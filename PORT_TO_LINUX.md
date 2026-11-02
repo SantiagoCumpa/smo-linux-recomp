@@ -35,43 +35,53 @@ gráfico y casi no toca Win32 salvo locks, eventos, contadores y la superficie.
 
 ## TODO
 
-recalcar que para este caso se tiene el archivo dumpeado en 2 partes: el juego base v0 y la update 1.4.1 separada en la carpeta dump/
+**Dump (importante):** en `./dump` hay **dos NSP** sin descifrar: el juego base
+`[0100000000010000][v0]` y la actualización `[0100000000010800][v262144]` por separado. `extract.py` espera la
+carpeta ya descifrada (`exefs/` con la actualización, `romfs/` con la actualización aplicada, `control.nacp`).
+Para descifrar hacen falta las claves de la consola del usuario (`prod.keys`, no están en la máquina: no hay
+`~/.switch/`) y una herramienta (`hactool`/`hactoolnet` de AUR, no instaladas): la RomFS de la actualización es un
+parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca base> <nca update> --romfsdir ...`).
 
-> Pendiente del usuario: `sudo pacman -S clang lld vulkan-headers` y copiar el dump 1.4.1 en `./dump`.
-> Nota: `build_exe.py` ya espera `runtime/core/plat.c`, `runtime/services/nnmovie_ff.c` y la opción
-> `--shaderc-selftest` del ejecutable; se crean en las Fases 1, 4 y 5.
+> Pendiente del usuario: poner `prod.keys` (de su consola) en `./dump/prod.keys` e instalar `hactoolnet`
+> (o `hactool`) — o bien dejar el dump ya descifrado en `./dump/{exefs,romfs,control.nacp}`. Hasta entonces no se
+> puede generar `build/gen` ni enlazar; el runtime se comprueba con `clang -fsyntax-only` y un `image.h` falso
+> (`build/tmp/syncheck.py`, `build/tmp/stubgen/`).
+> Ya instalado: clang 23, lld, vulkan-headers, sdl3, shaderc, ffmpeg, freetype2, fontconfig, `.venv` con los paquetes.
 
-- [ ] Crear `PORT_TO_LINUX.md` y la rama `linux-port`
-- [ ] Fase 0 — `tools/target.py`: CLANG, extensiones `.o`/`.so`, nombres sin `.exe`
-- [ ] Fase 0 — `build_main.py`: `-fPIC -fvisibility=hidden -ffp-contract=off`, `.o`
-- [ ] Fase 0 — `build_exe.py`: `libsmo_game.so` + `smo_native` con pkg-config, rpath, shaderc enlazado
-- [ ] Fase 0 — `extract.py`: symlinks en vez de junctions
-- [ ] Fase 0 — `setup.py` deps (clang, lld, pkg-config) con mensajes de `pacman`
-- [ ] Fase 0 — `run.py` + tests: sin `.exe`, `flock`, PRIME, cachés en `./build/cache` (hecho: `run.py`, `check_game_places.py` — prueba OK; faltan `difftest.py`, `linkcheck.py`, `check_all_shaders.py`, `bntx_layout_check.py`, `check_fast_paths.py`, `build_mx_equiv.py`, `stress_stages.py`, `tools/dev/*`)
-- [ ] Fase 0 — C de herramientas/tests sin `windows.h` (`difftest_host.c`, `linkcheck_stub.c`, `tests/*.c`)
-- [ ] Fase 1 — `runtime/core/plat.h` / `plat.c` (locks, eventos, atómicos, tiempo, hilos, memoria, archivos)
-- [ ] Fase 2 — `hostrt.c`: mapeo con mmap, manejador de señales e informe de crash
-- [ ] Fase 2 — `boot.c`, `sdklift_rt.c`, `gamedll.c`/`game_shim.c`, `hitch.c`
-- [ ] Fase 3 — `os_threads.c`: pthreads, topología P/E, slots con flock, prioridades (nice/SCHED_IDLE)
-- [ ] Fase 3 — `smo_nn.c` + `nvn_stub.c`: heap con memfd y vistas con mmap
-- [ ] Fase 3 — `nntime.c`, `nnmisc.c`, `nnsdk.c`
-- [ ] Fase 3 — `nnfs.c`, `nnfsdir.c` (POSIX, diario con fsync, rutas sin distinguir mayúsculas)
-- [ ] Fase 4 — `display.c`: ventana SDL3 (Wayland), eventos, reloj de 60 Hz
-- [ ] Fase 4 — `nvn_vk.c`: Vulkan por SDL, superficie, GPU discreta
-- [ ] Fase 4 — `nvn_vk_draw.c`, `nvn_vk_pipelines.c`, `nvn_vk_watchdog.c`, `nvn_misc.c` a `plat.h`
-- [ ] Fase 4 — `nvn_gl.c`: quitar el backend OpenGL, conservar el front end; `gfx_options.c`
-- [ ] Fase 4 — `vk_shaderc_shim.c` enlazado directo
-- [ ] Fase 4 — `nnhid.c` (teclado SDL, sin XInput), `nnpad_sdl.c`
+- [x] Crear `PORT_TO_LINUX.md` y la rama `linux-port`
+- [x] Fase 0 — `tools/target.py`: CLANG, extensiones `.o`/`.so`, nombres sin `.exe`
+- [x] Fase 0 — `build_main.py`: `-fPIC -fvisibility=hidden -ffp-contract=off`, `.o`
+- [x] Fase 0 — `build_exe.py`: `libsmo_game.so` + `smo_native` con pkg-config, rpath, shaderc enlazado
+- [x] Fase 0 — `extract.py`: symlinks en vez de junctions
+- [x] Fase 0 — `setup.py` deps (clang, lld, pkg-config) con mensajes de `pacman`
+- [~] Fase 0 — `run.py` + tests: sin `.exe`, `flock`, PRIME, cachés en `./build/cache` (hecho: `run.py`,
+  `check_game_places.py`, `difftest.py`, `linkcheck.py`; faltan `check_all_shaders.py`, `bntx_layout_check.py`,
+  `check_fast_paths.py`, `build_mx_equiv.py`, `stress_stages.py`, `tools/dev/*`)
+- [~] Fase 0 — C de herramientas/tests sin `windows.h` (hecho: `difftest_host.c`, `linkcheck_stub.c`; faltan
+  `tests/{fast_paths,mx_equiv,mx_all}.c`)
+- [x] Fase 1 — `runtime/core/plat.h` / `plat.c` (locks, eventos, atómicos, tiempo, hilos, memoria, archivos)
+- [x] Fase 2 — `hostrt.c`: mapeo con mmap, manejador de señales e informe de crash
+- [~] Fase 2 — `boot.c`, `sdklift_rt.c`, `gamedll.c`, `hitch.c` (hechos); falta `game_shim.c` (`__declspec`)
+- [x] Fase 3 — `os_threads.c`: pthreads, topología P/E, slots con flock, prioridades (nice/SCHED_IDLE)
+- [x] Fase 3 — `smo_nn.c` + `nvn_stub.c`: heap con memfd y vistas con mmap
+- [x] Fase 3 — `nntime.c`, `nnmisc.c`, `nnsdk.c`
+- [x] Fase 3 — `nnfs.c`, `nnfsdir.c` (POSIX, diario con fsync, rutas sin distinguir mayúsculas)
+- [x] Fase 4 — `display.c`: ventana SDL3 (Wayland), eventos, reloj de 60 Hz
+- [x] Fase 4 — `nvn_vk.c`: Vulkan por SDL, superficie, GPU discreta
+- [x] Fase 4 — `nvn_vk_draw.c`, `nvn_vk_pipelines.c`, `nvn_vk_watchdog.c`, `nvn_misc.c` a `plat.h`
+- [x] Fase 4 — `nvn_gl.c`: quitar el backend OpenGL, conservar el front end; `gfx_options.c`
+- [x] Fase 4 — `vk_shaderc_shim.c` enlazado directo
+- [ ] Fase 4 — `nnhid.c` (teclado SDL, sin XInput), `nnpad_sdl.c` (códigos `VK_*` → `vk_codes.h`)
 - [ ] Fase 5 — `smo_audio.c`, `nnaudio.c`: audio con SDL3
 - [ ] Fase 5 — `nnmovie_ff.c` (FFmpeg) en lugar de `nnmovie_mf.c`; `nnmovie.c`
 - [ ] Fase 5 — `nnfontll.c` (FreeType), `nnpl.c` (fontconfig)
 - [ ] Fase 5 — `nnnet.c`, `nnsocket.inc`, `nnonline.inc` (sockets BSD, getrandom)
 - [ ] Fase 5 — `nnapplet.c` (zenity/xdg-open), `smo_guide.c` (navegador), `nnalbum.c`, `nnservices.c`
-- [ ] Fase 5 — `runtime/game/*` y `runtime/libc/*` restantes
-- [ ] Compilación completa del runtime sin errores (gcc -fsyntax-only mientras falte clang; luego clang)
+- [ ] Fase 5 — `runtime/game/*` (`smo_nerve.c` sin `__try`, `smo_fast.c`, `smo_selftest.c`) y `libc/nncxxrt.c`
+- [ ] Compilación completa del runtime sin errores con clang (`build/tmp/syncheck.py`, sin dump)
 - [ ] Fase 6 — barreras de memoria en `recomp.py` + difftest
 - [ ] Fase 7 — README, `docs/*.md`, `.gitignore`
-- [ ] Verificación 1–2: dependencias y `setup.py --dump ./dump --check`
+- [ ] Verificación 1–2: dependencias y `setup.py --dump ./dump --check` (bloqueado: dump cifrado, ver arriba)
 - [ ] Verificación 3–4: autotests, shaders, texturas, fast paths
 - [ ] Verificación 5: jugar (`run.py play`)
 - [ ] Verificación 6–7: Cap Kingdom 13/13, stress de etapas
