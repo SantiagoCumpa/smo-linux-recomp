@@ -24,6 +24,39 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#include <link.h>
+#include <sys/mman.h>
+
+/* Rewrites the rel32 of a call instruction in the game library's code (r-x pages: made writable for the store, then
+ * r-x again). 1 on success. */
+static int patch_rel32(uint8_t *at, int32_t rel) {
+    long pg = sysconf(_SC_PAGESIZE);
+    uintptr_t lo = (uintptr_t)at & ~(uintptr_t)(pg - 1), hi = ((uintptr_t)at + 4 + pg - 1) & ~(uintptr_t)(pg - 1);
+    if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE | PROT_EXEC)) return 0;
+    memcpy(at, &rel, 4);
+    mprotect((void *)lo, hi - lo, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char *)at, (char *)at + 4);
+    return 1;
+}
+/* The executable segments of the loaded object holding `addr` (the game library) */
+typedef struct { uintptr_t addr; int n; uint8_t *lo[8], *hi[8]; } ExecSegs;
+static int exec_segs_cb(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    ExecSegs *e = data;
+    int mine = 0;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type == PT_LOAD && e->addr >= info->dlpi_addr + ph->p_vaddr && e->addr < info->dlpi_addr + ph->p_vaddr + ph->p_memsz) mine = 1;
+    }
+    if (!mine) return 0;
+    for (int i = 0; i < info->dlpi_phnum && e->n < 8; i++) {
+        const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || !(ph->p_flags & PF_X)) continue;
+        e->lo[e->n] = (uint8_t *)(info->dlpi_addr + ph->p_vaddr);
+        e->hi[e->n++] = (uint8_t *)(info->dlpi_addr + ph->p_vaddr + ph->p_memsz);
+    }
+    return 1;
+}
 
 #define SYM_SORT GAME_SYM__ZN4sead12PtrArrayImpl4sortEPFiPKvS2_E
 #define SYM_REGISTER GAME_SYM__ZN3agl6driver6NVNMgr16registerSampler_EiPK10NVNsamplerj
@@ -141,7 +174,7 @@ static uint8_t *alloc_near(uint8_t *site) {
         for (int s = 0; s < 2; s++) {
             uintptr_t a = s ? base + d : base - d;
             if (!s && base < d) continue;
-            void *m = VirtualAlloc((void *)a, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            void *m = plat_alloc((void *)a, 0x1000, PLAT_RW);     /* exactly there or nothing */
             if (m) return m;
         }
     }
@@ -163,16 +196,13 @@ static void install_register(void) {
         if (same && !(e && !atoi(e))) { g_site[0] = base + 0x2c; g_site[1] = base + 0x58; }
         printf("smo_fast: registerSampler's free-slot walk %s\n", g_site[0] ? "jumps over taken slots in host code (SMO_FAST_SKIP=0: one call per slot)" : same ? "one call per slot (SMO_FAST_SKIP=0)" : "one call per slot (its loop is not the expected code)");
     }
-    HMODULE m = NULL;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)(uintptr_t)g_lifted_register, &m);
-    if (!m) return;
-    IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((uint8_t *)m + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
-    IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
+    ExecSegs segs = {(uintptr_t)g_lifted_register, 0, {0}, {0}};
+    dl_iterate_phdr(exec_segs_cb, &segs);
+    if (!segs.n) return;
     uint8_t *target = (uint8_t *)(uintptr_t)g_lifted_register, *stub = NULL;
     int sites = 0, patched = 0;
-    for (int s = 0; s < nt->FileHeader.NumberOfSections; s++) {
-        if (!(sec[s].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-        uint8_t *q = (uint8_t *)m + sec[s].VirtualAddress, *end = q + sec[s].Misc.VirtualSize;
+    for (int s = 0; s < segs.n; s++) {
+        uint8_t *q = segs.lo[s], *end = segs.hi[s];
         for (; q + 5 <= end; q++) {
             int32_t rel;
             if (q[0] != 0xE8) continue;
@@ -182,18 +212,12 @@ static void install_register(void) {
             if (!stub) {
                 static const uint8_t jmp_abs[6] = {0xFF, 0x25, 0, 0, 0, 0};
                 void (*fn)(Ctx *) = sampler_register;
-                uint32_t old;
                 if (!(stub = alloc_near(q))) break;
                 memcpy(stub, jmp_abs, 6); memcpy(stub + 6, &fn, 8);
-                VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &old);
+                plat_protect(stub, 0x1000, PLAT_RX);
             }
             int64_t rel64 = stub - (q + 5);
-            uint32_t old;
-            if (rel64 != (int32_t)rel64 || !VirtualProtect(q + 1, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
-            rel = (int32_t)rel64;
-            memcpy(q + 1, &rel, 4);
-            VirtualProtect(q + 1, 4, old, &old);
-            FlushInstructionCache(GetCurrentProcess(), q, 5);
+            if (rel64 != (int32_t)rel64 || !patch_rel32(q + 1, (int32_t)rel64)) continue;
             patched++;
             q += 4;
         }
@@ -211,13 +235,11 @@ void smo_fast_install(void) {
     g_check = getenv("SMO_FAST_CHECK") && atoi(getenv("SMO_FAST_CHECK"));
     g_lifted_sort = host_fn_of(SYM_SORT);
     uint8_t *caller = (uint8_t *)(uintptr_t)host_fn_of(SYM_REGISTER);
-    uint64_t img = 0;
-    PRUNTIME_FUNCTION rf = caller ? RtlLookupFunctionEntry((uint64_t)(uintptr_t)caller, &img, NULL) : NULL;
-    if (!g_lifted_sort || !rf || (uint8_t *)(uintptr_t)(img + rf->BeginAddress) != caller) {
-        printf("smo_fast: NOT installed: the lifted registerSampler_ or sead::PtrArrayImpl::sort was not found, or has no unwind entry\n");
+    uint8_t *end = caller ? (uint8_t *)host_fn_end((uintptr_t)caller) : NULL, *at = NULL;
+    if (!g_lifted_sort || !end || end <= caller || end - caller > 0x100000) {
+        printf("smo_fast: NOT installed: the lifted registerSampler_ or sead::PtrArrayImpl::sort was not found, or its code's end is not known\n");
         return;
     }
-    uint8_t *end = (uint8_t *)(uintptr_t)(img + rf->EndAddress), *at = NULL;
     int found = 0;
     for (uint8_t *q = caller; q + 5 <= end; q++) {        /* call rel32 whose target is the lifted sort */
         int32_t rel;
@@ -230,15 +252,10 @@ void smo_fast_install(void) {
     void (*target)(Ctx *) = sampler_sort;
     static const uint8_t jmp_abs[6] = {0xFF, 0x25, 0, 0, 0, 0};      /* jmp [rip + 0], then the 8-byte address */
     memcpy(stub, jmp_abs, 6); memcpy(stub + 6, &target, 8);
-    uint32_t old;
-    VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &old);
+    plat_protect(stub, 0x1000, PLAT_RX);
     int64_t rel64 = stub - (at + 5);
     if (rel64 != (int32_t)rel64) { printf("smo_fast: NOT installed: the stub is out of rel32 range\n"); return; }
-    int32_t rel = (int32_t)rel64;
-    if (!VirtualProtect(at + 1, 4, PAGE_EXECUTE_READWRITE, &old)) { printf("smo_fast: NOT installed: the game's code cannot be written (error %lu)\n", GetLastError()); return; }
-    memcpy(at + 1, &rel, 4);
-    VirtualProtect(at + 1, 4, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), at, 5);
+    if (!patch_rel32(at + 1, (int32_t)rel64)) { printf("smo_fast: NOT installed: the game's code cannot be written (%s)\n", strerror(errno)); return; }
     printf("smo_fast: agl::driver::NVNMgr::registerSampler_ sorts its sampler list in host code (SMO_FAST=0: the game's own code%s)\n",
            g_check ? "; SMO_FAST_CHECK=1: every sort compared with the game's" : ", SMO_FAST_CHECK=1: compare with it");
     install_register();

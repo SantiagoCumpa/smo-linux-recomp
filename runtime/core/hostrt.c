@@ -84,6 +84,24 @@ uint64_t guest_function_of(uint64_t rip) {
     return g_by_host[best].addr;
 }
 
+/* Where the host code of the lifted function starting at `fn` ends: the start of the next lifted function in host
+ * memory (what the Windows build read from the function's unwind entry), or 0 when fn is not a lifted function's start
+ * or is the last one. */
+uintptr_t host_fn_end(uintptr_t fn) {
+    if (!g_by_host) return 0;
+    int lo = 0, hi = fn_table_count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uintptr_t f = (uintptr_t)g_by_host[mid].fn;
+        if (f == fn) {
+            while (mid + 1 < fn_table_count && (uintptr_t)g_by_host[mid + 1].fn == fn) mid++;   /* aliases: one body */
+            return mid + 1 < fn_table_count ? (uintptr_t)g_by_host[mid + 1].fn : 0;
+        }
+        if (f < fn) lo = mid + 1; else hi = mid - 1;
+    }
+    return 0;
+}
+
 /* ---------------------------------------------------------------- host functions handed to the guest
  * Function pointers the guest obtains at run time (for example through nvnBootstrapLoader) are
  * placeholder addresses in their own range; calling one runs the registered host handler. */

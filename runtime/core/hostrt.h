@@ -33,6 +33,7 @@ ImportFn import_lookup(const char *name);    /* registered handler of an importe
 ImportFn handler_by_name(const char *name);  /* the handler registered under a name, imported or not, or NULL */
 void call_guest(Ctx *c, uint64_t addr);
 uint64_t guest_function_of(uint64_t host_rip);
+uintptr_t host_fn_end(uintptr_t host_fn);   /* end of a lifted function's host code (the next one's start), 0 when unknown */
 void print_import_summary(FILE *out);
 void trace_printf(const char *fmt, ...);
 
