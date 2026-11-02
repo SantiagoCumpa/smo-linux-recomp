@@ -84,7 +84,10 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
 - [x] Fase 5 — `runtime/game/*` (`smo_nerve.c` con `process_vm_readv`, `smo_fast.c` con `dl_iterate_phdr`,
   `smo_selftest.c`, `smo_ui.c`) y `libc/nncxxrt.c`
 - [x] Compilación completa del runtime sin errores con clang (`build/tmp/syncheck.py`, sin dump: 50 de 50 archivos)
-- [ ] Fase 6 — barreras de memoria en `recomp.py` + difftest
+- [x] Fase 6 — barreras de memoria en `recomp.py`: `dmb`/`dsb` → `__atomic_thread_fence` (acquire con `LD`,
+  release con `ST`, seq_cst el resto), `isb` → barrera del compilador, `ldar`/`ldaxr` → `lda<n>` (acquire),
+  `stlr` → `stl<n>` (release) en `runtime.h`. Comprobado sin dump con `tests/check_ordered.py` (ELF falso; 256 casos
+  iguales a Unicorn). Falta `difftest.py all` con el dump (va en la Verificación 2)
 - [ ] Fase 7 — README, `docs/*.md`, `.gitignore`
 - [ ] Verificación 1–2: dependencias y `setup.py --dump ./dump --check` (bloqueado: dump cifrado, ver arriba)
 - [ ] Verificación 3–4: autotests, shaders, texturas, fast paths

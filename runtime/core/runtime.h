@@ -44,6 +44,13 @@ void guest_svc(Ctx *c, uint32_t number);
     static inline uint##bits##_t rd##bits(uint64_t a) { uint##bits##_t v; memcpy(&v, (void *)(uintptr_t)a, sizeof v); return v; } \
     static inline void wr##bits(uint64_t a, uint##bits##_t v) { memcpy((void *)(uintptr_t)a, &v, sizeof v); }
 DEF_MEM(8) DEF_MEM(16) DEF_MEM(32) DEF_MEM(64)
+/* LDAR / LDAXR and STLR: the same access with acquire / release ordering (the guest's code relies on it between threads;
+ * clang may otherwise move plain accesses across them). Aligned, as the instructions require. On x86-64 both are plain
+ * moves that the compiler may not reorder. */
+#define DEF_ORD(bits) \
+    static inline uint##bits##_t lda##bits(uint64_t a) { return __atomic_load_n((uint##bits##_t *)(uintptr_t)a, __ATOMIC_ACQUIRE); } \
+    static inline void stl##bits(uint64_t a, uint##bits##_t v) { __atomic_store_n((uint##bits##_t *)(uintptr_t)a, v, __ATOMIC_RELEASE); }
+DEF_ORD(8) DEF_ORD(16) DEF_ORD(32) DEF_ORD(64)
 
 /* STXR: store only if the location still holds the value the matching LDXR read. Returns 0 on success. */
 void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, int bits);

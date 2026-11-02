@@ -305,8 +305,13 @@ class Fn:
             return SET(bits(w, 4, 0), 1, '0ULL')        # fpcr / fpsr read
         if (w & 0xffffffe0) in (0xd51b4400, 0xd51b4420):
             return ';'                                   # fpcr / fpsr write
-        if (w & 0xfffff0ff) in (0xd503305f, 0xd50330bf, 0xd503309f, 0xd50330df):
-            return ';'                                   # clrex / dmb / dsb / isb
+        if (w & 0xfffff0ff) == 0xd503305f:
+            return ';'                                   # clrex
+        if (w & 0xfffff0ff) in (0xd50330bf, 0xd503309f):  # dmb / dsb <option>: CRm's low bits say which accesses
+            req = bits(w, 9, 8)                          # 1 = LD (loads before), 2 = ST (stores before and after), else all
+            return '__atomic_thread_fence(%s);' % {1: '__ATOMIC_ACQUIRE', 2: '__ATOMIC_RELEASE'}.get(req, '__ATOMIC_SEQ_CST')
+        if (w & 0xfffff0ff) == 0xd50330df:
+            return '__atomic_signal_fence(__ATOMIC_SEQ_CST);'  # isb: no memory effect here; keeps clang from moving accesses
         # SMO additions (SDK code: a data-cache maintenance loop in the audio server)
         if (w & 0xffffffe0) == 0xd53b0020:               # mrs ctr_el0: the console's Cortex-A57 reset value 0x8444C004
             return SET(bits(w, 4, 0), 1, '0x8444c004ULL')  # [doc] ARM Cortex-A57 TRM, CTR_EL0: 64-byte I and D lines
@@ -410,12 +415,15 @@ class Fn:
                 raise Unimpl('excl-pair')
             nb = 8 << size
             rs = bits(w, 20, 16)
+            o0 = bits(w, 15, 15)                         # acquire (loads) / release (stores)
             if o2:                                       # ldar / stlr: ordered, not exclusive
                 if load:
-                    return SET(rt, 1, 'rd%d(%s)' % (nb, XS(rn)))
-                return 'wr%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
+                    return SET(rt, 1, 'lda%d(%s)' % (nb, XS(rn)))
+                return 'stl%d(%s, %s);' % (nb, XS(rn), R(rt, size == 3))
             if load:                                     # ldxr / ldaxr: remember address and value
-                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = rd%d(a); %s }' % (XS(rn), nb, SET(rt, 1, 'c->ex_val'))
+                return '{ uint64_t a = %s; c->ex_addr = a; c->ex_val = %s%d(a); %s }' % (
+                    XS(rn), 'lda' if o0 else 'rd', nb, SET(rt, 1, 'c->ex_val'))
+            # (stlxr's release: the compare-and-swap of stx<n> is a full barrier)
             # stxr / stlxr: succeeds only if the value is still the one loaded (compare-and-swap)
             return SET(rs, 0, 'stx%d(c, %s, %s)' % (nb, XS(rn), R(rt, size == 3)))
         if bits(w, 31, 31) == 0 and bits(w, 29, 24) in (0x0c, 0x0d):   # AdvSIMD structure load/store
