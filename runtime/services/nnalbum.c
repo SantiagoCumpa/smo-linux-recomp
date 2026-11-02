@@ -1,4 +1,4 @@
-/* The album: pictures of the Capture button, kept in <userdata>\album (<userdata> = %SMO_USERDATA% or ..\userdata) as
+/* The album: pictures of the Capture button, kept in <userdata>/album (<userdata> = $SMO_USERDATA or ../userdata) as
  * <date>_<time>_<nn>.bmp (32-bit BMP; a console stores JPEG). The game imports no nn::album function. */
 #include "plat.h"
 #include <stdint.h>
@@ -6,10 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-const char *fs_user_root(void);                           /* nnfs.c: %SMO_USERDATA% or ..\userdata */
+const char *fs_user_root(void);                           /* nnfs.c: $SMO_USERDATA or ../userdata */
 static char g_album_dir[PATH_MAX];
 static const char *album_dir(void) {
-    if (!g_album_dir[0]) snprintf(g_album_dir, sizeof g_album_dir, "%s\\album", fs_user_root());
+    if (!g_album_dir[0]) snprintf(g_album_dir, sizeof g_album_dir, "%s/album", fs_user_root());
     return g_album_dir;
 }
 static volatile int32_t g_shot_counter;
@@ -18,16 +18,14 @@ static volatile int32_t g_shot_counter;
 static int write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
     FILE *f = fopen(path, "wb");
     if (!f) return 1;
-    BITMAPFILEHEADER fh;
-    BITMAPINFOHEADER ih;
-    memset(&fh, 0, sizeof fh);
-    memset(&ih, 0, sizeof ih);
-    fh.bfType = 0x4d42;
-    fh.bfOffBits = sizeof fh + sizeof ih;
-    fh.bfSize = fh.bfOffBits + (uint32_t)w * (uint32_t)h * 4;
-    ih.biSize = sizeof ih; ih.biWidth = w; ih.biHeight = h; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;
-    fwrite(&fh, sizeof fh, 1, f);
-    fwrite(&ih, sizeof ih, 1, f);
+    /* BITMAPFILEHEADER (14 bytes) + BITMAPINFOHEADER (40 bytes), little-endian, packed */
+    uint8_t hd[54] = {'B', 'M'};
+    uint32_t off = 54, size = off + (uint32_t)w * (uint32_t)h * 4, ihs = 40, bits = 32;
+    int32_t iw = w, ih = h;
+    uint16_t planes = 1;
+    memcpy(hd + 2, &size, 4); memcpy(hd + 10, &off, 4);
+    memcpy(hd + 14, &ihs, 4); memcpy(hd + 18, &iw, 4); memcpy(hd + 22, &ih, 4); memcpy(hd + 26, &planes, 2); memcpy(hd + 28, &bits, 2);
+    fwrite(hd, sizeof hd, 1, f);
     uint8_t *row = malloc((size_t)w * 4);
     for (int y = h - 1; y >= 0; y--) {
         const uint8_t *s = rgba + (size_t)y * w * 4;
@@ -40,7 +38,7 @@ static int write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
     return bad;
 }
 /* a picture of the Capture button (nvn_vk_draw.c capture_vk): the presented frame, w x h opaque 8-bit RGBA,
- * saved as <album>\<date>_<time>_<n>.bmp and turned as the game last asked with
+ * saved as <album>/<date>_<time>_<n>.bmp and turned as the game last asked with
  * nn::oe::SetScreenShotImageOrientation (smo_nn.c): 1 = 90, 2 = 180, 3 = 270 degrees clockwise (NOT VERIFIED on a
  * console: the direction of the turn). */
 int smo_screenshot_orientation(void);                     /* smo_nn.c */
@@ -58,12 +56,13 @@ int album_save_capture(const uint8_t *rgba, int w, int h, char *out_path, size_t
             }
         pix = turned;
     }
-    SYSTEMTIME t;
+    struct tm t;
+    time_t now = time(NULL);
     char path[PATH_MAX];
-    GetLocalTime(&t);
-    plat_mkdir(album_dir());
-    snprintf(path, sizeof path, "%s\\%04d%02d%02d_%02d%02d%02d_%02ld.bmp", album_dir(), t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
-             plat_inc(&g_shot_counter) % 100);
+    localtime_r(&now, &t);
+    plat_mkdirs(album_dir());
+    snprintf(path, sizeof path, "%s/%04d%02d%02d_%02d%02d%02d_%02ld.bmp", album_dir(), t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
+             (long)(plat_inc(&g_shot_counter) % 100));
     int bad = write_bmp(path, pix, ow, oh);
     if (out_path && out_cap) snprintf(out_path, out_cap, "%s", path);
     if (bad) printf("capture: cannot write %s\n", path);

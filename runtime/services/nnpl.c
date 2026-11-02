@@ -3,9 +3,9 @@
  * The game draws with them in one place met so far: the map screen's legend and travel-guide pages (the Standard font;
  * 189 glyphs, 61 characters, when the map first opens; the other types draw nothing in English). For each type, in
  * this order:
- *   1. the console's own font, from your dump: %SMO_FONTS% or ..\sysdata\fonts (setup's import step puts it there);
- *   2. a free font you put in the repository's deps\fonts (Noto Sans, Noto Sans SC / TC / KR, .ttf or .otf);
- *   3. Windows' own font for that script, which every Windows PC has, so the game always starts.
+ *   1. the console's own font, from your dump: $SMO_FONTS or ../sysdata/fonts (setup's import step puts it there);
+ *   2. a free font you put in the repository's deps/fonts (Noto Sans, Noto Sans SC / TC / KR, .ttf or .otf);
+ *   3. the system's font for that script, through fontconfig (Arch: noto-fonts, noto-fonts-cjk), so the game starts.
  * The log line says which file each type got. The Nintendo extension fonts (button icons and symbols) have no free
  * equivalent: their fallback is the Standard one's.
  *
@@ -17,6 +17,7 @@
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
+#include <fontconfig/fontconfig.h>
 
 #define A0 (c->x[0])
 #define RET(v) (c->x[0] = (uint64_t)(v))
@@ -26,7 +27,7 @@ static const char *const console_files[FONT_TYPES] = {
     "nintendo_udsg-r_std_003.ttf", "nintendo_udsg-r_org_zh-cn_003.ttf", "nintendo_udsg-r_ext_zh-cn_003.ttf",
     "nintendo_udjxh-db_zh-tw_003.ttf", "nintendo_udsg-r_ko_003.ttf", "nintendo_ext_003.ttf", "nintendo_ext2_003.ttf",
 };
-/* free fonts in deps\fonts, by script: a few spellings each (static or variable builds, .ttf or .otf) */
+/* free fonts in deps/fonts, by script: a few spellings each (static or variable builds, .ttf or .otf) */
 static const char *const free_files[FONT_TYPES][4] = {
     {"NotoSans-Regular.ttf", "NotoSans-Regular.otf", "NotoSans[wdth,wght].ttf", NULL},
     {"NotoSansSC-Regular.ttf", "NotoSansSC-Regular.otf", "NotoSansSC[wght].ttf", NULL},
@@ -36,10 +37,27 @@ static const char *const free_files[FONT_TYPES][4] = {
     {"NotoSans-Regular.ttf", "NotoSans-Regular.otf", "NotoSans[wdth,wght].ttf", NULL},
     {"NotoSans-Regular.ttf", "NotoSans-Regular.otf", "NotoSans[wdth,wght].ttf", NULL},
 };
-/* Windows' own, in %WINDIR%\Fonts: Segoe UI, Microsoft YaHei, Microsoft JhengHei, Malgun Gothic */
-static const char *const windows_files[FONT_TYPES] = {"segoeui.ttf", "msyh.ttc", "msyh.ttc", "msjh.ttc", "malgun.ttf", "segoeui.ttf", "segoeui.ttf"};
+/* the system's, through fontconfig: a sans-serif face for the script of each type */
+static const char *const system_patterns[FONT_TYPES] = {"sans-serif:lang=en", "sans-serif:lang=zh-cn", "sans-serif:lang=zh-cn",
+                                                        "sans-serif:lang=zh-tw", "sans-serif:lang=ko", "sans-serif:lang=en", "sans-serif:lang=en"};
 static struct { void *data; size_t size; int tried; } g_fonts[FONT_TYPES];
-static plat_lock_t g_lock;
+static plat_lock_t g_lock = PLAT_LOCK_INIT;
+
+static int system_font(unsigned type, char *path, size_t cap) {   /* fontconfig's best file for the type's script; 1 when found */
+    int ok = 0;
+    if (!FcInit()) return 0;
+    FcPattern *pat = FcNameParse((const FcChar8 *)system_patterns[type]);
+    if (!pat) return 0;
+    FcConfigSubstitute(NULL, pat, FcMatchPattern);
+    FcDefaultSubstitute(pat);
+    FcResult r;
+    FcPattern *m = FcFontMatch(NULL, pat, &r);
+    FcChar8 *file = NULL;
+    if (m && FcPatternGetString(m, FC_FILE, 0, &file) == FcResultMatch && file) { snprintf(path, cap, "%s", (const char *)file); ok = 1; }
+    if (m) FcPatternDestroy(m);
+    FcPatternDestroy(pat);
+    return ok;
+}
 
 static int read_font(unsigned type, const char *path) {
     FILE *f = fopen(path, "rb");
@@ -63,22 +81,19 @@ static void load_font(unsigned type) {
         g_fonts[type].tried = 1;
         char path[PATH_MAX] = "";
         const char *dir = getenv("SMO_FONTS"), *from = "the console's (your dump)";
-        snprintf(path, sizeof path, "%s\\%s", dir ? dir : "..\\sysdata\\fonts", console_files[type]);
+        snprintf(path, sizeof path, "%s/%s", dir ? dir : "../sysdata/fonts", console_files[type]);
         int ok = read_font(type, path);
         for (int k = 0; !ok && free_files[type][k]; k++) {
-            snprintf(path, sizeof path, "..\\..\\deps\\fonts\\%s", free_files[type][k]);
-            if ((ok = read_font(type, path))) from = "a free font (deps\\fonts)";
+            snprintf(path, sizeof path, "../../deps/fonts/%s", free_files[type][k]);
+            if ((ok = read_font(type, path))) from = "a free font (deps/fonts)";
         }
         if (!ok) {
-            char windir[PATH_MAX] = "C:\\Windows";
-            GetWindowsDirectoryA(windir, sizeof windir);
-            snprintf(path, sizeof path, "%s\\Fonts\\%s", windir, windows_files[type]);
-            if ((ok = read_font(type, path))) from = "Windows' own (no dumped or free font found)";
+            if (system_font(type, path, sizeof path) && (ok = read_font(type, path))) from = "the system's (fontconfig; no dumped or free font found)";
         }
         printf("nn::pl: shared font %u %s (%s, %zu bytes)%s%s\n", type, ok ? "loaded" : "NOT FOUND", path, g_fonts[type].size,
                ok ? ": " : "", ok ? from : "");
         if (!ok) {
-            printf("nn::pl: no font for shared font type %u (not in your dump, deps\\fonts or %%WINDIR%%\\Fonts): stopping\n", type);
+            printf("nn::pl: no font for shared font type %u (not in your dump, deps/fonts or the system's fonts: pacman -S noto-fonts noto-fonts-cjk): stopping\n", type);
             fflush(stdout);
             report_and_exit(7);
         }
