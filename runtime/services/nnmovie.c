@@ -1,4 +1,4 @@
-/* movie:: (the SDK's video player library): the placeholder used with SMO_MOVIE=0 (nnmovie_mf.c plays the movies).
+/* movie:: (the SDK's video player library): the placeholder used with SMO_MOVIE=0 (nnmovie_ff.c plays the movies).
  *
  * The Decoder is a C++ object the game drives through its virtual table. Here it gets a table whose every entry
  * reports failure, so the game's movie player gives up on the film instead of jumping through an uninitialised

@@ -79,7 +79,7 @@ void register_movie_imports(void);       /* nnmovie.c */
 void register_misc_imports(void);        /* nnmisc.c */
 void register_audio_imports(void);       /* nnaudio.c */
 void register_service_imports(void);        /* nnservices.c: sdklift_*.c, nnapplet.c, nnnet.c, nnfsdir.c */
-void register_movie_mf_imports(void);    /* nnmovie_mf.c */
+void register_movie_ff_imports(void);    /* nnmovie_ff.c */
 void cxxrt_install_data(void);           /* nncxxrt.c: vtables / typeinfo objects of the C++ runtime (before runtime_init) */
 void register_unwind_imports(void);      /* nnunwind.c: C++ exception unwinding through lifted module code */
 void register_cxxrt_imports(void);       /* nncxxrt.c + nncxxlib.c + nnlibc2.c: C and C++ runtime, fills what is still missing */
@@ -261,7 +261,7 @@ int main(int argc, char **argv) {
     register_movie_imports();
     register_misc_imports();                 /* only fills names nobody else implements */
     register_audio_imports();
-    register_movie_mf_imports();             /* replaces nnmovie.c's failing placeholder unless SMO_MOVIE=0 */
+    register_movie_ff_imports();             /* replaces nnmovie.c's failing placeholder unless SMO_MOVIE=0 */
     register_iostream_imports();             /* libc++ stream base classes */
     register_cxxrt_imports();                /* C / C++ runtime: everything still without a handler (keep last) */
     register_unwind_imports();               /* installs the unwinder the C++ runtime calls on a throw */
