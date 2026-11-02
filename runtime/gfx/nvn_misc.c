@@ -78,12 +78,15 @@ static void (APIENTRY *p_DrawTextureNV)(GLuint, GLuint, GLfloat, GLfloat, GLfloa
 static void (APIENTRY *p_GetTextureParameteriv)(GLuint, GLenum, GLint *);
 static void (APIENTRY *p_GetTextureLevelParameteriv)(GLuint, GLint, GLenum, GLint *);
 static int g_gl_loaded;
+/* OpenGL extension functions: the old OpenGL back end's (not run on Linux); resolved from libOpenGL when asked */
+#include <dlfcn.h>
+static void *gl_proc(const char *name) { static void *lib; if (!lib) lib = dlopen("libOpenGL.so.0", RTLD_NOW | RTLD_LOCAL); return lib ? dlsym(lib, name) : NULL; }
 static void gl_load(void) {
     if (g_gl_loaded) return;
     g_gl_loaded = 1;
-    p_DrawTextureNV = (void *)wglGetProcAddress("glDrawTextureNV");
-    p_GetTextureParameteriv = (void *)wglGetProcAddress("glGetTextureParameteriv");
-    p_GetTextureLevelParameteriv = (void *)wglGetProcAddress("glGetTextureLevelParameteriv");
+    p_DrawTextureNV = gl_proc("glDrawTextureNV");
+    p_GetTextureParameteriv = gl_proc("glGetTextureParameteriv");
+    p_GetTextureLevelParameteriv = gl_proc("glGetTextureLevelParameteriv");
 }
 
 int nvn_misc_draw_texture_gl(unsigned tex, unsigned smp, const NvnDrawTexture *w, int alpha_func, float alpha_ref) {
@@ -208,9 +211,9 @@ void nvn_misc_gl_selftest_hook(void) {
     GLuint tex, target, depth, fbo, smp;
     int bad = 0, n = 0;
     gl_load();
-    p_GenFramebuffers = (void *)wglGetProcAddress("glGenFramebuffers"); p_BindFramebuffer = (void *)wglGetProcAddress("glBindFramebuffer");
-    p_FramebufferTexture = (void *)wglGetProcAddress("glFramebufferTexture"); p_CheckFramebufferStatus = (void *)wglGetProcAddress("glCheckFramebufferStatus");
-    p_TexStorage2D = (void *)wglGetProcAddress("glTexStorage2D"); p_GenSamplers = (void *)wglGetProcAddress("glGenSamplers"); p_SamplerParameteri = (void *)wglGetProcAddress("glSamplerParameteri");
+    p_GenFramebuffers = gl_proc("glGenFramebuffers"); p_BindFramebuffer = gl_proc("glBindFramebuffer");
+    p_FramebufferTexture = gl_proc("glFramebufferTexture"); p_CheckFramebufferStatus = gl_proc("glCheckFramebufferStatus");
+    p_TexStorage2D = gl_proc("glTexStorage2D"); p_GenSamplers = gl_proc("glGenSamplers"); p_SamplerParameteri = gl_proc("glSamplerParameteri");
     printf("NVN OpenGL self-test: GL_NV_draw_texture %s\n", p_DrawTextureNV ? "present" : "MISSING");
     if (!p_DrawTextureNV) { fflush(stdout); plat_exit(1); }
     glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex); p_TexStorage2D(GL_TEXTURE_2D, 1, 0x8058 /* RGBA8 */, 4, 2);

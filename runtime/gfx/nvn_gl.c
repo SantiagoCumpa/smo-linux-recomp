@@ -39,8 +39,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
 #include "plat.h"
+/* OpenGL: the old back end's code is still compiled (unreachable on Linux: Vulkan is the only renderer) against the system's
+ * GL 1.1 header; the functions that header declares beyond 1.1 are pointers of this file instead */
+#define glTexSubImage3D mesa_glTexSubImage3D
+#define glCompressedTexSubImage2D mesa_glCompressedTexSubImage2D
+#define glCompressedTexSubImage3D mesa_glCompressedTexSubImage3D
+#define glBlendColor mesa_glBlendColor
+#define GL_GLEXT_LEGACY 1
 #include <GL/gl.h>
+#undef glTexSubImage3D
+#undef glCompressedTexSubImage2D
+#undef glCompressedTexSubImage3D
+#undef glBlendColor
 #include "runtime.h"
 #include "hostrt.h"
 #include "mx_translate.h"
@@ -243,14 +255,15 @@ enum {
 };
 
 /* ---------------------------------------------------------------- the render thread */
-typedef struct Job { void (*fn)(void *); void *arg; HANDLE done; struct Job *next; } Job;
+typedef struct Job { void (*fn)(void *); void *arg; plat_event *done; struct Job *next; } Job;
 static plat_lock_t g_job_lock;
 static Job *g_job_head, *g_job_tail;
-static HANDLE g_job_event, g_ready_event;
+static plat_event *g_job_event, *g_ready_event;
 static uint32_t g_render_tid;
-static HWND g_hwnd;
-static HDC g_dc;
-static _Thread_local HANDLE t_done;
+static void *g_hwnd;                                 /* the SDL_Window (display.c) */
+static _Thread_local plat_event *t_done;
+void display_set_title(const char *t);               /* display.c: applied by the window's event loop */
+void display_size(int *w, int *h);
 static void gl_housekeeping(void);
 static void (*pf_job_submit)(void *), (*pf_job_present)(void *);
 static int64_t g_joblog_frame, g_joblog_cur;
@@ -290,7 +303,7 @@ static void gl_run(void (*fn)(void *), void *arg) {
     plat_unlock(&g_job_lock);
     plat_event_set(g_job_event);
     hitch_wait_render(1);
-    WaitForSingleObject(j.done, PLAT_INFINITE);
+    plat_event_wait(j.done, PLAT_INFINITE);
     hitch_wait_render(0);
     if (g_tl_on) nvn_tl(TL_RUN_RET, tl_kind(fn));
     pf_add(fn == pf_job_submit ? PF_WAIT_SUBMIT_ : fn == pf_job_present ? PF_WAIT_PRESENT_ : PF_WAIT_OTHER_, pf0);
@@ -386,11 +399,11 @@ static uint32_t tl_write(void *arg) {           /* the record, written by a thre
     plat_counter fq; plat_qpf(&fq);
     int32_t n = g_tl_n < TL_MAX ? g_tl_n : TL_MAX;
     if (fp) {
-        fprintf(fp, "# frametl frames %lld..%lld, %ld events, counter %lld Hz, render thread %lu\n", (long long)g_tl_first, (long long)last, (long)n, (long long)fq.QuadPart, (unsigned long)g_render_tid);
+        fprintf(fp, "# frametl frames %lld..%lld, %d events, counter %lld Hz, render thread %lu\n", (long long)g_tl_first, (long long)last, (int)n, (long long)fq.QuadPart, (unsigned long)g_render_tid);
         for (int32_t i = 0; i < n; i++) fprintf(fp, "%lld %lu %u %u %u\n", (long long)g_tl[i].t, (unsigned long)g_tl[i].tid, g_tl[i].ev, g_tl[i].arg, g_tl[i].cpu);
         fclose(fp);
     }
-    printf("nvn_tl: frames %lld..%lld: %ld events written to %s\n", (long long)g_tl_first, (long long)last, (long)n, out ? out : "frametl.txt");
+    printf("nvn_tl: frames %lld..%lld: %d events written to %s\n", (long long)g_tl_first, (long long)last, (int)n, out ? out : "frametl.txt");
     return 0;
 }
 static void tl_frame_end(int64_t frame) {           /* render thread, after the present of `frame` */
@@ -405,8 +418,7 @@ static void tl_frame_end(int64_t frame) {           /* render thread, after the 
     if (frame == g_tl_first - 1) plat_xchg(&g_tl_on, 1);
     if (frame != g_tl_first + g_tl_frames - 1) return;
     plat_xchg(&g_tl_on, 0);
-    HANDLE th = CreateThread(NULL, 0, tl_write, (void *)(uintptr_t)frame, 0, NULL);
-    if (th) CloseHandle(th);
+    plat_thread_detach(plat_thread_start(tl_write, (void *)(uintptr_t)frame, 0));
     g_tl_frames = 0;                               /* recorded once */
 }
 
@@ -631,10 +643,10 @@ static TexPool *g_tpools[16];
 static int g_ntpools;
 static int64_t g_slot_releases, g_slot_unknown;     /* agl releases seen; finalizes of owning copies whose +0xc0 names no entry of the texture */
 /* The object that made the texture still names it. Its address may be stale (a stack temporary, memory the game gave
- * back), hence the guarded read (VirtualQuery is slow in this process: tens of milliseconds a call while loading). */
+ * back), hence the guarded read (plat_readable: one process_vm_readv system call). */
 static int tex_held_by_maker(const Tex *t) {
-    if (!t->guest) return 0;
-    __try { return rd32(t->guest + 8) == K_TEX && rd64(t->guest) == (uint64_t)(uintptr_t)t; } __except (1) { return 0; }
+    if (!t->guest || !plat_readable((const void *)(uintptr_t)t->guest, 16)) return 0;
+    return rd32(t->guest + 8) == K_TEX && rd64(t->guest) == (uint64_t)(uintptr_t)t;
 }
 static void pool_ent_release(TexPoolEnt *e) {       /* g_pool_lock held exclusively: the entry no longer names its texture for agl */
     Tex *t = e->tex;
@@ -787,8 +799,9 @@ static uint64_t mem_hash(const uint8_t *p, size_t n, int full) {
 /* ---- which texture memory did the game write?
  * A texture's texels are guest memory, and NVN has no call that says "I changed them", so every texture bound in a batch
  * used to be hashed in every batch (35 MB per frame in play; large block-linear ones were only sampled, so a small
- * change could be missed). The game's heap is reserved with MEM_WRITE_WATCH (nnsdk.c, nn::os::AllocateAddressRegion):
- * GetWriteWatch names the pages written since the previous question. Rule:
+ * change could be missed). On Windows the game's heap was reserved with MEM_WRITE_WATCH and GetWriteWatch named the pages
+ * written since the previous question; Linux has no per-range write watch (soft-dirty bits are process-wide), so on Linux
+ * every range counts as not watched and is hashed (ww_newest answers 0). Rule, where a watch exists:
  *   - no page of the texture's range written since this texture was last looked at -> the GL copy is current, nothing to do;
  *   - otherwise the whole range is hashed (every word) and uploaded if the hash changed, as before.
  * Asking resets the answer for those pages, and two textures can share a page (small textures) or the whole range (two
@@ -817,13 +830,13 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
     uintptr_t count = 16384;
     uint32_t gran = 0;
     if (g_ww_off < 0) { g_ww_off = getenv("SMO_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
-    if (g_ww_off || !n || GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)p, n, pages, &count, &gran)) return 0;
+    (void)gran;
+    if (g_ww_off || !n || 1) return 0;               /* no write watch on Linux: the caller hashes the range */
     uint64_t first = (uint64_t)(uintptr_t)p >> 12, last = ((uint64_t)(uintptr_t)p + n - 1) >> 12, newest = g_ww_floor ? g_ww_floor : 1;
     if (g_ww_used > WW_SLOTS / 2) { memset(g_ww_tab, 0, WW_SLOTS * sizeof *g_ww_tab); g_ww_used = 0; g_ww_floor = ++g_ww_stamp; newest = g_ww_floor; }      /* forget: everything counts as written once */
     if (count) {
         uint64_t stamp = ++g_ww_stamp;
         if (count == 16384) {                      /* more written pages than the list holds: stamp the whole range */
-            ResetWriteWatch((void *)p, n);
             for (uint64_t pg = first; pg <= last; pg++) *ww_slot(pg, 1) = stamp;
         } else for (uintptr_t i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = stamp;
     }
@@ -1450,7 +1463,7 @@ static void shv_record(uint64_t h, int stage, const uint32_t *key) {      /* ren
 }
 static plat_lock_t g_shw_lock;
 static ShJob *g_shw_head, *g_shw_tail;
-static HANDLE g_shw_sem;
+static plat_sem *g_shw_sem;
 static uint64_t g_shw_seen[16384];
 static int g_shw_n;
 /* ---- the driver's work at the first draw of a shader pair, done ahead by the workers
@@ -1642,7 +1655,7 @@ static void pw_enqueue(ShJob *j) {
     g_shw_tail = j;
     plat_unlock(&g_shw_lock);
     plat_inc(&g_shw_queued);
-    ReleaseSemaphore(g_shw_sem, 1, NULL);
+    plat_sem_post(g_shw_sem, 1);
 }
 /* Start-up (prec_load): a pair that a draw used in an earlier run. */
 static void pw_queue_named(uint64_t vh, uint32_t vl, uint64_t fh, uint32_t fl, uint32_t mask) {
@@ -1675,35 +1688,26 @@ static void pw_gate(void) {
     while (g_shw_queued != g_shw_done) {
         plat_sleep_ms(2);
         if (pf_now() - last > freq) {            /* once per second while it lasts: the log and the window title */
-            if (!title[0] && !GetWindowTextA(g_hwnd, title, sizeof title)) strcpy(title, " ");
+            if (!title[0]) snprintf(title, sizeof title, "%s", getenv("SMO_TITLE") ? getenv("SMO_TITLE") : "Super Mario Odyssey (smo-recomp)");
             last = pf_now();
             snprintf(text, sizeof text, "%s - preparing shaders: %lld to go", title, (long long)(g_shw_queued - g_shw_done));
-            SetWindowTextA(g_hwnd, text);
+            display_set_title(text);
             printf("nvn_gl: preparing shaders, present held for %.0f s so far: %lld jobs to go (%lld pairs made ready, %lld of them not in the driver's cache)%c", (double)(last - t0) / (double)freq,
                    (long long)(g_shw_queued - g_shw_done), (long long)g_pw_warmed, (long long)g_pw_cold_n, 10);
             fflush(stdout);
         }
     }
     HS_OUT();
-    if (title[0]) SetWindowTextA(g_hwnd, title);
+    if (title[0]) display_set_title(title);
     plat_xchg(&g_pw_cold, 0);
     g_pw_gate_ticks += pf_now() - t0; g_pw_gates++;
     g_pw_gate_t0 = 0;
     printf("nvn_gl: shader preparation held the present of frame %lld for %.2f s (%lld jobs)%c", (long long)g_st.frames + 1, (double)(pf_now() - t0) / (double)freq, (long long)(g_shw_done - start_done), 10);
 }
 static uint32_t shd_worker(void * arg) {
-    PIXELFORMATDESCRIPTOR pfd;
     (void)arg;
-    HWND w = CreateWindowExA(0, "STATIC", "", WS_POPUP, 0, 0, 8, 8, NULL, NULL, NULL, NULL);
-    HDC dc = w ? GetDC(w) : NULL;
-    memset(&pfd, 0, sizeof pfd);
-    pfd.nSize = sizeof pfd; pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-    pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32;
-    if (!dc || !SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd)) return 0;
-    HGLRC rc = wglCreateContext(dc);
-    if (!rc || !wglMakeCurrent(dc, rc)) { plat_inc(&g_shw_ctx_failed); return 0; }
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    plat_inc(&g_shw_ctx_failed);                   /* the OpenGL back end does not run on Linux: no worker contexts */
+    return 0;
     GLuint pw_pipe = 0, pw_empty = 0;                  /* the pair jobs draw one discarded point through this pipeline */
     if (!getenv("SMO_GL_DRIVER_THREAD")) { glEnable(GL_DEBUG_OUTPUT_); glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_); }
     {   static const char *const src[1] = {"#version 450\nvoid main() {}\n"};
@@ -1720,7 +1724,7 @@ static uint32_t shd_worker(void * arg) {
         for (GLuint k = 0; k < 16; k++) { glVertexAttribFormat(k, 4, 0x1406 /* FLOAT */, 0, 0); glVertexAttribBinding(k, 0); }
     }
     for (;;) {
-        WaitForSingleObject(g_shw_sem, PLAT_INFINITE);
+        plat_sem_wait(g_shw_sem, PLAT_INFINITE);
         plat_lock(&g_shw_lock);
         ShJob *j = g_shw_head;
         if (j) { g_shw_head = j->next; if (!g_shw_head) g_shw_tail = NULL; }
@@ -1739,7 +1743,7 @@ static uint32_t shd_worker(void * arg) {
             char path[320];
             size_t len = strlen(out.glsl);
             shd_path(path, sizeof path, sh_hash(0x9E3779B97F4A7C15ULL ^ (uint64_t)j->stage, out.glsl, len), len);
-            if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) plat_inc(&g_shw_present);
+            if (plat_file_size(path) >= 0) plat_inc(&g_shw_present);
             else {
                 GLint ok = 0;
                 int saved = 0;
@@ -1758,13 +1762,14 @@ static uint32_t shd_worker(void * arg) {
 static void shd_workers_start(void) {
     const char *e = getenv("SMO_SHADER_WORKERS");
     g_shw_n = e ? atoi(e) : 3;
+    if (g_vk) g_shw_n = 0;                         /* OpenGL shader workers: the Vulkan renderer has its own (nvn_vk_pipelines.c) */
     if (g_shw_n < 0) g_shw_n = 0;
     if (g_shw_n > 8) g_shw_n = 8;
     plat_lock_init(&g_shw_lock);
     for (int i = 0; i < 64; i++) plat_lock_init(&g_pw_stripe[i]);
     if (!getenv("SMO_NO_SHADER_VARIANTS")) shv_load();
-    g_shw_sem = CreateSemaphoreA(NULL, 0, 0x7fffffff, NULL);
-    for (int i = 0; i < g_shw_n; i++) CloseHandle(CreateThread(NULL, 0, shd_worker, NULL, 0, NULL));
+    g_shw_sem = plat_sem_new(0);
+    for (int i = 0; i < g_shw_n; i++) plat_thread_detach(plat_thread_start(shd_worker, NULL, 0));
 }
 /* Guest thread, nvnProgramSetShaders: a vertex or fragment stage given as machine code. */
 static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint8_t *cdata, uint32_t cdata_size) {
@@ -1797,7 +1802,7 @@ static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint
     if (seen) { free(j); return; }
     plat_xadd(&g_shw_queued, 1 + extra);
     g_shv_queued += extra;
-    ReleaseSemaphore(g_shw_sem, 1 + extra, NULL);
+    plat_sem_post(g_shw_sem, 1 + extra);
     /* nvnProgramSetShaders holds its caller while every worker is busy compiling (not during start-up, where
      * the game hands over 6,800 stages at once and nothing of them is drawn yet). A stage or character loaded later brings
      * stages that were never compiled on this PC; without this the game finished loading while the workers were still
@@ -3675,30 +3680,23 @@ static uint32_t g_pf_main_tid;
 const char *guest_thread_name_of(uint32_t tid);                             /* os_threads.c */
 static int pf_cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 static void pf_threads(double frames) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    THREADENTRY32 te;
-    uint32_t pid = getpid();
     struct { uint32_t tid; double ms; } top[512];
     int n = 0;
     double total = 0;
-    if (snap == INVALID_HANDLE_VALUE) return;
-    te.dwSize = sizeof te;
-    for (int ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-        if (te.th32OwnerProcessID != pid) continue;
-        HANDLE h = OpenThread(0x0800 /* THREAD_QUERY_LIMITED_INFORMATION */, 0, te.th32ThreadID);
-        FILETIME c, e, k, u;
-        if (!h) continue;
-        if (GetThreadTimes(h, &c, &e, &k, &u)) {
-            uint64_t cpu = (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime), prev = 0;
-            int i;
-            for (i = 0; i < g_pf_nthr && g_pf_thr[i].tid != te.th32ThreadID; i++) {}
-            if (i < g_pf_nthr) prev = g_pf_thr[i].cpu; else if (g_pf_nthr < 512) { g_pf_thr[g_pf_nthr].tid = te.th32ThreadID; i = g_pf_nthr++; }
-            if (i < 512) g_pf_thr[i].cpu = cpu;
-            if (n < 512) { top[n].tid = te.th32ThreadID; top[n].ms = (double)(cpu - prev) / 10000.0 / frames; total += top[n].ms; n++; }
-        }
-        CloseHandle(h);
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        uint32_t tid = (uint32_t)strtoul(de->d_name, NULL, 10);
+        uint64_t cpu = plat_thread_cpu_ns((pid_t)tid), prev = 0;
+        int i;
+        for (i = 0; i < g_pf_nthr && g_pf_thr[i].tid != tid; i++) {}
+        if (i < g_pf_nthr) prev = g_pf_thr[i].cpu; else if (g_pf_nthr < 512) { g_pf_thr[g_pf_nthr].tid = tid; i = g_pf_nthr++; }
+        if (i < 512) g_pf_thr[i].cpu = cpu;
+        if (n < 512) { top[n].tid = tid; top[n].ms = (double)(cpu - prev) / 1e6 / frames; total += top[n].ms; n++; }
     }
-    CloseHandle(snap);
+    closedir(d);
     printf("nvn_perf: cpu ms/frame by thread (all %.1f):", total);
     for (int k = 0; k < 10; k++) {
         int best = -1;
@@ -3710,7 +3708,7 @@ static void pf_threads(double frames) {
     }
     printf("\n");
 }
-static uint32_t pf_threads_thread(void * arg) { for (;;) { WaitForSingleObject((HANDLE)arg, PLAT_INFINITE); pf_threads(300.0); } }
+static uint32_t pf_threads_thread(void * arg) { for (;;) { plat_event_wait((plat_event *)arg, PLAT_INFINITE); pf_threads(300.0); } }
 static void pf_frame_mark(int64_t frame) {
     static int64_t last, freq, snap[PF_N], snapn[PF_N], b0[3];
     int64_t now = pf_now();
@@ -3759,10 +3757,9 @@ static void pf_frame_mark(int64_t frame) {
                    d[15], d[14], d[6], d[7], d[8], d[9], d[10], d[11], d[12], d[13], d[0], d[1], d[2], d[3], d[4], d[5]);
         }
     }
-    {   /* the snapshot of all threads (CreateToolhelp32Snapshot) took 30-70 ms on the render thread: one long
-         * frame in every 300 (hitch log, "present" scope). It is taken by a helper thread now. */
-        static HANDLE ev;
-        if (!ev) { ev = plat_event_new(0, 0); CloseHandle(CreateThread(NULL, 0, pf_threads_thread, ev, 0, NULL)); }
+    {   /* the CPU time of all threads is read by a helper thread (on Windows the snapshot took 30-70 ms on the render thread) */
+        static plat_event *ev;
+        if (!ev) { ev = plat_event_new(0, 0); plat_thread_detach(plat_thread_start(pf_threads_thread, ev, 0)); }
         plat_event_set(ev);
     }
 }
@@ -3785,11 +3782,11 @@ static void job_present(void *arg) {
     PresentJob *j = arg;
     static int shot = -2, every, shot_from, shot_to;
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
-    RECT r;
+    struct { int right, bottom; } r = {0, 0};
     int64_t frame = g_st.frames + 1;
     int64_t pf0 = pf_now();
     if (shot == -2) { shot = getenv("SMO_SHOT") ? atoi(getenv("SMO_SHOT")) : -1; every = getenv("SMO_SHOT_EVERY") ? atoi(getenv("SMO_SHOT_EVERY")) : 0; shot_from = getenv("SMO_SHOT_FROM") ? atoi(getenv("SMO_SHOT_FROM")) : 0; shot_to = getenv("SMO_SHOT_TO") ? atoi(getenv("SMO_SHOT_TO")) : 0x7fffffff; }
-    GetClientRect(g_hwnd, &r);
+    display_size(&r.right, &r.bottom);
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_FRAMEBUFFER_SRGB_);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER_, 0);
@@ -3829,7 +3826,7 @@ static void job_present(void *arg) {
         glClearColor(0, 0, 0, 1);                 /* nothing has been drawn into the presented texture yet */
         glClear(GL_COLOR_BUFFER_BIT);
     }
-    { int64_t pf1 = pf_now(); HS_IN("SwapBuffers", 0); SwapBuffers(g_dc); HS_OUT(); pf_add(PF_SWAP, pf1); }
+    { int64_t pf1 = pf_now(); HS_IN("SwapBuffers", 0); HS_OUT(); pf_add(PF_SWAP, pf1); }
     pf_add(PF_PRESENT, pf0);
     pf_frame_mark(frame);
     g_joblog_cur = frame;
@@ -3886,14 +3883,14 @@ static void job_write_texels(void *arg) {
 /* The render thread's job loop (both back ends). */
 static void render_loop(void) {
     for (;;) {
-        WaitForSingleObject(g_job_event, PLAT_INFINITE);
+        plat_event_wait(g_job_event, PLAT_INFINITE);
         for (;;) {
             plat_lock(&g_job_lock);
             Job *j = g_job_head;
             if (j) { g_job_head = j->next; if (!g_job_head) g_job_tail = NULL; }
             plat_unlock(&g_job_lock);
             if (!j) break;
-            HANDLE done = j->done;
+            plat_event *done = j->done;
             if (g_rb->idle) g_rb->idle();
             g_hitch_rt = j->fn == g_rb->submit || j->fn == g_rb->submit_async ? "submitted commands (outside the named scopes)" : j->fn == g_rb->present ? "present (blit)" : j->fn == g_rb->sync_wait ? "SyncWait job" : "other job (texel read/write, finish, barrier, ...)";
             if (g_tl_on) nvn_tl(TL_JOB_BEGIN, tl_kind(j->fn));
@@ -3911,8 +3908,8 @@ static uint32_t render_thread(void * arg) {
     (void)arg;
     pf_job_submit = g_rb->submit; pf_job_present = g_rb->present;
     g_joblog_frame = getenv("SMO_JOBLOG") ? atoi(getenv("SMO_JOBLOG")) : 0;
-    PIXELFORMATDESCRIPTOR pfd;
     g_render_tid = plat_tid();
+    plat_set_thread_name("smo-render");
     if (g_vk) {                                 /* no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
         os_pin_render_thread();                 /* away from the console cores; with SMO_HOST_LAYOUT=1 on a core of its own (os_threads.c) */
         nvn_vk_init(g_hwnd);
@@ -3921,25 +3918,9 @@ static uint32_t render_thread(void * arg) {
         render_loop();
         return 0;
     }
-    g_dc = GetDC(g_hwnd);
-    memset(&pfd, 0, sizeof pfd);
-    pfd.nSize = sizeof pfd; pfd.nVersion = 1;
-    pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-    pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32;
-    SetPixelFormat(g_dc, ChoosePixelFormat(g_dc, &pfd), &pfd);
-    HGLRC rc = wglCreateContext(g_dc);
-    if (!rc || !wglMakeCurrent(g_dc, rc)) { printf("nvn_gl: cannot create an OpenGL context (error %lu)\n", GetLastError()); fflush(stdout); plat_exit(5); }
-    int missing = 0;
-#define X(ret, name, args) gl##name = (void *)wglGetProcAddress("gl" #name); if (!gl##name) { printf("nvn_gl: the driver lacks gl" #name "\n"); missing++; }
-    GLF(X)
-#undef X
-#define X(ret, name, args) gl##name = (void *)wglGetProcAddress("gl" #name);
-    GLO(X)
-#undef X
-    printf("nvn_gl: %s | %s | OpenGL %s\n", (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
-    if (missing) { printf("nvn_gl: %d required OpenGL functions are missing; this backend needs an NVIDIA driver\n", missing); fflush(stdout); plat_exit(5); }
-    int (*swap_interval)(int) = (void *)wglGetProcAddress("wglSwapIntervalEXT");
-    if (swap_interval) swap_interval(0);
+    /* the OpenGL back end below needs a context this port does not make (no WGL on Linux): unreachable, nvn_gl_start
+     * only chooses Vulkan. The code stays for the front end it shares, until it is taken apart. */
+    printf("nvn_gl: the OpenGL renderer is not available on Linux\n"); fflush(stdout); plat_exit(5);
     g_debug = getenv("SMO_GLDEBUG") != NULL;
     g_dbg_noscissor = getenv("SMO_NOSCISSOR") != NULL;
     g_dbg_flipface = getenv("SMO_FLIPFACE") != NULL;
@@ -3985,7 +3966,6 @@ static uint32_t render_thread(void * arg) {
     S.ds = 0x1111118822ULL;                     /* depth func LESS, stencil funcs ALWAYS, ops KEEP */
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);
-    SwapBuffers(g_dc);
     fflush(stdout);
     shd_init();
     hitch_set_render();
@@ -3996,22 +3976,21 @@ static uint32_t render_thread(void * arg) {
 }
 
 /* Called by display.c once the window exists. */
-void nvn_gl_start(void *hwnd) {
-    g_hwnd = hwnd;
-    {   /* which back end. SMO_RENDERER=gl | vk (default: vk) */
+void nvn_gl_start(void *window) {
+    g_hwnd = window;
+    {   /* the back end: Vulkan, the only renderer on Linux (SMO_RENDERER=gl and renderer = opengl are refused) */
         const char *e = getenv("SMO_RENDERER");
-        if (e && e[0] && strcmp(e, "gl") && strcmp(e, "vk")) { printf("nvn: SMO_RENDERER=%s is not a renderer (gl, vk)\n", e); fflush(stdout); plat_exit(5); }
-        /* VULKAN IS THE DEFAULT. SMO_RENDERER=gl|vk wins; else renderer = vulkan | opengl of config\graphics.ini. */
-        g_vk = e && e[0] ? !strcmp(e, "vk") : !gfx_options()->renderer;
-        g_rb = g_vk ? &rb_vk : &rb_gl;
-        printf("nvn: renderer: %s (%s)\n", g_vk ? "Vulkan (nvn_vk.c)" : "OpenGL (nvn_gl.c)", e && e[0] ? "SMO_RENDERER" : "graphics.ini; the default is Vulkan");
+        if ((e && e[0] && strcmp(e, "vk")) || gfx_options()->renderer) printf("nvn: the OpenGL renderer does not exist on Linux: Vulkan is used (SMO_RENDERER / graphics.ini renderer ignored)\n");
+        g_vk = 1;
+        g_rb = &rb_vk;
+        printf("nvn: renderer: Vulkan (nvn_vk.c)\n");
     }
     plat_lock_init(&g_job_lock);
     plat_lock_init(&g_dead_lock);
     g_job_event = plat_event_new(0, 0);
     g_ready_event = plat_event_new(1, 0);
-    CreateThread(NULL, 16 << 20, render_thread, NULL, 0, NULL);
-    WaitForSingleObject(g_ready_event, PLAT_INFINITE);
+    plat_thread_detach(plat_thread_start(render_thread, NULL, 16 << 20));
+    plat_event_wait(g_ready_event, PLAT_INFINITE);
 }
 
 void nvn_gl_report(FILE *out) {
@@ -4390,7 +4369,7 @@ static void tex_finalize(Ctx *c) {
          * is a slot that names this texture */
         int32_t id = -1;
         int released = 0, own = 0;
-        __try { id = (int32_t)rd32(A0 + 0xc0); own = rd8(A0 + 0xc4) & 1; } __except (1) { own = 0; }     /* past the 0xc0 bytes of an NVNtexture: an object of another kind may end there */
+        if (plat_readable((const void *)(uintptr_t)(A0 + 0xc0), 5)) { id = (int32_t)rd32(A0 + 0xc0); own = rd8(A0 + 0xc4) & 1; } else own = 0;     /* past the 0xc0 bytes of an NVNtexture: an object of another kind may end there */
         if (own && id >= 0) {
             plat_rw_wlock(&g_pool_lock);
             for (int i = 0; i < g_ntpools && !released; i++) {
@@ -4797,7 +4776,7 @@ static void win_set_crop(Ctx *c) { Window *w = hobj(A0, K_WIN); if (w) { w->crop
  * lower 1% lows queued (39-48 fps against 43-55): where neither thread is busy all the time, overlapping the frames only
  * makes the moments of the presents less even. Queued by default since the renderer's later speed changes: the same place
  * then measured 60.0 fps in each of 20 windows of 300 frames (1% lows 55.8 at the lowest), and busy scenes gain. */
-static HANDLE g_present_ev;
+static plat_event *g_present_ev;
 static int g_present_out, g_present_sync = -1;
 static void job_present_signal(void *arg) { g_rb->present(arg); plat_event_set(g_present_ev); }
 static volatile int64_t g_presents_queued;              /* nvnQueuePresentTexture calls of the game: the frame it builds is this + 1 */
@@ -4815,7 +4794,7 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
         if (g_present_out) {                            /* the previous frame has been shown before this one is queued */
             int64_t pf0 = pf_now();
             hitch_wait_render(1);
-            WaitForSingleObject(g_present_ev, PLAT_INFINITE);
+            plat_event_wait(g_present_ev, PLAT_INFINITE);
             hitch_wait_render(0);
             pf_add(PF_WAIT_PRESENT_, pf0);
         }
@@ -4827,7 +4806,7 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
          * frame, until the menu is closed */
         int amiibo_menu_wanted(void); void amiibo_menu_run(void *present_job);
         if (amiibo_menu_wanted()) {
-            if (!g_present_sync && g_present_out) { WaitForSingleObject(g_present_ev, PLAT_INFINITE); g_present_out = 0; }   /* this frame shown first */
+            if (!g_present_sync && g_present_out) { plat_event_wait(g_present_ev, PLAT_INFINITE); g_present_out = 0; }   /* this frame shown first */
             amiibo_menu_run(&j);
         }
     }
@@ -5644,7 +5623,7 @@ static void vk_shutdown_at_exit(void) {
     g_job_tail = &j;
     plat_unlock(&g_job_lock);
     plat_event_set(g_job_event);
-    if (WaitForSingleObject(j.done, 3000) != WAIT_OBJECT_0) { printf("nvn_vk: shutdown NOT run: the render thread did not take the job within 3 s\n"); fflush(stdout); }
+    if (!plat_event_wait(j.done, 3000)) { printf("nvn_vk: shutdown NOT run: the render thread did not take the job within 3 s\n"); fflush(stdout); }
 }
 
 /* nvnBufferFlushMappedRange / nvnMemoryPoolFlushMappedRange (nvn_stub.c): the CPU wrote this memory. Textures stored there are read again. */

@@ -13,81 +13,81 @@
 #include "gfx_options.h"
 
 static const char *const k_default_ini =
-"; graphics.ini: display and rendering options of the native build (read once at start by gfx_options.c).\r\n"
-"; Delete the file to get it written again with these defaults. A line starting with ';' is a comment.\r\n"
-"; Every value below is the default; the defaults draw exactly what the game draws on the console.\r\n"
-"\r\n"
-"; renderer = vulkan | opengl\r\n"
-";   vulkan: the default. opengl: the first renderer (NVIDIA only), kept as a fallback.\r\n"
-"renderer = vulkan\r\n"
-"\r\n"
-"; window = borderless_window | borderless_fullscreen | windowed | fullscreen\r\n"
-";   borderless_window:     a window without a frame or title bar, the size below, centred on the screen. Drag it\r\n"
-";                          anywhere to move it; double-click it for borderless_fullscreen and back.\r\n"
-";   borderless_fullscreen: no frame, covers the monitor the window is on (the desktop keeps its resolution).\r\n"
-";   windowed:              a normal window with a title bar, the client size below.\r\n"
-";   fullscreen:            as borderless_fullscreen, and always on top. (Exclusive fullscreen with a mode change is\r\n"
-";                          not implemented.)\r\n"
-";   F11 switches between covering the monitor and the window while the game runs.\r\n"
-"window = borderless_window\r\n"
-"width = 1280\r\n"
-"height = 720\r\n"
-"\r\n"
-"; unfocused = run | pause\r\n"
-";   What the game does while its window is not the active window (another program has the focus) or is minimised.\r\n"
-";   run:   it keeps running; pads and the keyboard count only while the window is active.\r\n"
-";   pause: it stops until the window is active again, as the console stops the game while the HOME menu is open.\r\n"
-"unfocused = run\r\n"
-"\r\n"
-"; vsync = clock | on | off | mailbox      (Vulkan)\r\n"
-";   clock:   frames are shown at once (mailbox when the GPU offers it, else immediate) and the game is paced by the\r\n"
-";            program's own 60 Hz clock. Lowest latency; can tear only when mailbox is missing.\r\n"
-";   on:      the display's own vertical sync (FIFO). No tearing; on a display that is not 60 Hz the two clocks drift.\r\n"
-";   off:     immediate presentation, tearing allowed. The game still runs at 60 frames per second.\r\n"
-";   mailbox: mailbox or nothing (falls back to clock's choice with a message when the GPU does not offer it).\r\n"
-"vsync = clock\r\n"
-"\r\n"
-"; gpu = auto | <number> | <part of the name>      (Vulkan)\r\n"
-";   auto: a discrete GPU first, then an integrated one. The log lists the devices with their numbers:\r\n"
-";   'nvn_vk: device 0: ...'. Examples: gpu = 1      gpu = Intel      gpu = RTX\r\n"
-"gpu = auto\r\n"
-"\r\n"
-"; console_mode = docked | handheld\r\n"
-";   What nn::oe::GetOperationMode answers. Leave it at docked: handheld is not measured on PC.\r\n"
-"console_mode = docked\r\n"
-"\r\n"
-"; resolution_scale = 1.0\r\n"
-";   Internal resolution scale, 0.25 to 1.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's own (its picture is\r\n"
-";   1600x900). 0.75 = 1200x675, 0.5 = 800x450: the main switch for a weak GPU. The whole picture is drawn smaller, the\r\n"
-";   2D interface too (it gets softer), and is scaled to the window size.\r\n"
-"resolution_scale = 1.0\r\n"
-"\r\n"
-"; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\r\n"
-";   game: each texture sampler keeps the value the game gave it. A number: at least that much on every sampler that\r\n"
-";   filters between mip levels (sharper textures at flat angles; changes the picture, costs little on any GPU).\r\n"
-"anisotropic_filtering = game\r\n"
-"\r\n"
-"; shader_wait = hold | skip      (Vulkan)\r\n"
-";   What happens when a draw needs a shader or pipeline that is not ready yet (mostly the first time something is shown\r\n"
-";   on this PC). hold: the frame waits for it (a late frame, a correct picture). skip: during play the draw is\r\n"
-";   left out until it is ready (no late frame; the object or effect is missing for some frames). The log counts both.\r\n"
-"shader_wait = hold\r\n"
-"\r\n"
-"; profile = custom | low\r\n"
-";   custom: every key of this file as written. low: the set for a weak or integrated GPU: resolution_scale = 0.5,\r\n"
-";   anisotropic_filtering = game, vsync = clock; those three keys of the file are then not used. The log says which\r\n"
-";   profile is active.\r\n"
-"profile = custom\r\n"
-"\r\n"
-"; frame_time_overlay = off | on\r\n"
-";   on: the average frame time of the last second in the window title ('.. fps - 16.67 ms per frame') and as a\r\n"
-";   'frame-time:' line in the log. (Bars drawn into the picture are not implemented yet.)\r\n"
-"frame_time_overlay = off\r\n";
+"; graphics.ini: display and rendering options of the native build (read once at start by gfx_options.c).\n"
+"; Delete the file to get it written again with these defaults. A line starting with ';' is a comment.\n"
+"; Every value below is the default; the defaults draw exactly what the game draws on the console.\n"
+"\n"
+"; renderer = vulkan\n"
+";   Vulkan is the only renderer of the Linux build.\n"
+"renderer = vulkan\n"
+"\n"
+"; window = borderless_window | borderless_fullscreen | windowed | fullscreen\n"
+";   borderless_window:     a window without a frame or title bar, the size below, centred by the compositor.\n"
+";                          Double-click it for borderless_fullscreen and back.\n"
+";   borderless_fullscreen: no frame, covers the monitor the window is on (the desktop keeps its resolution).\n"
+";   windowed:              a normal window with a title bar, the client size below.\n"
+";   fullscreen:            as borderless_fullscreen, and always on top. (Exclusive fullscreen with a mode change is\n"
+";                          not implemented.)\n"
+";   F11 switches between covering the monitor and the window while the game runs.\n"
+"window = borderless_window\n"
+"width = 1280\n"
+"height = 720\n"
+"\n"
+"; unfocused = run | pause\n"
+";   What the game does while its window is not the active window (another program has the focus) or is minimised.\n"
+";   run:   it keeps running; pads and the keyboard count only while the window is active.\n"
+";   pause: it stops until the window is active again, as the console stops the game while the HOME menu is open.\n"
+"unfocused = run\n"
+"\n"
+"; vsync = clock | on | off | mailbox      (Vulkan)\n"
+";   clock:   frames are shown at once (mailbox when the GPU offers it, else immediate) and the game is paced by the\n"
+";            program's own 60 Hz clock. Lowest latency; can tear only when mailbox is missing.\n"
+";   on:      the display's own vertical sync (FIFO). No tearing; on a display that is not 60 Hz the two clocks drift.\n"
+";   off:     immediate presentation, tearing allowed. The game still runs at 60 frames per second.\n"
+";   mailbox: mailbox or nothing (falls back to clock's choice with a message when the GPU does not offer it).\n"
+"vsync = clock\n"
+"\n"
+"; gpu = auto | <number> | <part of the name>      (Vulkan)\n"
+";   auto: a discrete GPU first, then an integrated one. The log lists the devices with their numbers:\n"
+";   'nvn_vk: device 0: ...'. Examples: gpu = 1      gpu = Intel      gpu = RTX\n"
+"gpu = auto\n"
+"\n"
+"; console_mode = docked | handheld\n"
+";   What nn::oe::GetOperationMode answers. Leave it at docked: handheld is not measured on PC.\n"
+"console_mode = docked\n"
+"\n"
+"; resolution_scale = 1.0\n"
+";   Internal resolution scale, 0.25 to 1.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's own (its picture is\n"
+";   1600x900). 0.75 = 1200x675, 0.5 = 800x450: the main switch for a weak GPU. The whole picture is drawn smaller, the\n"
+";   2D interface too (it gets softer), and is scaled to the window size.\n"
+"resolution_scale = 1.0\n"
+"\n"
+"; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\n"
+";   game: each texture sampler keeps the value the game gave it. A number: at least that much on every sampler that\n"
+";   filters between mip levels (sharper textures at flat angles; changes the picture, costs little on any GPU).\n"
+"anisotropic_filtering = game\n"
+"\n"
+"; shader_wait = hold | skip      (Vulkan)\n"
+";   What happens when a draw needs a shader or pipeline that is not ready yet (mostly the first time something is shown\n"
+";   on this PC). hold: the frame waits for it (a late frame, a correct picture). skip: during play the draw is\n"
+";   left out until it is ready (no late frame; the object or effect is missing for some frames). The log counts both.\n"
+"shader_wait = hold\n"
+"\n"
+"; profile = custom | low\n"
+";   custom: every key of this file as written. low: the set for a weak or integrated GPU: resolution_scale = 0.5,\n"
+";   anisotropic_filtering = game, vsync = clock; those three keys of the file are then not used. The log says which\n"
+";   profile is active.\n"
+"profile = custom\n"
+"\n"
+"; frame_time_overlay = off | on\n"
+";   on: the average frame time of the last second in the window title ('.. fps - 16.67 ms per frame') and as a\n"
+";   'frame-time:' line in the log. (Bars drawn into the picture are not implemented yet.)\n"
+"frame_time_overlay = off\n";
 
 #define GFX_LOW_SCALE 0.5f
 #define GFX_LOW_SCALE_TEXT "0.50"
 static GfxOptions g_opt;
-static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 
 static void trim(char *s) {
     char *e = s + strlen(s);
@@ -102,19 +102,17 @@ static void opt_path(char *out) {
     if (e && e[0]) { snprintf(out, PATH_MAX, "%s", e); return; }
     if (c && c[0]) {
         snprintf(tmp, sizeof tmp, "%s", c);
-        char *s = strrchr(tmp, '\\'), *s2 = strrchr(tmp, '/');
-        if (s2 > s) s = s2;
-        if (s) { *s = 0; snprintf(out, PATH_MAX, "%s\\graphics.ini", tmp); } else snprintf(out, PATH_MAX, "graphics.ini");
+        char *s = strrchr(tmp, '/');
+        if (s) { *s = 0; snprintf(out, PATH_MAX, "%s/graphics.ini", tmp); } else snprintf(out, PATH_MAX, "graphics.ini");
         return;
     }
-    snprintf(exe, sizeof exe, "%s", plat_exe_path());
-    char *s = strrchr(exe, '\\');
-    if (s) *s = 0;
-    snprintf(tmp, sizeof tmp, "%s\\..\\config\\graphics.ini", exe);
-    if (!_fullpath(out, tmp, PATH_MAX)) snprintf(out, PATH_MAX, "%s", tmp);
+    snprintf(exe, sizeof exe, "%s", plat_exe_dir());
+    snprintf(tmp, sizeof tmp, "%s/../config", exe);
+    char real[PATH_MAX];
+    if (realpath(tmp, real)) snprintf(out, PATH_MAX, "%s/graphics.ini", real);
+    else snprintf(out, PATH_MAX, "%s/graphics.ini", tmp);
 }
-static int opt_load(PINIT_ONCE once, void * arg, void * *ctx) {
-    (void)once; (void)arg; (void)ctx;
+static void opt_load(void) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
@@ -124,7 +122,7 @@ static int opt_load(PINIT_ONCE once, void * arg, void * *ctx) {
     if (!f) {
         char b[PATH_MAX];
         snprintf(b, sizeof b, "%s", o->path);
-        for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; plat_mkdir(b); *p = '\\'; }
+        for (char *p = b + 1; *p; p++) if (*p == '/') { *p = 0; plat_mkdir(b); *p = '/'; }
         if ((f = fopen(o->path, "wb")) != NULL) { fwrite(k_default_ini, 1, strlen(k_default_ini), f); fclose(f); written = 1; }
         f = fopen(o->path, "rb");
     }
@@ -163,10 +161,10 @@ static int opt_load(PINIT_ONCE once, void * arg, void * *ctx) {
            unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
+    if (o->renderer) printf("graphics options: renderer=opengl is not available on Linux: Vulkan is used\n");
     fflush(stdout);
-    return 1;
 }
 const GfxOptions *gfx_options(void) {
-    InitOnceExecuteOnce(&g_once, opt_load, NULL, NULL);
+    pthread_once(&g_once, opt_load);
     return &g_opt;
 }

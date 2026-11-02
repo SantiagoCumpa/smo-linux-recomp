@@ -1482,7 +1482,7 @@ static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeo
 static void prewarm_start(void) {
     plat_lock_init(&g_sh_lock); plat_lock_init(&g_gpl_lock);
     plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
-    plat_mkdir(vkc_dir()); plat_mkdir(vkc_file("spv")); plat_mkdir(vkc_file("stage"));
+    plat_mkdirs(vkc_dir()); plat_mkdir(vkc_file("spv")); plat_mkdir(vkc_file("stage"));
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
     {   int smo_glsl_to_spirv(int, const char *, uint32_t **, size_t *, char *, size_t); void smo_spirv_free(uint32_t *);   /* vk_shaderc_shim.c */
         g_glsl_to_spirv = smo_glsl_to_spirv; g_spirv_free = smo_spirv_free;
