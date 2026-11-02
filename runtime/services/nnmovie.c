@@ -29,10 +29,8 @@ static void virtual_call(Ctx *c) {
                 g_seen[k][i] = 1;
                 printf("movie: %s called (x1=%llx x2=%llx) -> failure\n", name, (unsigned long long)c->x[1], (unsigned long long)c->x[2]);
                 for (int r = 1; r <= 2; r++) {                    /* show arguments that are readable strings (file paths) */
-                    MEMORY_BASIC_INFORMATION mi;
-                    const char *s = (const char *)(uintptr_t)c->x[r];
-                    if (c->x[r] > 0x10000 && VirtualQuery(s, &mi, sizeof mi) && mi.State == MEM_COMMIT &&
-                        (const char *)mi.BaseAddress + mi.RegionSize - s >= 64 && s[0] >= 0x20 && s[0] < 0x7f)
+                    char s[64];
+                    if (c->x[r] > 0x10000 && plat_safe_read(s, (const void *)(uintptr_t)c->x[r], sizeof s) && s[0] >= 0x20 && s[0] < 0x7f)
                         printf("movie:   x%d -> \"%.60s\"\n", r, s);
                 }
             }

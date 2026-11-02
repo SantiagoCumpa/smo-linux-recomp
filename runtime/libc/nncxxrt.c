@@ -30,6 +30,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "plat.h"
+#include <execinfo.h>
+#include <dlfcn.h>
 #include "runtime.h"
 #include "hostrt.h"
 #include "eh_runtime.h"
@@ -54,16 +56,13 @@ uint64_t cxxrt_main_symbol(const char *name) {           /* address of a functio
         if (dyn_syms[i].defined && strcmp(dyn_syms[i].name, name) == 0) return GUEST_BASE + dyn_syms[i].value;
     return 0;
 }
-/* Whether [p, p + n) is committed, accessible memory: one VirtualQuery. */
+/* Whether [p, p + n) is mapped, readable memory: one process_vm_readv of it (plat_readable; never faults). */
 static volatile int64_t g_rd_asked;
-void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery\n", (long long)g_rd_asked); }
+void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by process_vm_readv\n", (long long)g_rd_asked); }
 int cxxrt_readable(uint64_t p, size_t n) {
-    MEMORY_BASIC_INFORMATION mi;
     if (p < 0x10000) return 0;
     g_rd_asked++;
-    if (!VirtualQuery((void *)(uintptr_t)p, &mi, sizeof mi)) return 0;
-    if (mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return 0;
-    return p + n <= (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize;
+    return plat_readable((const void *)(uintptr_t)p, n ? n : 1);
 }
 /* Calls guest (or host-table) code at addr with up to three arguments; returns x0. */
 uint64_t cxxrt_call(Ctx *c, uint64_t addr, uint64_t a0, uint64_t a1, uint64_t a2) {
@@ -83,19 +82,15 @@ void cxxrt_guest_delete(Ctx *c, uint64_t p) {            /* the game's own opera
     c->x[0] = x0;
 }
 void cxxrt_print_guest_stack(void) {
-    CONTEXT ctx;
-    RtlCaptureContext(&ctx);
+    /* the host stack (glibc's backtrace: the unwind tables of the executable and the game library), each frame named
+     * by the lifted function holding it */
+    void *frames[600];
+    int nf = backtrace(frames, 600);
     printf("guest call stack (innermost first):\n");
     uint64_t last = 0;
-    for (int depth = 0, shown = 0; depth < 600 && shown < 48; depth++) {
-        uint64_t g = guest_function_of(ctx.Rip);
+    for (int depth = 0, shown = 0; depth < nf && shown < 48; depth++) {
+        uint64_t g = guest_function_of((uintptr_t)frames[depth]);
         if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); trace_printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
-        uint64_t base;
-        RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
-        if (!rf) break;
-        void *hd; uint64_t est;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
-        if (!ctx.Rip) break;
     }
 }
 static void fatal(Ctx *c, const char *fmt, ...) {
@@ -275,10 +270,12 @@ static const MainResume *g_main_resume;
 static int g_main_resume_n;
 void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t));               /* nnunwind.c */
 static void eh_bind_main(void) {
-    HMODULE dll = NULL;
     typedef void (*BindFn)(void (*)(Ctx *, void (*)(Ctx *, uint64_t)), const MainResume **, int *);
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)&fn_table[0], &dll)) return;
-    BindFn bind = (BindFn)(void *)GetProcAddress(dll, "game_eh_bind");
+    Dl_info di;                                          /* the game library: the object holding the function table */
+    if (!dladdr((const void *)&fn_table[0], &di) || !di.dli_fname) return;
+    void *dll = dlopen(di.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+    if (!dll) return;
+    BindFn bind = (BindFn)dlsym(dll, "game_eh_bind");
     if (bind) bind(nro_catch_call, &g_main_resume, &g_main_resume_n);
     trace_printf("nncxxrt: main %s\n", bind ? "has landing-pad resume entries" : "was lifted without resume entries (exceptions cannot be handled in main code)");
 }
@@ -503,19 +500,11 @@ int cxxrt_uncaught(Ctx *c) { return eh_state(c)->uncaught > 0; }                
  * Itanium ABI: the first byte of the 64-bit guard is 1 once the object is initialised (the game tests it inline).
  * As in libc++abi the second byte marks "initialisation in progress" and the upper half records the initialising
  * thread, so other threads wait and a recursive initialisation is reported instead of deadlocking. */
-static plat_lock_t g_guard_lock;
-static plat_cond_t g_guard_cv;
-static INIT_ONCE g_guard_once = INIT_ONCE_STATIC_INIT;
-static int guard_init(PINIT_ONCE once, void * arg, void * *ctx) {
-    (void)once; (void)arg; (void)ctx;
-    plat_lock_init(&g_guard_lock);
-    plat_cond_init(&g_guard_cv);
-    return 1;
-}
+static plat_lock_t g_guard_lock = PLAT_LOCK_INIT;
+static plat_cond_t g_guard_cv = PLAT_COND_INIT;
 static void abi_guard_acquire(Ctx *c) {
     uint64_t g = A0;
     int r;
-    InitOnceExecuteOnce(&g_guard_once, guard_init, NULL, NULL);
     plat_lock(&g_guard_lock);
     for (;;) {
         if (rd8(g)) { r = 0; break; }
@@ -530,7 +519,6 @@ static void abi_guard_acquire(Ctx *c) {
     RET(r);
 }
 static void guard_finish(uint64_t g, int done) {
-    InitOnceExecuteOnce(&g_guard_once, guard_init, NULL, NULL);
     plat_lock(&g_guard_lock);
     wr32(g + 4, 0);
     wr8(g + 1, 0);
