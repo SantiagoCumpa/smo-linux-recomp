@@ -89,7 +89,9 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
   de Windows en `nnmisc.c`/`nvn_gl.c`, y la biblioteca del juego sin `soname`, con lo que `$ORIGIN` no servía) y
   corre `--shaderc-selftest` (OK) y `SMO_PAD_SELFTEST=1` (51/51 con mandos virtuales de SDL3)
 - [ ] Limpieza — quitar el código del backend OpenGL de `nvn_gl.c` (hoy inalcanzable; sus 38 llamadas a GL 1.1
-  enlazan contra `runtime/gfx/gl_absent.c`, que aborta si alguna se llamara) y luego borrar `gl_absent.c`
+  enlazan contra `runtime/gfx/gl_absent.c`, que aborta si alguna se llamara) y luego borrar `gl_absent.c`. Son
+  ~2500 líneas mezcladas con el front end: se hace **después de la Verificación 5**, para comparar antes/después
+  con el juego corriendo
 - [x] Fase 6 — barreras de memoria en `recomp.py`: `dmb`/`dsb` → `__atomic_thread_fence` (acquire con `LD`,
   release con `ST`, seq_cst el resto), `isb` → barrera del compilador, `ldar`/`ldaxr` → `lda<n>` (acquire),
   `stlr` → `stl<n>` (release) en `runtime.h`. Comprobado sin dump con `tests/check_ordered.py` (ELF falso; 256 casos
@@ -99,7 +101,8 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
   FreeType, sin OpenGL/WebView2/MF), `docs/debugging.md` (señales, `/proc`, nice/SCHED_IDLE, slots con flock),
   `.gitignore` (`*.so`, `smo_native`, `smo_test*`)
 - [ ] Verificación 1–2: dependencias y `setup.py --dump ./dump --check` (bloqueado: dump cifrado, ver arriba)
-- [ ] Verificación 3–4: autotests, shaders, texturas, fast paths
+- [~] Verificación 3–4: autotests, shaders, texturas, fast paths (sin dump ya pasan `check_fast_paths.py`,
+  `check_ordered.py`, `check_link.py` con la autoprueba de shaderc y la de mandos; el resto necesita la RomFS)
 - [ ] Verificación 5: jugar (`run.py play`)
 - [ ] Verificación 6–7: Cap Kingdom 13/13, stress de etapas
 
