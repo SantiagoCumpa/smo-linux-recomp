@@ -28,7 +28,14 @@
 #include "plat.h"
 #include "sdklift.h"
 
-#pragma comment(lib, "ws2_32.lib")
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])

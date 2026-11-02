@@ -1,5 +1,5 @@
 /* Included by nnnet.c: nn::nifm leftovers, nn::socket / nnsocket* (bsd + resolver) on
- * Winsock, nn::ssl / nnssl*, nn::nsd::ResolveEx.
+ * BSD sockets (Linux), nn::ssl / nnssl*, nn::nsd::ResolveEx.
  *
  * Sources: [sdk] = Super Smash Bros. Ultimate 13.0.4's SDK module, where ssbu-recomp read these functions (addresses quoted),
  * [suyu] = the suyu emulator's src/core (file named).
@@ -127,13 +127,13 @@ static void nifm_GetCurrentProxySetting(Ctx *c) {
     RET(0);
 }
 
-/* ================================================================== nn::socket on Winsock */
+/* ================================================================== nn::socket on the host's BSD sockets */
 #define SO_MAX_FD 128
 #define SO_O_NONBLOCK 0x800
-typedef struct { SOCKET s; int32_t refs; int type; int bound_any; } SoObj;
+typedef struct { int s; int32_t refs; int type; int bound_any; } SoObj;
 static struct { SoObj *o; int flags; } g_so_fd[SO_MAX_FD];
 static plat_rwlock_t g_so_lock = PLAT_RWLOCK_INIT;
-static int g_so_init, g_so_wsa;
+static int g_so_init;
 static _Thread_local int t_so_herrno;
 
 static int *so_errno_ptr(Ctx *c) {
@@ -151,43 +151,42 @@ static void so_need_init(Ctx *c, const char *what) {
         guest_trap("nn::socket call before Initialize (SDK abort)", c->x[30] - 4);
     }
 }
+/* host errno -> the console's (Horizon's bsd numbers are Linux's, so most pass through; [suyu] network.cpp's set) */
 static int so_wsa_errno(int e, int sending) {
     switch (e) {
     case 0: return 0;
-    case WSAEINTR: return 4;
-    case WSAEBADF: case WSAENOTSOCK: return e == WSAEBADF ? 9 : 88;
-    case WSAEACCES: return 13;
-    case WSAEFAULT: return 14;
-    case WSAEINVAL: return 22;
-    case WSAEMFILE: return 24;
-    case WSAEWOULDBLOCK: return 11;
-    case WSAEINPROGRESS: return 115;
-    case WSAEALREADY: return 114;
-    case WSAEDESTADDRREQ: return 89;
-    case WSAEMSGSIZE: return 90;
-    case WSAEPROTOTYPE: return 91;
-    case WSAENOPROTOOPT: return 92;
-    case WSAEPROTONOSUPPORT: return 93;
-    case WSAESOCKTNOSUPPORT: return 94;
-    case WSAEOPNOTSUPP: return 95;
-    case WSAEPFNOSUPPORT: return 96;
-    case WSAEAFNOSUPPORT: return 97;
-    case WSAEADDRINUSE: return 98;
-    case WSAEADDRNOTAVAIL: return 99;
-    case WSAENETDOWN: return 100;
-    case WSAENETUNREACH: return 101;
-    case WSAENETRESET: return 102;
-    case WSAECONNABORTED: return sending ? 32 : 103;      /* [suyu] network.cpp: Winsock reports a broken pipe on send this way */
-    case WSAECONNRESET: return 104;
-    case WSAENOBUFS: return 105;
-    case WSAEISCONN: return 106;
-    case WSAENOTCONN: return 107;
-    case WSAESHUTDOWN: return sending ? 32 : 108;
-    case WSAETIMEDOUT: return 110;
-    case WSAECONNREFUSED: return 111;
-    case WSAEHOSTDOWN: return 112;
-    case WSAEHOSTUNREACH: return 113;
+    case EINTR: case EBADF: case EACCES: case EFAULT: case EINVAL: case EMFILE: case EAGAIN: case EINPROGRESS:
+    case EALREADY: case ENOTSOCK: case EDESTADDRREQ: case EMSGSIZE: case EPROTOTYPE: case ENOPROTOOPT:
+    case EPROTONOSUPPORT: case ESOCKTNOSUPPORT: case EOPNOTSUPP: case EPFNOSUPPORT: case EAFNOSUPPORT: case EADDRINUSE:
+    case EADDRNOTAVAIL: case ENETDOWN: case ENETUNREACH: case ENETRESET: case ECONNRESET: case ENOBUFS: case EISCONN:
+    case ENOTCONN: case ETIMEDOUT: case ECONNREFUSED: case EHOSTDOWN: case EHOSTUNREACH: case EPIPE:
+        return e;
+    case ECONNABORTED: return sending ? 32 : 103;
+    case ESHUTDOWN: return sending ? 32 : 108;
     default: return 5;                                    /* EIO */
+    }
+}
+#define WSAGetLastError() errno
+/* the console's SOL_SOCKET option numbers (BSD) -> Linux's; -1 when Linux has no such option */
+static int so_opt_host(int name) {
+    switch (name) {
+    case 0x0002: return SO_ACCEPTCONN;
+    case 0x0004: return SO_REUSEADDR;
+    case 0x0008: return SO_KEEPALIVE;
+    case 0x0010: return SO_DONTROUTE;
+    case 0x0020: return SO_BROADCAST;
+    case 0x0080: return SO_LINGER;
+    case 0x0100: return SO_OOBINLINE;
+    case 0x0200: return SO_REUSEPORT;
+    case 0x1001: return SO_SNDBUF;
+    case 0x1002: return SO_RCVBUF;
+    case 0x1003: return SO_SNDLOWAT;
+    case 0x1004: return SO_RCVLOWAT;
+    case 0x1005: return SO_SNDTIMEO;
+    case 0x1006: return SO_RCVTIMEO;
+    case 0x1007: return SO_ERROR;
+    case 0x1008: return SO_TYPE;
+    default: return -1;
     }
 }
 static SoObj *so_get(int fd, int *flags) {
@@ -202,7 +201,7 @@ static void so_put(SoObj *o) {
     plat_rw_wlock(&g_so_lock);
     last = --o->refs == 0;
     plat_rw_wunlock(&g_so_lock);
-    if (last) { closesocket(o->s); free(o); }
+    if (last) { close(o->s); free(o); }
 }
 static int so_install(SoObj *o, int flags) {             /* lowest free descriptor, or -1 */
     int fd = -1;
@@ -229,14 +228,17 @@ static int so_dup(int fd) {                               /* bsd DuplicateSocket
     so_put(o);
     return nfd;
 }
-static void so_nonblock(SoObj *o, int on) { u_long v = on ? 1 : 0; ioctlsocket(o->s, FIONBIO, &v); }
+static void so_nonblock(SoObj *o, int on) {
+    int f = fcntl(o->s, F_GETFL);
+    if (f >= 0) fcntl(o->s, F_SETFL, on ? f | O_NONBLOCK : f & ~O_NONBLOCK);
+}
 static int so_is_loopback(uint32_t be_addr) { return (be_addr & 0xff) == 127; }      /* first byte in memory */
 static int so_addr_in(uint64_t p, struct sockaddr_in *out) {                          /* guest BSD sockaddr_in -> host; 0 when not AF_INET */
     memset(out, 0, sizeof *out);
     if (M8(p + 1) != 2) return 0;
     out->sin_family = AF_INET;
     out->sin_port = M16(p + 2);
-    out->sin_addr.S_un.S_addr = M32(p + 4);
+    out->sin_addr.s_addr = M32(p + 4);
     return 1;
 }
 static uint32_t so_addr_out(uint64_t p, uint32_t cap, const struct sockaddr_in *in) { /* returns the length the module reports */
@@ -254,7 +256,6 @@ static void socket_Initialize(Ctx *c) {                   /* (void *pool, size_t
     if (g_so_init || !pool || (unsigned)(conc - 1) >= 14 || size <= alloc || (pool & 0xfff) || (size & 0xfff) || (alloc & 0xfff) || alloc <= 0xfff)
         guest_trap("nn::socket::Initialize: [sdk 0x36f89c] abort (already initialised or bad arguments)", c->x[30] - 4);
     if (size < 0xa0000) { RET(0x21bu); return; }
-    if (!g_so_wsa) { WSADATA d; if (WSAStartup(MAKEWORD(2, 2), &d) == 0) g_so_wsa = 1; }
     g_so_init = 1;
     RET(0);
 }
@@ -265,12 +266,12 @@ static void socket_Socket(Ctx *c) {                       /* (domain, type, prot
     int domain = (int)(A0 & 0xff), type = (int)A1, protocol = (int)A2;
     so_need_init(c, "nn::socket::Socket");
     if (domain != 2) { so_fail(c, 97); return; }
-    SOCKET s = socket(AF_INET, type, protocol);
-    if (s == INVALID_SOCKET) { so_fail(c, so_wsa_errno(WSAGetLastError(), 0)); return; }
+    int s = socket(AF_INET, type | SOCK_CLOEXEC, protocol);
+    if (s < 0) { so_fail(c, so_wsa_errno(WSAGetLastError(), 0)); return; }
     SoObj *o = calloc(1, sizeof *o);
     o->s = s; o->type = type;
     int fd = so_install(o, 0);
-    if (fd < 0) { closesocket(s); free(o); so_fail(c, 24); return; }
+    if (fd < 0) { close(s); free(o); so_fail(c, 24); return; }
     RETI(fd);
 }
 static void socket_Close(Ctx *c) {
@@ -286,10 +287,10 @@ static void so_bind(Ctx *c, int len_check) {              /* (fd, const sockaddr
     struct sockaddr_in a;
     int e = 0;
     if (!so_addr_in(A1, &a)) e = 97;
-    else if (a.sin_addr.S_un.S_addr != 0 && !so_is_loopback(a.sin_addr.S_un.S_addr)) e = 99;
+    else if (a.sin_addr.s_addr != 0 && !so_is_loopback(a.sin_addr.s_addr)) e = 99;
     else {
-        int any = a.sin_addr.S_un.S_addr == 0;
-        if (any) a.sin_addr.S_un.S_addr = htonl(INADDR_LOOPBACK);
+        int any = a.sin_addr.s_addr == 0;
+        if (any) a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(o->s, (struct sockaddr *)&a, sizeof a) != 0) e = so_wsa_errno(WSAGetLastError(), 0);
         else o->bound_any = any;
     }
@@ -305,10 +306,10 @@ static void socket_Connect(Ctx *c) {                      /* (fd, const sockaddr
     if (!o) { so_fail(c, 9); return; }
     struct sockaddr_in a;
     if (!so_addr_in(A1, &a)) e = 97;
-    else if (!so_is_loopback(a.sin_addr.S_un.S_addr)) e = 101;                        /* no network: nothing but loopback is reachable */
+    else if (!so_is_loopback(a.sin_addr.s_addr)) e = 101;                        /* no network: nothing but loopback is reachable */
     else if (connect(o->s, (struct sockaddr *)&a, sizeof a) != 0) {
         int w = WSAGetLastError();
-        e = w == WSAEWOULDBLOCK ? 115 : w == WSAEISCONN ? 0 : so_wsa_errno(w, 0);     /* [suyu] ConnectImpl: "already connected" is success */
+        e = w == EAGAIN ? 115 : w == EISCONN ? 0 : so_wsa_errno(w, 0);     /* [suyu] ConnectImpl: "already connected" is success */
     }
     so_put(o);
     if (e) so_fail(c, e); else RETI(0);
@@ -339,17 +340,17 @@ static void socket_Accept(Ctx *c) {                       /* (fd, sockaddr *, so
     SoObj *o = so_get((int)A0, &flags);
     if (!o) { so_fail(c, 9); return; }
     struct sockaddr_in a;
-    int alen = sizeof a;
+    socklen_t alen = sizeof a;
     memset(&a, 0, sizeof a);
-    SOCKET s = accept(o->s, (struct sockaddr *)&a, &alen);
-    int e = s == INVALID_SOCKET ? so_wsa_errno(WSAGetLastError(), 0) : 0, type = o->type;
+    int s = accept4(o->s, (struct sockaddr *)&a, &alen, SOCK_CLOEXEC);
+    int e = s < 0 ? so_wsa_errno(WSAGetLastError(), 0) : 0, type = o->type;
     so_put(o);
     if (e) { so_fail(c, e); return; }
     SoObj *n = calloc(1, sizeof *n);
     n->s = s; n->type = type;
     so_nonblock(n, 0);                                    /* a new descriptor starts blocking */
     int fd = so_install(n, 0);
-    if (fd < 0) { closesocket(s); free(n); so_fail(c, 24); return; }
+    if (fd < 0) { close(s); free(n); so_fail(c, 24); return; }
     uint32_t out = so_addr_out(addr, cap, &a);
     if (lenp) M32(lenp) = cap ? out : 0;
     RETI(fd);
@@ -361,11 +362,10 @@ static void so_name(Ctx *c, int peer) {                   /* (fd, sockaddr *, so
     SoObj *o = so_get((int)A0, NULL);
     if (!o) { so_fail(c, 9); return; }
     struct sockaddr_in a;
-    int alen = sizeof a;
+    socklen_t alen = sizeof a;
     memset(&a, 0, sizeof a);
     int e = (peer ? getpeername(o->s, (struct sockaddr *)&a, &alen) : getsockname(o->s, (struct sockaddr *)&a, &alen)) != 0 ? so_wsa_errno(WSAGetLastError(), 0) : 0;
-    if (!e && !peer && o->bound_any) a.sin_addr.S_un.S_addr = 0;
-    if (e == 22 && !peer) { e = 0; a.sin_family = AF_INET; }                         /* Winsock refuses an unbound socket; BSD reports 0.0.0.0:0 */
+    if (!e && !peer && o->bound_any) a.sin_addr.s_addr = 0;
     so_put(o);
     if (e) { so_fail(c, e); return; }
     M32(lenp) = so_addr_out(addr, M32(lenp), &a);
@@ -385,15 +385,13 @@ static void so_recv(Ctx *c, uint64_t addr, uint64_t lenp) {   /* (fd, buf, size,
     if (!o) { so_fail(c, 9); return; }
     int temp = (gf & 0x80) && !(flags & SO_O_NONBLOCK), n, e = 0;
     struct sockaddr_in a;
-    int alen = sizeof a;
+    socklen_t alen = sizeof a;
     memset(&a, 0, sizeof a);
     if (temp) so_nonblock(o, 1);
     if (addr) n = recvfrom(o->s, (char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf), (struct sockaddr *)&a, &alen);
     else n = recv(o->s, (char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf));
     if (n < 0) {
-        int w = WSAGetLastError();
-        if (w == WSAEMSGSIZE) n = (int)size;              /* datagram longer than the buffer: BSD truncates silently */
-        else e = so_wsa_errno(w, 0);
+        e = so_wsa_errno(errno, 0);                       /* (a datagram longer than the buffer is truncated silently, as BSD) */
     }
     if (temp) so_nonblock(o, 0);
     int stream = o->type == SOCK_STREAM;
@@ -416,11 +414,11 @@ static void so_send(Ctx *c, uint64_t addr) {              /* (fd, buf, size, fla
     int temp = (gf & 0x80) && !(flags & SO_O_NONBLOCK), n = -1, e = 0;
     struct sockaddr_in a;
     if (addr && !so_addr_in(addr, &a)) e = 97;
-    else if (addr && !so_is_loopback(a.sin_addr.S_un.S_addr)) e = 101;                 /* no network */
+    else if (addr && !so_is_loopback(a.sin_addr.s_addr)) e = 101;                 /* no network */
     else {
         if (temp) so_nonblock(o, 1);
-        if (addr) n = sendto(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf) & MSG_OOB, (struct sockaddr *)&a, sizeof a);
-        else n = send(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), so_host_flags(gf) & MSG_OOB);
+        if (addr) n = sendto(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), (so_host_flags(gf) & MSG_OOB) | MSG_NOSIGNAL, (struct sockaddr *)&a, sizeof a);
+        else n = send(o->s, (const char *)(uintptr_t)buf, (int)(size > 0x7fffffff ? 0x7fffffff : size), (so_host_flags(gf) & MSG_OOB) | MSG_NOSIGNAL);      /* no SIGPIPE: EPIPE instead */
         if (n < 0) e = so_wsa_errno(WSAGetLastError(), 1);
         if (temp) so_nonblock(o, 0);
     }
@@ -452,7 +450,7 @@ static void socket_Poll(Ctx *c) {                         /* (pollfd *, nfds, ti
     if (n >> 29) { so_fail(c, 14); return; }
     if ((int64_t)n <= 0) { so_set_errno(c, 0); RETI(-1); return; }                    /* [suyu] PollImpl: no entries -> -1 with errno 0 */
     if (timeout < -1) { so_fail(c, 22); return; }
-    WSAPOLLFD *h = calloc((size_t)n, sizeof *h);
+    struct pollfd *h = calloc((size_t)n, sizeof *h);
     SoObj **objs = calloc((size_t)n, sizeof *objs);
     int ready = 0, hn = 0, r = 0, e = 0;
     for (uint64_t i = 0; i < n; i++) {
@@ -463,22 +461,22 @@ static void socket_Poll(Ctx *c) {                         /* (pollfd *, nfds, ti
         objs[i] = so_get(fd, NULL);
         if (!objs[i]) { M16(fds + i * 8 + 6) = 0x20; ready++; continue; }
         h[hn].fd = objs[i]->s;
-        h[hn].events = (SHORT)((ev & 0x41 ? POLLRDNORM : 0) | (ev & 0x82 ? POLLRDBAND : 0) | (ev & 0x4 ? POLLWRNORM : 0));
+        h[hn].events = (short)((ev & 0x41 ? POLLIN : 0) | (ev & 0x82 ? POLLPRI : 0) | (ev & 0x4 ? POLLOUT : 0));
         hn++;
     }
     if (hn) {
-        r = WSAPoll(h, (uint32_t)hn, ready ? 0 : timeout);
+        r = poll(h, (nfds_t)hn, ready ? 0 : timeout);
         if (r < 0) e = so_wsa_errno(WSAGetLastError(), 0);
     } else if (!ready && timeout) plat_sleep_ms(timeout < 0 ? PLAT_INFINITE : (uint32_t)timeout);
     hn = 0;
     for (uint64_t i = 0; i < n; i++) {
         if (!objs[i]) continue;
         if (!e) {
-            SHORT rv = h[hn].revents;
+            short rv = h[hn].revents;
             uint16_t ev = M16(fds + i * 8 + 4), out = 0;
-            if (rv & POLLRDNORM) out |= (uint16_t)(ev & 0x41 ? ev & 0x41 : 1);
-            if (rv & POLLRDBAND) out |= (uint16_t)(ev & 0x82 ? ev & 0x82 : 2);
-            if (rv & POLLWRNORM) out |= 4;
+            if (rv & POLLIN) out |= (uint16_t)(ev & 0x41 ? ev & 0x41 : 1);
+            if (rv & POLLPRI) out |= (uint16_t)(ev & 0x82 ? ev & 0x82 : 2);
+            if (rv & POLLOUT) out |= 4;
             if (rv & POLLERR) out |= 8;
             if (rv & POLLHUP) out |= 0x10;
             if (rv & POLLNVAL) out |= 0x20;
@@ -502,15 +500,17 @@ static void socket_GetSockOpt(Ctx *c) {                   /* (fd, level, name, v
     uint32_t cap = M32(lenp);
     if (level == 0xffff || (level == 6 && name == 1)) {
         char tmp[64];
-        int tl = sizeof tmp;
-        if (name == 0x800 && level == 0xffff) { memset(tmp, 0, 4); tl = 4; }          /* SO_NOSIGPIPE: there are no signals */
-        else if (getsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, name, tmp, &tl) != 0) e = so_wsa_errno(WSAGetLastError(), 0);
+        socklen_t tl = sizeof tmp;
+        int hname = level == 0xffff ? so_opt_host(name) : TCP_NODELAY;
+        if (name == 0x800 && level == 0xffff) { memset(tmp, 0, 4); tl = 4; }          /* SO_NOSIGPIPE: sends never raise SIGPIPE (MSG_NOSIGNAL) */
+        else if (hname < 0) e = 92;                                                  /* ENOPROTOOPT */
+        else if (getsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, hname, tmp, &tl) != 0) e = so_wsa_errno(errno, 0);
         if (!e) {
             uint8_t out[16] = {0};
             uint32_t ol = 4;
             if (level == 0xffff && name == 0x1007) { int v = so_wsa_errno(*(int *)tmp, 0); memcpy(out, &v, 4); }
-            else if (level == 0xffff && name == 0x80) { LINGER *l = (LINGER *)tmp; int v[2] = {l->l_onoff, l->l_linger}; memcpy(out, v, 8); ol = 8; }
-            else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) { uint32_t ms = *(uint32_t *)tmp; int64_t tv[2] = {ms / 1000, (ms % 1000) * 1000}; memcpy(out, tv, 16); ol = 16; }
+            else if (level == 0xffff && name == 0x80) { struct linger *l = (struct linger *)tmp; int v[2] = {l->l_onoff, l->l_linger}; memcpy(out, v, 8); ol = 8; }
+            else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) { struct timeval *t = (struct timeval *)tmp; int64_t tv[2] = {t->tv_sec, t->tv_usec}; memcpy(out, tv, 16); ol = 16; }
             else { int v = tl >= 4 ? *(int *)tmp : (tl >= 1 ? tmp[0] != 0 : 0); memcpy(out, &v, 4); }
             if (ol > cap) ol = cap;
             memcpy((void *)(uintptr_t)val, out, ol);
@@ -531,16 +531,18 @@ static void socket_SetSockOpt(Ctx *c) {                   /* (fd, level, name, c
     int e = 0, r = 0;
     if (level == 0xffff && name == 0x80) {
         if (len < 8) e = 22;
-        else { LINGER l; l.l_onoff = (u_short)(M32(val) != 0); l.l_linger = (u_short)M32(val + 4); r = setsockopt(o->s, SOL_SOCKET, SO_LINGER, (char *)&l, sizeof l); }
+        else { struct linger l; l.l_onoff = M32(val) != 0; l.l_linger = (int)M32(val + 4); r = setsockopt(o->s, SOL_SOCKET, SO_LINGER, &l, sizeof l); }
     } else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) {
         uint32_t ms = len >= 16 ? (uint32_t)(M64(val) * 1000 + M64(val + 8) / 1000) : len >= 4 ? M32(val) : 0;
-        if (len < 4) e = 22; else r = setsockopt(o->s, SOL_SOCKET, name, (char *)&ms, sizeof ms);
+        struct timeval tv = {ms / 1000, (ms % 1000) * 1000};
+        if (len < 4) e = 22; else r = setsockopt(o->s, SOL_SOCKET, so_opt_host(name), &tv, sizeof tv);
     } else if (level == 0xffff && name == 0x800) r = 0;   /* SO_NOSIGPIPE */
     else if (level == 0xffff || (level == 6 && name == 1)) {
         if (len < 4) e = 22;
-        else { int v = (int)M32(val); r = setsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, name, (char *)&v, sizeof v); }
+        else if (level == 0xffff && so_opt_host(name) < 0) e = 92;                  /* ENOPROTOOPT */
+        else { int v = (int)M32(val); r = setsockopt(o->s, level == 0xffff ? SOL_SOCKET : IPPROTO_TCP, level == 0xffff ? so_opt_host(name) : TCP_NODELAY, &v, sizeof v); }
     }                                                     /* other levels: [suyu] SetSockOptImpl accepts and ignores */
-    if (!e && r != 0) e = so_wsa_errno(WSAGetLastError(), 0);
+    if (!e && r != 0) e = so_wsa_errno(errno, 0);
     so_put(o);
     if (e) so_fail(c, e); else RETI(0);
 }
@@ -554,21 +556,21 @@ static const char *const g_gai_text[] = {
     "No address associated with hostname", "hostname nor servname provided, or not known", "servname not supported for ai_socktype",
     "ai_socktype not supported", "System error returned in errno", "Invalid value for hints", "Resolved protocol is unknown",
     "Argument buffer overflow"};
-static int so_gai_from_host(int w) {
+static int so_gai_from_host(int w) {                     /* glibc EAI_* -> the console's (BSD) numbers */
     switch (w) {
     case 0: return 0;
-    case WSATRY_AGAIN: return 2;
-    case WSAEINVAL: return 3;
-    case WSANO_RECOVERY: return 4;
-    case WSAEAFNOSUPPORT: return 5;
-    case WSA_NOT_ENOUGH_MEMORY: return 6;
-    case WSAHOST_NOT_FOUND: return 8;
-    case WSATYPE_NOT_FOUND: return 9;
-    case WSAESOCKTNOSUPPORT: return 10;
+    case EAI_AGAIN: return 2;
+    case EAI_BADFLAGS: return 3;
+    case EAI_FAIL: return 4;
+    case EAI_FAMILY: return 5;
+    case EAI_MEMORY: return 6;
+    case EAI_NONAME: return 8;
+    case EAI_SERVICE: return 9;
+    case EAI_SOCKTYPE: return 10;
     default: return 15;                                   /* [suyu] GetAddrInfoError::OTHER */
     }
 }
-static int so_is_numeric_host(const char *s) { struct in_addr a; return s && InetPtonA(AF_INET, s, &a) == 1; }
+static int so_is_numeric_host(const char *s) { struct in_addr a; return s && inet_pton(AF_INET, s, &a) == 1; }
 /* (node, service, hints, out). nn_layout: nn::socket::AddrInfo instead of struct addrinfo */
 static void so_getaddrinfo(Ctx *c, int nn_layout) {
     const char *node = (const char *)(uintptr_t)A0, *service = (const char *)(uintptr_t)A1;
@@ -629,11 +631,11 @@ static void socket_GetHostByNameWithOptions(Ctx *c) {     /* (const char *name, 
     struct in_addr a;
     if (!so_resolver_enabled()) { so_set_errno(c, 22); RET(0); return; }
     if (!name) { t_so_herrno = 1; so_set_errno(c, 22); RET(0); return; }
-    if (InetPtonA(AF_INET, name, &a) != 1 || strlen(name) >= sizeof t_he.text) { t_so_herrno = 2; so_set_errno(c, 0); RET(0); return; }
+    if (inet_pton(AF_INET, name, &a) != 1 || strlen(name) >= sizeof t_he.text) { t_so_herrno = 2; so_set_errno(c, 0); RET(0); return; }
     strcpy(t_he.text, name);
     t_he.name = P(t_he.text); t_he.alias0 = 0; t_he.aliases = P(&t_he.alias0);
     t_he.type = 2; t_he.length = 4;
-    t_he.addr = a.S_un.S_addr; t_he.addrs[0] = P(&t_he.addr); t_he.addrs[1] = 0; t_he.list = P(t_he.addrs);
+    t_he.addr = a.s_addr; t_he.addrs[0] = P(&t_he.addr); t_he.addrs[1] = 0; t_he.list = P(t_he.addrs);
     t_so_herrno = 0; so_set_errno(c, 0);
     RET(P(&t_he));
 }
@@ -648,8 +650,7 @@ static void so_ResolverGetOption(Ctx *c) {                /* (ResolverOption *ou
     }
     if (key == 0x2711) {                                  /* [sdk 0x382d50] CreateRandomId */
         uint32_t id = 0;
-        HCRYPTPROV prov = 0;
-        if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 4, (uint8_t *)&id); CryptReleaseContext(prov, 0); }
+        plat_random(&id, sizeof id);
         M32(opt + 0x10) = id; M64(opt + 8) = 4;
         RETI(0); return;
     }
@@ -937,7 +938,7 @@ static int sock_selftest(Ctx *c) {
     SOCK_CHECK("nifm: no connection: address 0.0.0.0, proxy setting 0xaa zero bytes");
     g_nifm_init = was;
     /* ---- sockets */
-    uint8_t *pool = VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint8_t *pool = plat_alloc(NULL, 0x100000, PLAT_RW);
     uint8_t sa[16], sb[16], buf[64];
     uint32_t len;
     ok = (int)H(SOK("12GetLastErrnoEv"), 0) == 22;
@@ -1078,7 +1079,7 @@ static int sock_selftest(Ctx *c) {
     ok = ok && (int)H(SOK("5FcntlEiiz"), u1, 3, 0) >= 0;  /* the application's own descriptor survives the connection */
     SOCK_CHECK("ssl: connection: create / ids / setters; no socket: SetIoMode + DoHandshake 0xce7b; Pending 0; argument checks 0xe27b, 0xe07b;\n"
               "          unknown descriptor 0xd47b; descriptor duplicated and released; Destroy twice 0xda7b; context with a connection 0xd67b");
-    VirtualFree(pool, 0, MEM_RELEASE);
+    plat_release(pool, 0x100000);
     /* ---- nsd */
     char fq[0x110], fin[0x100];
     memset(fq, 0x7e, sizeof fq); memset(fin, 0, sizeof fin);
