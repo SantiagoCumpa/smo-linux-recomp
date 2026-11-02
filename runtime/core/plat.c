@@ -424,6 +424,30 @@ int plat_fsync_dir(const char *path_in_dir) {
     return ok;
 }
 
+uint64_t plat_file_mtime(const char *path) {
+    struct stat st;
+    if (stat(path, &st)) return 0;
+    return (uint64_t)st.st_mtim.tv_sec * 1000000000ull + (uint64_t)st.st_mtim.tv_nsec;
+}
+
+static char g_tmp[PATH_MAX];
+static pthread_once_t g_tmp_once = PTHREAD_ONCE_INIT;
+static void tmp_init(void) {
+    const char *e = getenv("SMO_TMP");
+    char d[PATH_MAX];
+    if (e && e[0]) snprintf(d, sizeof d, "%s", e);
+    else {
+        snprintf(d, sizeof d, "%s/../tmp", plat_exe_dir());
+        char *r = realpath(plat_exe_dir(), NULL);           /* build/bin -> build/tmp, without the ".." */
+        if (r) { char *s = strrchr(r, '/'); if (s && s != r) { *s = 0; snprintf(d, sizeof d, "%s/tmp", r); } free(r); }
+    }
+    size_t n = strlen(d);
+    while (n > 1 && d[n - 1] == '/') d[--n] = 0;
+    plat_mkdirs(d);
+    snprintf(g_tmp, sizeof g_tmp, "%s/", d);
+}
+const char *plat_temp_dir(void) { pthread_once(&g_tmp_once, tmp_init); return g_tmp; }
+
 void plat_exit(int code) {
     fflush(NULL);
     _exit(code);

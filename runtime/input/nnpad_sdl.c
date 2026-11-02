@@ -9,10 +9,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 #include <math.h>
 #include "plat.h"
 #include <SDL3/SDL.h>
 #include "nnpad.h"
+#include "vk_codes.h"
 
 #define MAXDEV 16
 #define MAXCFG 64
@@ -317,24 +319,22 @@ static char *read_file(const char *path, size_t *len) {
     return b;
 }
 static uint64_t file_mtime(const char *path) {
-    WIN32_FILE_ATTRIBUTE_DATA a;
-    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
-    return ((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+    return plat_file_mtime(path);
 }
 static void cfg_path(char *out) {
     const char *e = getenv("SMO_CONFIG");
     if (e && e[0]) { snprintf(out, PATH_MAX, "%s", e); return; }
-    char exe[PATH_MAX], tmp[PATH_MAX];
-    snprintf(exe, sizeof exe, "%s", plat_exe_path());
-    char *s = strrchr(exe, '\\');
-    if (s) *s = 0;
-    snprintf(tmp, sizeof tmp, "%s\\..\\config\\controllers.ini", exe);
-    if (!_fullpath(out, tmp, PATH_MAX)) snprintf(out, PATH_MAX, "%s", tmp);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof tmp, "%s/../config", plat_exe_dir());
+    char *r = realpath(tmp, NULL);                          /* build/config when it exists: the path without ".." */
+    snprintf(out, PATH_MAX, "%s/controllers.ini", r ? r : tmp);
+    free(r);
 }
 static void make_dirs(const char *file) {
     char b[PATH_MAX];
     snprintf(b, sizeof b, "%s", file);
-    for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; plat_mkdir(b); *p = '\\'; }
+    char *s = strrchr(b, '/');
+    if (s && s != b) { *s = 0; plat_mkdirs(b); }
 }
 static void cfg_load(int first) {                 /* lock held */
     static Cfg n;
@@ -898,12 +898,12 @@ int nnpad_selftest(const NnHidHooks *h) {
     SDL_JoystickID id[10];
     SDL_Joystick *js[10];
     uint64_t btn; int32_t st[4]; uint32_t attr;
-    GetTempPathA(PATH_MAX, path); strcat(path, "smo_pad_selftest\\controllers.ini");
+    snprintf(path, sizeof path, "%ssmo_pad_selftest/controllers.ini", plat_temp_dir());
     make_dirs(path);
     unlink(path);
-    _putenv_s("SMO_CONFIG", path);
-    _putenv_s("SMO_KEYBOARD_PLAYER", "0");
-    _putenv_s("SMO_PAD_LAYOUT", "");
+    setenv("SMO_CONFIG", path, 1);
+    setenv("SMO_KEYBOARD_PLAYER", "0", 1);
+    setenv("SMO_PAD_LAYOUT", "", 1);
     g_only_virtual = 1;
     h->test_mode(1);
     printf("pad self-test (SDL virtual joysticks, no physical pad):\n");

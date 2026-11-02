@@ -1,4 +1,4 @@
-/* nn::hid: Pro Controllers for players 1..4 from XInput pads, plus the keyboard as one more controller
+/* nn::hid: Pro Controllers for players 1..8 from SDL3 game controllers (nnpad_sdl.c), plus the keyboard as one more controller
  * (see "controllers" below for the mapping, vibration and what is not supported).
  *
  * Npad state (all styles share the layout, 0x28 bytes):
@@ -14,6 +14,8 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "nnpad.h"
+#include "vk_codes.h"
+int display_focus_flags(void);          /* display.c: bit 0 = the game's window has the keyboard focus */
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -435,9 +437,8 @@ static int seq_key(int vk) {
     for (const char *k = g_seq[g_seq_index].keys; *k; k++) if (script_vk(*k) == vk) return 1;
     return 0;
 }
-/* The real keyboard counts only while a window of THIS process is the foreground window: GetAsyncKeyState reads the
- * whole desktop, so without this check anything typed in another program (or another running copy of the game, or a
- * test that injects keys) steered the game. With SMO_SEQ the keyboard is ignored altogether, unless SMO_SEQ_KEYBOARD
+/* The real keyboard counts only while the game's window has the keyboard focus (display_key_down checks it too), so
+ * anything typed in another program (or another running copy of the game) never steers the game. With SMO_SEQ the keyboard is ignored altogether, unless SMO_SEQ_KEYBOARD
  * is set, so a scripted run is not disturbed by a person at the machine. */
 static int keyboard_ours(void) {
     static int mode = -1;
@@ -446,10 +447,8 @@ static int keyboard_ours(void) {
     if (mode < 0) mode = (getenv("SMO_SEQ") || getenv("SMO_PLAY")) && !getenv("SMO_SEQ_KEYBOARD") ? 0 : 1;
     if (!mode) return 0;
     if (checked_at != g_sampling) {                       /* once per poll */
-        uint32_t pid = 0;
-        HWND fg = GetForegroundWindow();
         checked_at = g_sampling;
-        ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid();
+        ours = (display_focus_flags() & 1) != 0;
     }
     return ours;
 }
@@ -569,7 +568,7 @@ static void record_or_replay(uint64_t *buttons, int *lx, int *ly) {
  * from the service (anything else aborts) and 604 = 0x4b8ca is "no controller of that kind"; handles are
  * style index | npad id << 8 | device index << 16 (GetVibrationDeviceHandles / GetSixAxisSensorHandles run as
  * lifted SDK code). */
-typedef struct { uint16_t buttons; uint8_t lt, rt; SHORT lx, ly, rx, ry; } XGamepad;
+typedef struct { uint16_t buttons; uint8_t lt, rt; int16_t lx, ly, rx, ry; } XGamepad;
 typedef struct { uint32_t packet; XGamepad pad; } XState;
 typedef struct { uint16_t left, right; } XVibration;
 typedef struct { uint8_t type, subtype; uint16_t flags; XGamepad pad; XVibration vib; } XCaps;
@@ -614,8 +613,8 @@ static uint32_t synth_get_state(uint32_t slot, XState *out) {
         for (size_t i = 0; i < sizeof m / sizeof m[0]; i++) if (seq_key(m[i].vk)) g.buttons |= m[i].x;
         g.lt = seq_key('A') ? 255 : 0;
         g.rt = seq_key('S') ? 255 : 0;
-        g.lx = (SHORT)((seq_key(VK_RIGHT) - seq_key(VK_LEFT)) * 32767);
-        g.ly = (SHORT)((seq_key(VK_UP) - seq_key(VK_DOWN)) * 32767);
+        g.lx = (int16_t)((seq_key(VK_RIGHT) - seq_key(VK_LEFT)) * 32767);
+        g.ly = (int16_t)((seq_key(VK_UP) - seq_key(VK_DOWN)) * 32767);
         if (memcmp(&g, &g_xs[0].st.pad, sizeof g)) { g_xs[0].st.pad = g; g_xs[0].st.packet++; }
         g_xs[0].connected = 1;
     }
@@ -654,25 +653,19 @@ static void hid_setup(void) {
         x_get_state = synth_get_state; x_set_state = synth_set_state; x_get_caps = synth_get_caps;
         printf("nn::hid: SYNTHETIC XInput pad on slot 0, driven by the input sequence (test aid; the sequence's keyboard path is off)\n");
     }
-    static const char *const dlls[] = {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"};
-    for (int i = 0; i < 3 && !x_get_state; i++) {
-        HMODULE m = LoadLibraryA(dlls[i]);
-        if (!m) continue;
-        x_get_state = (void *)GetProcAddress(m, "XInputGetState");
-        x_set_state = (void *)GetProcAddress(m, "XInputSetState");
-        x_get_caps = (void *)GetProcAddress(m, "XInputGetCapabilities");
-    }
+    /* Linux: no XInput library. The XInput mapping below (fill_pad, vibration) is kept for the synthetic pad of the
+     * tests (SMO_XINPUT_SYNTH, the self-test); real pads always go through SDL3 (nnpad_sdl.c). */
     const char *kb = getenv("SMO_KEYBOARD_PLAYER"), *layout = getenv("SMO_PAD_LAYOUT"), *backend = getenv("SMO_PAD_BACKEND");
     int k = kb && kb[0] ? atoi(kb) : 1;
     g_keyboard_player = k >= 1 && k <= 8 ? k - 1 : -1;
     g_label_layout = layout && !strcmp(layout, "label");
-    /* default backend = SDL3 (nnpad_sdl.c, controllers.ini); SMO_PAD_BACKEND=xinput keeps the older XInput path below, and is the fallback if SDL cannot start */
-    if (!g_x_synth && !(backend && !strcasecmp(backend, "xinput"))) {
+    /* the backend = SDL3 (nnpad_sdl.c, controllers.ini); SMO_PAD_BACKEND=keyboard: the keyboard only */
+    if (!g_x_synth && !(backend && !strcasecmp(backend, "keyboard"))) {
         g_sdl_pad = nnpad_init();
         if (g_sdl_pad) { g_keyboard_player = nnpad_keyboard_player(); printf("nn::hid: pads through SDL3; keyboard = player %d\n", g_keyboard_player + 1); return; }
-        printf("nn::hid: SDL could not start, falling back to XInput\n");
+        printf("nn::hid: SDL could not start its game controller support: the keyboard only\n");
     }
-    printf("nn::hid: XInput %s; keyboard = player %d; buttons by %s\n", x_get_state ? "available" : "NOT available (no pads)",
+    printf("nn::hid: %s; keyboard = player %d; buttons by %s\n", x_get_state ? "synthetic XInput pad" : "no pads",
            g_keyboard_player + 1, g_label_layout ? "label" : "position");
 }
 
@@ -725,7 +718,7 @@ static int key_for(uint32_t id, int vk, int kbidx) {         /* vk = the fixed k
     if (id == 0) down = scripted(vk) || script_key(vk) || seq_key(vk);
     if (!down && (int)id == g_keyboard_player) {
         int real = sdl_on() ? nnpad_kb_vk(kbidx) : vk;
-        down = real && keyboard_ours() && (GetAsyncKeyState(real) & 0x8000) != 0;
+        down = real && keyboard_ours() && display_key_down(real);
     }
     return down;
 }
@@ -906,10 +899,8 @@ void hid_menu_closed(void) { for (int i = 0; i < 8; i++) { g_menu_mask[i] = g_me
  * this process has the foreground window (as keyboard_ours, checked here every call: the game does not poll meanwhile) */
 int hid_menu_key(int which) {
     static int was[2];
-    uint32_t pid = 0;
-    HWND fg = GetForegroundWindow();
-    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid() && !scripted_run();
-    int on = ours && (GetAsyncKeyState(which ? VK_RETURN : VK_ESCAPE) & 0x8000) != 0, hit = on && !was[which & 1];
+    int ours = (display_focus_flags() & 1) && !scripted_run();
+    int on = ours && display_key_down(which ? VK_RETURN : VK_ESCAPE), hit = on && !was[which & 1];
     was[which & 1] = on;
     return hit;
 }
@@ -1350,7 +1341,7 @@ static int th_six(uint32_t id, float accel[3], float gyro[3], int *rest) {
     *rest = (int)c.x[0];
     return rd32((uint64_t)(uintptr_t)buf + 0x58) == 1;
 }
-static void th_test_mode(int on) { g_pad_test = on; if (on) { _putenv("SMO_REC=NUL"); hid_setup(); } }
+static void th_test_mode(int on) { g_pad_test = on; if (on) { setenv("SMO_REC", "/dev/null", 1); hid_setup(); } }
 static uint32_t th_led(uint32_t id) { Ctx c; memset(&c, 0, sizeof c); c.x[0] = (uint64_t)(uintptr_t)&id; hid_GetPlayerLedPattern(&c); return (uint32_t)c.x[0]; }
 int nnhid_pad_selftest(void) {
     NnHidHooks h = {th_style, th_state, th_vibrate, th_six, th_test_mode, th_led};

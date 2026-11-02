@@ -173,6 +173,9 @@ int64_t plat_file_size(const char *path);                 /* -1 when missing */
 int plat_rename_replace(const char *from, const char *to);/* 1 on success */
 int plat_fsync_path(const char *path);
 int plat_fsync_dir(const char *path_in_dir);              /* the folder holding the file (a rename's durability) */
+uint64_t plat_file_mtime(const char *path);               /* modification time in ns since 1970, 0 when missing */
+/* the folder for temporary files, with a trailing '/': $SMO_TMP, else <exe dir>/../tmp (build/tmp: never /tmp), made */
+const char *plat_temp_dir(void);
 void plat_exit(int code) __attribute__((noreturn));
 int plat_random(void *buf, size_t n);                     /* kernel entropy (getrandom); 1 on success */
 extern int plat_argc;                                     /* the program's arguments, from before main() */
