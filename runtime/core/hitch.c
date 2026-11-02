@@ -16,8 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-#include <psapi.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -25,18 +24,17 @@ int g_hitch_ms;                                   /* threshold; 0 = off */
 volatile const char *g_hitch_rt = "idle";         /* render thread: current scope (nvn_gl.c) */
 volatile uint64_t g_hitch_rt_arg;
 
-typedef struct { DWORD tid; HANDLE h; Ctx *volatile ctx; volatile LONG wait_render, pacing; char note[160]; } HRec;
+typedef struct { uint32_t tid; Ctx *volatile ctx; volatile int32_t wait_render, pacing; char note[160]; } HRec;
 static HRec g_rec[256];
-static volatile LONG g_nrec;
-static __declspec(thread) HRec *t_rec;
+static volatile int32_t g_nrec;
+static _Thread_local HRec *t_rec;
 static HRec *volatile g_main_rec, *volatile g_render_rec;
 
 static HRec *rec_get(void) {
     if (t_rec) return t_rec;
-    LONG i = InterlockedIncrement(&g_nrec) - 1;
+    int32_t i = plat_inc(&g_nrec) - 1;
     if (i >= 256) return NULL;
-    g_rec[i].tid = GetCurrentThreadId();
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_rec[i].h, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    g_rec[i].tid = plat_tid();
     return t_rec = &g_rec[i];
 }
 void hitch_set_main(Ctx *c) { if (g_hitch_ms) { HRec *r = rec_get(); if (r) { r->ctx = c; g_main_rec = r; } } }
@@ -59,13 +57,13 @@ void hitch_pacing(int on) { if (g_hitch_ms) { HRec *r = rec_get(); if (r) r->pac
 typedef struct { char key[200]; double ms; } Bucket;
 static Bucket g_cur[NB];
 static int g_ncur;
-static SRWLOCK g_lock;
+static plat_rwlock_t g_lock;
 typedef struct { char key[200]; double ms, worst; int frames, top; } Sum;
 static Sum g_sum[2048], g_cat[128];
 static int g_nsum, g_ncat;
 static double g_hitch_total_ms, g_frames_seen, g_sample_gap_max;
-static LONG64 g_hitch_frames;
-static LARGE_INTEGER g_freq;
+static int64_t g_hitch_frames;
+static plat_counter g_freq;
 
 static void bucket_add(const char *key, double ms) {
     int i;
@@ -95,34 +93,31 @@ static const char *import_class(const char *n) {
     return "other import";
 }
 
-int guest_thread_info(int i, Ctx **c, const char **name, HANDLE *h);          /* os_threads.c */
-DWORD os_mutex_owner(uint64_t key);
-static ULONG64 g_thr_cyc[256];
+int guest_thread_info(int i, Ctx **c, const char **name, uint32_t *tid);          /* os_threads.c */
+uint32_t os_mutex_owner(uint64_t key);
+static uint64_t g_thr_cyc[256];
 
-static DWORD WINAPI watchdog(LPVOID arg) {
+static uint32_t watchdog(void * arg) {
     (void)arg;
-    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
-    LARGE_INTEGER prev, now;
-    ULONG64 main_cyc = 0, rt_cyc = 0;
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-    QueryPerformanceCounter(&prev);
+    plat_counter prev, now;
+    uint64_t main_cyc = 0, rt_cyc = 0;
+    plat_set_thread_name("hitch");
+    plat_qpc(&prev);
     for (;;) {
-        LARGE_INTEGER due;
-        due.QuadPart = -10000;                    /* 1 ms */
-        if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100); else Sleep(1);
-        QueryPerformanceCounter(&now);
+        plat_sleep_until(plat_ticks() + 1000000);  /* 1 ms */
+        plat_qpc(&now);
         double dt = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)g_freq.QuadPart;
         prev = now;
         HRec *m = g_main_rec, *r = g_render_rec;
         if (!m || !m->ctx) continue;
         if (dt > g_sample_gap_max) g_sample_gap_max = dt;
         char key[200];
-        ULONG64 cyc = 0, rc = 0;
-        QueryThreadCycleTime(m->h, &cyc);
-        int running = cyc - main_cyc > 20000;     /* more than a few microseconds of CPU since the last sample */
+        uint64_t cyc = 0, rc = 0;
+        cyc = plat_thread_cpu_ns(m->tid);
+        int running = cyc - main_cyc > 5000;      /* more than a few microseconds of CPU since the last sample */
         main_cyc = cyc;
-        if (r) QueryThreadCycleTime(r->h, &rc);
-        int rt_running = rc - rt_cyc > 20000;
+        if (r) rc = plat_thread_cpu_ns(r->tid);
+        int rt_running = rc - rt_cyc > 5000;
         rt_cyc = rc;
         Ctx *c = m->ctx;
         const char *imp = c->in_import;
@@ -138,15 +133,15 @@ static DWORD WINAPI watchdog(LPVOID arg) {
             else snprintf(key, sizeof key, "main: %s: %s (blocked)|%s called from %llx", import_class(imp), imp, m->note, (unsigned long long)c->import_from);
             blocked_scan = !running;
         } else snprintf(key, sizeof key, "main: lifted code%s|f_%llx", running ? "" : " (not on a CPU: preempted or page fault)", (unsigned long long)c->fn);
-        AcquireSRWLockExclusive(&g_lock);
+        plat_rw_wlock(&g_lock);
         bucket_add(key, dt);
         if (blocked_scan && (strstr(imp, "mutex") || strstr(imp, "Mutex"))) {      /* who owns the mutex, and what is the owner inside? */
-            DWORD owner = os_mutex_owner(c->x[0]);
+            uint32_t owner = os_mutex_owner(c->x[0]);
             int found = 0;
             for (int i = 0; owner && i < 256; i++) {
-                Ctx *tc; const char *name; HANDLE h;
+                Ctx *tc; const char *name; uint32_t h;
                 if (!guest_thread_info(i, &tc, &name, &h)) break;
-                if (!h || GetThreadId(h) != owner) continue;
+                if (!h || h != owner) continue;
                 const char *ti = tc->in_import;
                 if (ti) snprintf(key, sizeof key, "  (owner of mutex %llx) %s: %s called from %llx", (unsigned long long)c->x[0], name ? name : "?", ti, (unsigned long long)tc->import_from);
                 else snprintf(key, sizeof key, "  (owner of mutex %llx) %s: lifted code f_%llx", (unsigned long long)c->x[0], name ? name : "?", (unsigned long long)tc->fn);
@@ -157,11 +152,11 @@ static DWORD WINAPI watchdog(LPVOID arg) {
         }
         if (blocked_scan) {                       /* who ran while the main thread stood still? */
             for (int i = 0; i < 256; i++) {
-                Ctx *tc; const char *name; HANDLE h;
+                Ctx *tc; const char *name; uint32_t h;
                 if (!guest_thread_info(i, &tc, &name, &h)) break;
-                ULONG64 q = 0;
-                if (!h || !QueryThreadCycleTime(h, &q)) continue;
-                int ran = q - g_thr_cyc[i] > 200000;
+                uint64_t q = 0;
+                if (!h || !(q = plat_thread_cpu_ns((pid_t)h))) continue;
+                int ran = q - g_thr_cyc[i] > 50000;
                 g_thr_cyc[i] = q;
                 if (!ran) continue;
                 const char *ti = tc->in_import;
@@ -169,7 +164,7 @@ static DWORD WINAPI watchdog(LPVOID arg) {
                 bucket_add(key, dt);
             }
         }
-        ReleaseSRWLockExclusive(&g_lock);
+        plat_rw_wunlock(&g_lock);
     }
 }
 
@@ -178,26 +173,21 @@ static int cmp_sum(const void *a, const void *b) { double x = ((const Sum *)a)->
 
 /* Render thread, at every present: `ms` = time since the previous present; `scene` = the frame had compute dispatches. */
 void hitch_frame(long long frame, double ms, int scene) {
-    static FILETIME idle0, kern0, user0, pk0, pu0;
-    static DWORD faults0;
+    static uint64_t busy0, idle0, us0, faults0;
     static int said;
     Bucket b[NB];
     int n;
     if (!g_hitch_ms) return;
-    AcquireSRWLockExclusive(&g_lock);
+    plat_rw_wlock(&g_lock);
     n = g_ncur; memcpy(b, g_cur, sizeof(Bucket) * (size_t)n); g_ncur = 0;
-    ReleaseSRWLockExclusive(&g_lock);
+    plat_rw_wunlock(&g_lock);
     g_frames_seen++;
-    FILETIME idle, kern, user, c0, e0, pk, pu;
-    PROCESS_MEMORY_COUNTERS pmc;
-    GetSystemTimes(&idle, &kern, &user);
-    GetProcessTimes(GetCurrentProcess(), &c0, &e0, &pk, &pu);
-    memset(&pmc, 0, sizeof pmc); pmc.cb = sizeof pmc;
-    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
-#define FT(x) (((ULONGLONG)(x).dwHighDateTime << 32) | (x).dwLowDateTime)
-    double d_idle = (double)(FT(idle) - FT(idle0)), d_all = (double)(FT(kern) - FT(kern0)) + (double)(FT(user) - FT(user0)), d_us = (double)(FT(pk) - FT(pk0)) + (double)(FT(pu) - FT(pu0));
-    DWORD d_faults = pmc.PageFaultCount - faults0;
-    idle0 = idle; kern0 = kern; user0 = user; pk0 = pk; pu0 = pu; faults0 = pmc.PageFaultCount;
+    uint64_t busy, idle, us, faults;
+    plat_system_cpu(&busy, &idle);
+    plat_process_cpu(&us, &faults);
+    double d_idle = (double)(idle - idle0), d_all = (double)(busy - busy0) + d_idle, d_us = (double)(us - us0);
+    uint64_t d_faults = faults - faults0;
+    busy0 = busy; idle0 = idle; us0 = us; faults0 = faults;
     if (ms <= (double)g_hitch_ms || frame < 3) return;
     qsort(b, (size_t)n, sizeof b[0], cmp_bucket);
     double counted = 0;
@@ -242,10 +232,10 @@ void hitch_report(FILE *out) {
 
 void hitch_init(void) {
     const char *e = getenv("SMO_HITCH");
-    QueryPerformanceFrequency(&g_freq);
+    plat_qpf(&g_freq);
     if (!e || atoi(e) <= 0) return;
     g_hitch_ms = atoi(e);
-    InitializeSRWLock(&g_lock);
-    CloseHandle(CreateThread(NULL, 0, watchdog, NULL, 0, NULL));
+    plat_rw_init(&g_lock);
+    plat_thread_detach(plat_thread_start(watchdog, NULL, 0));
     printf("hitch: frames over %d ms are attributed (SMO_HITCH)\n", g_hitch_ms);
 }

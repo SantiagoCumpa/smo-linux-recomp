@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -53,11 +53,11 @@ static const int g_devinfo[0x62] = {
     4096, 65536, 65536, 256, 16384, 262144, 4096, 1, 4, 2, 1, 4096, 16384, 4096, 128, 32, /* 0x50..0x5f */
     65535, 1,                                                                    /* 0x60..0x61 */
 };
-static volatile LONG g_devinfo_queries[256];
+static volatile int32_t g_devinfo_queries[256];
 static void nvn_get_integer(Ctx *c) {
     uint32_t pname = (uint32_t)A1;
     int value = pname < 0x62 ? g_devinfo[pname] : 0;
-    if (pname < 256 && InterlockedIncrement(&g_devinfo_queries[pname]) == 1)
+    if (pname < 256 && plat_inc(&g_devinfo_queries[pname]) == 1)
         trace_printf("     nvnDeviceGetInteger pname=0x%x -> %d  from=%llx\n", pname, value, (unsigned long long)c->x[30] - 4);
     if (A2) wr32(A2, (uint32_t)value);
 }
@@ -74,27 +74,27 @@ typedef struct NvnObj { uint64_t key, memory, size, pool, offset, flags; struct 
  * exclusive lock and 4096 buckets): a shared lock for the lookup, the exclusive one only to add, 65536 buckets. */
 #define NOBJ_N 65536
 static NvnObj *g_objs[NOBJ_N];
-static SRWLOCK g_objs_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_objs_lock = PLAT_RWLOCK_INIT;
 static NvnObj *nobj(uint64_t key) {
     unsigned h = (unsigned)((key >> 3) * 2654435761u) & (NOBJ_N - 1);
-    AcquireSRWLockShared(&g_objs_lock);
+    plat_rw_rlock(&g_objs_lock);
     NvnObj *o = g_objs[h];
     while (o && o->key != key) o = o->next;
-    ReleaseSRWLockShared(&g_objs_lock);
+    plat_rw_runlock(&g_objs_lock);
     if (o) return o;
-    AcquireSRWLockExclusive(&g_objs_lock);
+    plat_rw_wlock(&g_objs_lock);
     o = g_objs[h];
     while (o && o->key != key) o = o->next;
     if (!o) { o = calloc(1, sizeof *o); o->key = key; o->next = g_objs[h]; g_objs[h] = o; }
-    ReleaseSRWLockExclusive(&g_objs_lock);
+    plat_rw_wunlock(&g_objs_lock);
     return o;
 }
 static void nobj_drop(uint64_t key) {                                   /* the object is finalized: forget what it referred to */
     unsigned h = (unsigned)((key >> 3) * 2654435761u) & (NOBJ_N - 1);
-    AcquireSRWLockExclusive(&g_objs_lock);
+    plat_rw_wlock(&g_objs_lock);
     for (NvnObj **pp = &g_objs[h]; *pp; pp = &(*pp)->next)
         if ((*pp)->key == key) { NvnObj *o = *pp; *pp = o->next; free(o); break; }
-    ReleaseSRWLockExclusive(&g_objs_lock);
+    plat_rw_wunlock(&g_objs_lock);
 }
 void nvn_label_set(uint64_t obj, const char *text);                    /* nvn_gl.c */
 void nvn_label_drop(uint64_t obj);
@@ -161,11 +161,11 @@ typedef struct { uint64_t start, size; int mapped; uint64_t sec_off; } VpSeg;   
  * direct: the pool IS a physical pool's range (see pool_map_virtual: whole-pool request that views cannot express) */
 typedef struct VPool { uint64_t key, base, size; int nseg, used, direct; VpSeg seg[VP_MAXSEG]; struct VPool *next; } VPool;
 static VPool *g_vpools;
-static SRWLOCK g_vp_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_vp_lock = PLAT_RWLOCK_INIT;
 static unsigned long long g_vp_maps, g_vp_unmaps;
-typedef PVOID (WINAPI *VirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void *, ULONG);
-typedef PVOID (WINAPI *MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void *, ULONG);
-typedef BOOL (WINAPI *UnmapViewOfFile2Fn)(HANDLE, PVOID, ULONG);
+typedef void * (*VirtualAlloc2Fn)(HANDLE, void *, size_t, uint32_t, uint32_t, void *, uint32_t);
+typedef void * (*MapViewOfFile3Fn)(HANDLE, HANDLE, void *, uint64_t, size_t, uint32_t, uint32_t, void *, uint32_t);
+typedef int (*UnmapViewOfFile2Fn)(HANDLE, void *, uint32_t);
 static VirtualAlloc2Fn p_VirtualAlloc2;
 static MapViewOfFile3Fn p_MapViewOfFile3;
 static UnmapViewOfFile2Fn p_UnmapViewOfFile2;
@@ -202,9 +202,9 @@ static void vp_split(Ctx *c, VPool *v, uint64_t off) {
         left.size = off - s->start;
         right.start = off; right.size = s->start + s->size - off; right.sec_off = s->sec_off + left.size;
         if (s->mapped) {
-            if (!p_UnmapViewOfFile2(GetCurrentProcess(), (PVOID)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap for a split", v->base + s->start, s->size);
+            if (!p_UnmapViewOfFile2(GetCurrentProcess(), (void *)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap for a split", v->base + s->start, s->size);
         }
-        if (!VirtualFree((PVOID)(uintptr_t)(v->base + left.start), (SIZE_T)left.size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "placeholder split", v->base + left.start, left.size);
+        if (!VirtualFree((void *)(uintptr_t)(v->base + left.start), (size_t)left.size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "placeholder split", v->base + left.start, left.size);
         v->seg[i] = left; v->seg[i + 1] = right; v->nseg++;
         if (left.mapped) { vp_map_view(c, v, &v->seg[i]); vp_map_view(c, v, &v->seg[i + 1]); }
         return;
@@ -214,21 +214,21 @@ int smo_heap_section_handle(HANDLE *h);                       /* smo_nn.c */
 static int vp_map_view(Ctx *c, VPool *v, VpSeg *s) {
     HANDLE sec;
     if (!smo_heap_section_handle(&sec)) vp_fail(c, "no heap section", 0, 0);
-    PVOID r = p_MapViewOfFile3(sec, GetCurrentProcess(), (PVOID)(uintptr_t)(v->base + s->start), s->sec_off, (SIZE_T)s->size,
+    void * r = p_MapViewOfFile3(sec, GetCurrentProcess(), (void *)(uintptr_t)(v->base + s->start), s->sec_off, (size_t)s->size,
                                MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
-    if (r != (PVOID)(uintptr_t)(v->base + s->start)) vp_fail(c, "MapViewOfFile3", v->base + s->start, s->size);
+    if (r != (void *)(uintptr_t)(v->base + s->start)) vp_fail(c, "MapViewOfFile3", v->base + s->start, s->size);
     return 1;
 }
 static void pool_virtual_init(Ctx *c, NvnObj *p) {
     vp_load(c);
     if (p->memory) vp_fail(c, "a virtual pool was given memory of its own", p->memory, p->size);
     if (!p->size || p->size % VP_GRAN) vp_fail(c, "virtual pool size is not a multiple of 64 KB", p->size, 0);
-    PVOID base = p_VirtualAlloc2(GetCurrentProcess(), NULL, (SIZE_T)p->size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
+    void * base = p_VirtualAlloc2(GetCurrentProcess(), NULL, (size_t)p->size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
     if (!base) vp_fail(c, "placeholder reservation", p->size, 0);
     VPool *v = calloc(1, sizeof *v);
     v->key = p->key; v->base = (uint64_t)(uintptr_t)base; v->size = p->size;
     v->nseg = 1; v->seg[0].start = 0; v->seg[0].size = p->size;
-    AcquireSRWLockExclusive(&g_vp_lock); v->next = g_vpools; g_vpools = v; ReleaseSRWLockExclusive(&g_vp_lock);
+    plat_rw_wlock(&g_vp_lock); v->next = g_vpools; g_vpools = v; plat_rw_wunlock(&g_vp_lock);
     p->memory = v->base;
     printf("nvn: virtual memory pool %llx: 0x%llx bytes at %llx (placeholder)\n", (unsigned long long)p->key, (unsigned long long)p->size, (unsigned long long)v->base);
 }
@@ -236,9 +236,9 @@ static void pool_map_virtual(Ctx *c) {
     log_call(c);
     uint64_t pool = A0, n = A1, req = A2;
     vp_load(c);
-    AcquireSRWLockExclusive(&g_vp_lock);
+    plat_rw_wlock(&g_vp_lock);
     VPool *v = vp_find(pool);
-    if (!v) { ReleaseSRWLockExclusive(&g_vp_lock); vp_fail(c, "nvnMemoryPoolMapVirtual on a pool that is not virtual", pool, 0); }
+    if (!v) { plat_rw_wunlock(&g_vp_lock); vp_fail(c, "nvnMemoryPoolMapVirtual on a pool that is not virtual", pool, 0); }
     for (uint64_t k = 0; k < n; k++) {
         uint64_t r = req + k * 0x28, phys = rd64(r), poff = rd64(r + 8), voff = rd64(r + 0x10), size = rd64(r + 0x18);
         uint32_t cls = rd32(r + 0x20);
@@ -261,7 +261,7 @@ static void pool_map_virtual(Ctx *c) {
                 if (n != 1 || voff != 0 || size != v->size || v->nseg != 1 || v->seg[0].mapped || v->used)
                     vp_fail(c, in_heap ? "physical offset in the heap is not a multiple of 64 KB, and the request is not a whole-pool mapping of an unused pool"
                                        : "physical memory is not inside the memory heap, and the request is not a whole-pool mapping of an unused pool", pp->memory + poff, size);
-                if (!VirtualFree((PVOID)(uintptr_t)v->base, 0, MEM_RELEASE)) vp_fail(c, "placeholder release", v->base, v->size);
+                if (!VirtualFree((void *)(uintptr_t)v->base, 0, MEM_RELEASE)) vp_fail(c, "placeholder release", v->base, v->size);
                 v->direct = 1;
                 v->base = pp->memory + poff;
                 nobj(pool)->memory = v->base;
@@ -282,12 +282,12 @@ static void pool_map_virtual(Ctx *c) {
             if (first < 0) first = i;
             last = i;
             if (s->mapped) {
-                if (!p_UnmapViewOfFile2(GetCurrentProcess(), (PVOID)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap", v->base + s->start, s->size);
+                if (!p_UnmapViewOfFile2(GetCurrentProcess(), (void *)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap", v->base + s->start, s->size);
                 s->mapped = 0; g_vp_unmaps++;
             }
         }
         if (last > first) {
-            if (!VirtualFree((PVOID)(uintptr_t)(v->base + voff), (SIZE_T)size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) vp_fail(c, "placeholder coalesce", v->base + voff, size);
+            if (!VirtualFree((void *)(uintptr_t)(v->base + voff), (size_t)size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) vp_fail(c, "placeholder coalesce", v->base + voff, size);
             memmove(&v->seg[first + 1], &v->seg[last + 1], sizeof(VpSeg) * (size_t)(v->nseg - last - 1));
             v->nseg -= last - first;
         }
@@ -295,7 +295,7 @@ static void pool_map_virtual(Ctx *c) {
         s->start = voff; s->size = size; s->mapped = 0;
         if (phys) { s->sec_off = sec_off; vp_map_view(c, v, s); s->mapped = 1; g_vp_maps++; }
     }
-    ReleaseSRWLockExclusive(&g_vp_lock);
+    plat_rw_wunlock(&g_vp_lock);
     RET(1);
 }
 void nvn_virtual_pool_report(FILE *out) {
@@ -306,10 +306,10 @@ void nvn_virtual_pool_report(FILE *out) {
 /* For nvn_gl.c: where a memory pool's storage is. */
 /* a virtual pool whose address was handed out cannot later become a direct alias (pool_map_virtual) */
 static void vp_note_use(uint64_t pool) {
-    AcquireSRWLockExclusive(&g_vp_lock);
+    plat_rw_wlock(&g_vp_lock);
     VPool *v = vp_find(pool);
     if (v && !v->direct) v->used = 1;
-    ReleaseSRWLockExclusive(&g_vp_lock);
+    plat_rw_wunlock(&g_vp_lock);
 }
 int nvn_pool_range(uint64_t pool, uint64_t *mem, uint64_t *size) {
     NvnObj *p = nobj(pool);

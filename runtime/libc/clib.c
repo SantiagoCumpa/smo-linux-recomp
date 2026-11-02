@@ -7,8 +7,7 @@
 #include <ctype.h>
 #include <math.h>
 #include <time.h>
-#include <malloc.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -195,7 +194,7 @@ static int scan_float_token(const unsigned char *s, int width, char *tok, int to
     if (i < width && (s[i] == '+' || s[i] == '-')) TAKE();
     if (i + 2 < width + 0 && (s[i] | 0x20) == 'i' && (s[i + 1] | 0x20) == 'n' && (s[i + 2] | 0x20) == 'f') {
         TAKE(); TAKE(); TAKE();
-        if (i + 4 < width && _strnicmp((const char *)s + i, "inity", 5) == 0) { TAKE(); TAKE(); TAKE(); TAKE(); TAKE(); }
+        if (i + 4 < width && strncasecmp((const char *)s + i, "inity", 5) == 0) { TAKE(); TAKE(); TAKE(); TAKE(); TAKE(); }
         tok[n] = 0; return i;
     }
     if (i + 2 < width && (s[i] | 0x20) == 'n' && (s[i + 1] | 0x20) == 'a' && (s[i + 2] | 0x20) == 'n') {
@@ -371,8 +370,8 @@ int clib_guest_sscanf(Ctx *c) { c_sscanf(c); return (int)(int32_t)c->x[0]; }
 
 /* ---------------------------------------------------------------- searching and sorting
  * The comparator is guest code: int (*)(const void *, const void *). */
-static __declspec(thread) Ctx *t_cmp_ctx;
-static __declspec(thread) uint64_t t_cmp_fn;
+static _Thread_local Ctx *t_cmp_ctx;
+static _Thread_local uint64_t t_cmp_fn;
 static int guest_compare(const void *a, const void *b) {
     Ctx *c = t_cmp_ctx;
     c->x[0] = (uint64_t)(uintptr_t)a;
@@ -415,14 +414,14 @@ static void c_tolower(Ctx *c) { RET((int64_t)tolower((int)A0)); }
 static void c_toupper(Ctx *c) { RET((int64_t)toupper((int)A0)); }
 #define CTYPE(n, fn) static void n(Ctx *c) { int v = (int)A0; RET(v >= 0 && v < 256 ? (fn(v) != 0) : 0); }
 CTYPE(c_isalnum, isalnum) CTYPE(c_isxdigit, isxdigit)
-static void c_strcasecmp(Ctx *c) { RET((int64_t)_stricmp(STR(0), STR(1))); }
-static void c_strncasecmp(Ctx *c) { RET((int64_t)_strnicmp(STR(0), STR(1), (size_t)A2)); }
+static void c_strcasecmp(Ctx *c) { RET((int64_t)strcasecmp(STR(0), STR(1))); }
+static void c_strncasecmp(Ctx *c) { RET((int64_t)strncasecmp(STR(0), STR(1), (size_t)A2)); }
 static void c_strncat(Ctx *c) { strncat((char *)(uintptr_t)A0, STR(1), (size_t)A2); }
 static void c_strpbrk(Ctx *c) { RET(strpbrk(STR(0), STR(1))); }
 static void c_strcspn(Ctx *c) { RET(strcspn(STR(0), STR(1))); }
 static void c_strdup(Ctx *c) {                            /* freed by the imported free(): same heap */
     size_t n = strlen(STR(0)) + 1;
-    char *p = _aligned_malloc(n, 16);
+    char *p = plat_aligned_alloc(n, 16);
     memcpy(p, STR(0), n);
     RET(p);
 }

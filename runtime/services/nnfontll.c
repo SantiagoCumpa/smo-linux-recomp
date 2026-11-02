@@ -62,7 +62,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <windows.h>
+#include "plat.h"
 #ifndef FONTLL_TEST
 #include "runtime.h"
 #include "hostrt.h"
@@ -98,8 +98,8 @@ typedef struct {
     int sub_format;
     HFONT hfont;
     int gdi;                                      /* 0 not tried, 1 usable, -1 unusable */
-    volatile LONG64 drawn;                        /* glyph maps made from this font (fontll_report) */
-    volatile LONG seen[0x10000 / 32];             /* which characters of the Basic Multilingual Plane were drawn */
+    volatile int64_t drawn;                        /* glyph maps made from this font (fontll_report) */
+    volatile int32_t seen[0x10000 / 32];             /* which characters of the Basic Multilingual Plane were drawn */
     long long last_frame, when[8];                /* frames at which drawing from it began again after a pause */
     int nwhen;
 } FontData;
@@ -119,7 +119,7 @@ typedef struct {
 static Engine g_engines[MAX_ENGINES];
 static FontData g_fontdata[MAX_FONTDATA];
 static int g_fontdata_count;
-static CRITICAL_SECTION g_lock;                   /* GDI, the font list and the engine table */
+static plat_lock_t g_lock;                   /* GDI, the font list and the engine table */
 static HDC g_dc;
 static const MAT2 identity = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
 
@@ -130,11 +130,11 @@ static void put16(uint8_t *p, int v) { uint16_t x = (uint16_t)v; memcpy(p, &x, 2
 static void put32(uint8_t *p, int32_t v) { memcpy(p, &v, 4); }
 
 static int g_log = -1;
-static volatile LONG g_counts[16];
+static volatile int32_t g_counts[16];
 enum { L_CHECK, L_SETFONT, L_SCALE, L_ADVANCE, L_GLYPH, L_METRICS, L_BOLD, L_OUTLINE, L_FLAGS, L_KERN, L_OTF, L_LOAD };
 static int flog(int what) {                       /* SMO_FONTLOG=<n>: log the first n calls of each kind */
     if (g_log < 0) { const char *v = getenv("SMO_FONTLOG"); g_log = v ? atoi(v) : 0; }
-    return g_log > 0 && InterlockedIncrement(&g_counts[what]) <= g_log;
+    return g_log > 0 && plat_inc(&g_counts[what]) <= g_log;
 }
 
 /* ---------------------------------------------------------------- font files */
@@ -288,7 +288,7 @@ static FontData *font_data(const uint8_t *data, uint32_t index) {
            f->upem, f->glyphs, f->sub ? f->sub_format : -1, f->kern ? ", kern table" : "", f->gpos ? ", GPOS table" : "");
     const char *dump = getenv("SMO_FONTDUMP");
     if (dump) {
-        char path[MAX_PATH];
+        char path[PATH_MAX];
         snprintf(path, sizeof path, "%s\\%s.%s", dump, f->name, f->cff ? "otf" : "ttf");
         FILE *out = fopen(path, "wb");
         if (out) { fwrite(f->data, 1, size, out); fclose(out); }
@@ -314,7 +314,7 @@ static double fx(FIXED v) { return v.value + v.fract / 65536.0; }
 /* Makes GDI able to draw from this font file; verifies that the face GDI selects really is this file. */
 static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
     if (f->gdi) return f->gdi > 0;
-    DWORD installed = 0;
+    uint32_t installed = 0;
     f->gdi = -1;
     if (!f->face[0] || !AddFontMemResourceEx(f->data, f->size, NULL, &installed)) { printf("nn::fontll: font \"%s\" REJECTED BY GDI: its glyphs will be blank\n", f->name); return 0; }
     f->hfont = CreateFontW(-f->upem, 0, 0, 0, FW_DONTCARE, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, f->face);
@@ -323,7 +323,7 @@ static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
     WCHAR got[LF_FACESIZE];
     uint8_t head[54];
     GetTextFaceW(g_dc, LF_FACESIZE, got);
-    DWORD n = GetFontData(g_dc, 0x64616568 /* "head" */, 0, head, sizeof head);
+    uint32_t n = GetFontData(g_dc, 0x64616568 /* "head" */, 0, head, sizeof head);
     int same = n == sizeof head && !memcmp(head, f->head, sizeof head) && !lstrcmpiW(got, f->face);
     if (!same) { printf("nn::fontll: font \"%s\": GDI selected another font (\"%ls\"): its glyphs will be blank\n", f->name, got); return 0; }
     f->gdi = 1;
@@ -333,13 +333,13 @@ static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
 /* Appends the outline of a glyph, transformed by the 16.16 matrix m / unitsPerEm, as polylines (y up). */
 static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
     static uint8_t *buf;
-    static DWORD cap;
+    static uint32_t cap;
     GLYPHMETRICS gm;
-    EnterCriticalSection(&g_lock);
+    plat_lock(&g_lock);
     if (gdi_prepare(f)) {
         SelectObject(g_dc, f->hfont);
-        const UINT fmt = GGO_BEZIER | GGO_UNHINTED | GGO_GLYPH_INDEX;
-        DWORD size = GetGlyphOutlineW(g_dc, glyph, fmt, &gm, 0, NULL, &identity);
+        const unsigned fmt = GGO_BEZIER | GGO_UNHINTED | GGO_GLYPH_INDEX;
+        uint32_t size = GetGlyphOutlineW(g_dc, glyph, fmt, &gm, 0, NULL, &identity);
         if (size != GDI_ERROR && size) {
             if (size > cap) { cap = size + 4096; buf = realloc(buf, cap); }
             size = GetGlyphOutlineW(g_dc, glyph, fmt, &gm, size, buf, &identity);
@@ -349,9 +349,9 @@ static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path
             double pixels = fabs(a) > fabs(d) ? fabs(a) : fabs(d);
 #define TX(px, py) ((px) * a + (py) * b)
 #define TY(px, py) ((px) * c2 + (py) * d)
-            for (DWORD at = 0; at + sizeof(TTPOLYGONHEADER) <= size;) {
+            for (uint32_t at = 0; at + sizeof(TTPOLYGONHEADER) <= size;) {
                 const TTPOLYGONHEADER *ph = (const TTPOLYGONHEADER *)(buf + at);
-                DWORD end = at + ph->cb;
+                uint32_t end = at + ph->cb;
                 if (ph->cb < sizeof *ph || end > size) break;
                 double x0 = fx(ph->pfxStart.x), y0 = fx(ph->pfxStart.y);
                 path_point(path, TX(x0, y0), TY(x0, y0));
@@ -389,7 +389,7 @@ static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path
                             x0 = x2; y0 = y2;
                         }
                     }
-                    at += 4 + (DWORD)n * sizeof(POINTFX);
+                    at += 4 + (uint32_t)n * sizeof(POINTFX);
                 }
                 path_close(path);
                 at = end;
@@ -398,7 +398,7 @@ static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path
 #undef TY
         }
     }
-    LeaveCriticalSection(&g_lock);
+    plat_unlock(&g_lock);
 }
 
 /* ---------------------------------------------------------------- scan conversion (exact area coverage) */
@@ -782,7 +782,7 @@ static Engine *engine(uint64_t key) {
     memcpy(&slot, HOST(key), 8);
     memcpy(&magic, HOST(key) + 8, 8);
     if (magic == ENGINE_MAGIC && slot < MAX_ENGINES && g_engines[slot].key == key) return &g_engines[slot];
-    EnterCriticalSection(&g_lock);
+    plat_lock(&g_lock);
     Engine *e = NULL;
     for (int i = 0; i < MAX_ENGINES && !e; i++) if (g_engines[i].key == key) e = &g_engines[i];
     for (int i = 0; i < MAX_ENGINES && !e; i++) if (!g_engines[i].key) {
@@ -793,7 +793,7 @@ static Engine *engine(uint64_t key) {
         e->scale[0] = e->scale[3] = 32 << 16;
         e->outline = 1;
     }
-    LeaveCriticalSection(&g_lock);
+    plat_unlock(&g_lock);
     if (!e) { printf("nn::fontll: more than %d engines\n", MAX_ENGINES); report_and_exit(3); }
     slot = (uint64_t)(e - g_engines);
     magic = ENGINE_MAGIC;
@@ -805,14 +805,14 @@ static Engine *engine(uint64_t key) {
 static void fe_ctor(Ctx *c) {
     uint64_t self = A0;
     memset(HOST(self), 0, 0xb8);
-    EnterCriticalSection(&g_lock);
+    plat_lock(&g_lock);
     for (int i = 0; i < MAX_ENGINES; i++) if (g_engines[i].key == self) g_engines[i].key = 0;      /* a new object at a reused address */
-    LeaveCriticalSection(&g_lock);
+    plat_unlock(&g_lock);
     engine(self);
     RET(self);
 }
 static void fe_Initialize(Ctx *c) { Engine *e = engine(A0); e->work = A1; e->error = 0; memcpy(HOST(A0) + 0xb0, &e->work, 8); RET(0); }
-static void fe_Finalize(Ctx *c) { Engine *e = engine(A0); uint64_t self = A0; EnterCriticalSection(&g_lock); e->key = 0; LeaveCriticalSection(&g_lock); memset(HOST(self), 0, 16); RET(0); }
+static void fe_Finalize(Ctx *c) { Engine *e = engine(A0); uint64_t self = A0; plat_lock(&g_lock); e->key = 0; plat_unlock(&g_lock); memset(HOST(self), 0, 16); RET(0); }
 static void fe_GetPointerToWorkBuffer(Ctx *c) { RET(engine(A0)->work); }
 static void fe_GetError(Ctx *c) { RET((uint32_t)engine(A0)->error); }
 
@@ -824,9 +824,9 @@ static void fe_LoadFont(Ctx *c) {
     size_t room = (size_t)(uint32_t)A4;
     if (!A2) { e->error = ERR_FONT_NOT_FOUND; RET(e->error); return; }
     if (e->count == MAX_FONTS) { printf("nn::fontll: more than %d fonts in one engine\n", MAX_FONTS); report_and_exit(3); }
-    EnterCriticalSection(&g_lock);
+    plat_lock(&g_lock);
     FontData *fd = font_data(data, (uint32_t)A3);
-    LeaveCriticalSection(&g_lock);
+    plat_unlock(&g_lock);
     if (!fd) { printf("nn::fontll: LoadFont: not a usable font file at %p\n", (void *)data); e->error = ERR_FONT_NOT_FOUND; RET(e->error); return; }
     Font *f = &e->fonts[e->count];
     f->fd = fd;
@@ -864,10 +864,10 @@ static void fe_SetScale(Ctx *c) {
 
 static void fe_SetBoldWeight(Ctx *c) {
     Engine *e = engine(A0);
-    static volatile LONG warned;
+    static volatile int32_t warned;
     if (flog(L_BOLD)) printf("fontll: SetBoldWeight engine %llx %x\n", (unsigned long long)A0, (unsigned)A1);
     if ((uint32_t)A1 > 0x10000) { e->error = ERR_BAD_BOLD; RET(e->error); return; }
-    if ((uint32_t)A1 && !InterlockedExchange(&warned, 1)) printf("nn::fontll: SetBoldWeight(%#x): emboldening is not implemented, glyphs stay regular\n", (unsigned)A1);
+    if ((uint32_t)A1 && !plat_xchg(&warned, 1)) printf("nn::fontll: SetBoldWeight(%#x): emboldening is not implemented, glyphs stay regular\n", (unsigned)A1);
     e->bold = (int)A1;
     e->error = 0;
     RET(0);
@@ -942,12 +942,12 @@ static void fe_AcquireGlyphmap(Ctx *c) {
     FontData *fd = current(e);
     if (map && fd) {
         long long frame = nvn_front_frame_next();
-        InterlockedIncrement64(&fd->drawn);
-        if ((uint32_t)A1 < 0x10000) InterlockedOr(&fd->seen[(uint32_t)A1 / 32], (LONG)(1u << ((uint32_t)A1 % 32)));
-        EnterCriticalSection(&g_lock);
+        plat_inc(&fd->drawn);
+        if ((uint32_t)A1 < 0x10000) plat_or(&fd->seen[(uint32_t)A1 / 32], (int32_t)(1u << ((uint32_t)A1 % 32)));
+        plat_lock(&g_lock);
         if ((fd->drawn == 1 || frame > fd->last_frame + 60) && fd->nwhen < 8) fd->when[fd->nwhen++] = frame;
         fd->last_frame = frame;
-        LeaveCriticalSection(&g_lock);
+        plat_unlock(&g_lock);
     }
     if (map && flog(L_GLYPH)) {
         int16_t v[4];
@@ -1077,7 +1077,7 @@ static const ImportDef fontll_imports[] = {
 };
 
 void register_fontll_imports(void) {
-    InitializeCriticalSection(&g_lock);
+    plat_lock_init(&g_lock);
     g_dc = CreateCompatibleDC(NULL);
     register_imports(fontll_imports, (int)(sizeof fontll_imports / sizeof fontll_imports[0]));
 }
@@ -1092,7 +1092,7 @@ void fontll_report(FILE *out) {
         size_t used = 0;
         int distinct = 0;
         for (uint32_t ch = 0; ch < 0x10000; ch++) {
-            if (!(f->seen[ch / 32] & (LONG)(1u << (ch % 32)))) continue;
+            if (!(f->seen[ch / 32] & (int32_t)(1u << (ch % 32)))) continue;
             distinct++;
             if (used + 8 < sizeof sample) used += (size_t)snprintf(sample + used, sizeof sample - used, " %04x", (unsigned)ch);
         }
@@ -1111,7 +1111,7 @@ void fontll_report(FILE *out) {
  * fonttest <font file> <pixels> <text or U+hex ...> [outline n]: metrics, advances, glyph maps as text, kerning. */
 int main(int argc, char **argv) {
     if (argc < 4) { printf("usage: fonttest <font> <pixels> <text|U+xxxx> [outline width] [pgm prefix]\n"); return 1; }
-    InitializeCriticalSection(&g_lock);
+    plat_lock_init(&g_lock);
     g_dc = CreateCompatibleDC(NULL);
     FILE *in = fopen(argv[1], "rb");
     if (!in) return 1;
@@ -1152,7 +1152,7 @@ int main(int argc, char **argv) {
         SelectObject(g_dc, f->hfont);
         GetGlyphOutlineW(g_dc, glyph, GGO_METRICS | GGO_GLYPH_INDEX, &gm, 0, NULL, &identity);
         WCHAR ch = (WCHAR)codes[i];
-        WORD gi = 0xffff;
+        uint16_t gi = 0xffff;
         GetGlyphIndicesW(g_dc, &ch, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS);
         printf("U+%04X glyph %u (GDI says %u)  hmtx advance %d units (GDI at em size: %d) = %.4f px -> i_dx %d", codes[i], glyph, gi, advance_units(f, glyph), gm.gmCellIncX,
                advance_fixed(&e, f, glyph) / 65536.0, (advance_fixed(&e, f, glyph) + 0x8000) >> 16);

@@ -21,7 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -31,7 +31,7 @@
 
 static void (*g_lifted_sort)(Ctx *);
 static int g_check;
-static LONG64 g_sorts, g_items, g_swaps, g_other, g_checked;
+static int64_t g_sorts, g_items, g_swaps, g_other, g_checked;
 
 static void (*host_fn_of(uint64_t guest))(Ctx *) {          /* the lifted function at a guest address (fn_table is sorted) */
     int lo = 0, hi = fn_table_count - 1;
@@ -49,9 +49,9 @@ static inline int key_cmp(uint64_t a, uint64_t b) { return (int)rd16(a + 0x62) -
 /* sead::PtrArrayImpl::sort [main], step for step: a forward pass over [lo, hi) swaps where cmp(p[k], p[k+1]) >= 1, a
  * backward pass from the forward pass's last swap down to lo swaps where cmp(p[k], p[k-1]) < 0; the next passes are
  * bounded by those last swaps; it ends when a pass's last swap is where it started. */
-static LONG64 shaker_sort_keys(uint64_t *p, int n) {
+static int64_t shaker_sort_keys(uint64_t *p, int n) {
     int lo = 0, hi = n - 1;
-    LONG64 swaps = 0;
+    int64_t swaps = 0;
     for (;;) {
         int last = lo;
         for (int k = lo; k < hi; k++)
@@ -103,7 +103,7 @@ static void sampler_sort(Ctx *c) {
  * what the game's code leaves behind (w0 = -1; x8, x9, x10 as it sets them; the callee-saved registers it restores);
  * a free slot goes to the lifted function. */
 static void (*g_lifted_register)(Ctx *);
-static LONG64 g_reg_taken, g_reg_free, g_reg_skipped;
+static int64_t g_reg_taken, g_reg_free, g_reg_skipped;
 /* The free-slot search that calls registerSampler_ [main 0x980e80..0x980ef4] keeps its cursor in this->+0x16a
  * (u16) and reads it again after each -1: loop 1 from the cursor + 1 up to this->count, loop 2 from 0 up to where loop
  * 1 began. A taken slot reached from one of its two calls also moves the cursor to the slot before the next free one
@@ -164,7 +164,7 @@ static void install_register(void) {
         printf("smo_fast: registerSampler's free-slot walk %s\n", g_site[0] ? "jumps over taken slots in host code (SMO_FAST_SKIP=0: one call per slot)" : same ? "one call per slot (SMO_FAST_SKIP=0)" : "one call per slot (its loop is not the expected code)");
     }
     HMODULE m = NULL;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)g_lifted_register, &m);
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)(uintptr_t)g_lifted_register, &m);
     if (!m) return;
     IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)((uint8_t *)m + ((IMAGE_DOS_HEADER *)m)->e_lfanew);
     IMAGE_SECTION_HEADER *sec = IMAGE_FIRST_SECTION(nt);
@@ -182,13 +182,13 @@ static void install_register(void) {
             if (!stub) {
                 static const uint8_t jmp_abs[6] = {0xFF, 0x25, 0, 0, 0, 0};
                 void (*fn)(Ctx *) = sampler_register;
-                DWORD old;
+                uint32_t old;
                 if (!(stub = alloc_near(q))) break;
                 memcpy(stub, jmp_abs, 6); memcpy(stub + 6, &fn, 8);
                 VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &old);
             }
             int64_t rel64 = stub - (q + 5);
-            DWORD old;
+            uint32_t old;
             if (rel64 != (int32_t)rel64 || !VirtualProtect(q + 1, 4, PAGE_EXECUTE_READWRITE, &old)) continue;
             rel = (int32_t)rel64;
             memcpy(q + 1, &rel, 4);
@@ -211,8 +211,8 @@ void smo_fast_install(void) {
     g_check = getenv("SMO_FAST_CHECK") && atoi(getenv("SMO_FAST_CHECK"));
     g_lifted_sort = host_fn_of(SYM_SORT);
     uint8_t *caller = (uint8_t *)(uintptr_t)host_fn_of(SYM_REGISTER);
-    DWORD64 img = 0;
-    PRUNTIME_FUNCTION rf = caller ? RtlLookupFunctionEntry((DWORD64)(uintptr_t)caller, &img, NULL) : NULL;
+    uint64_t img = 0;
+    PRUNTIME_FUNCTION rf = caller ? RtlLookupFunctionEntry((uint64_t)(uintptr_t)caller, &img, NULL) : NULL;
     if (!g_lifted_sort || !rf || (uint8_t *)(uintptr_t)(img + rf->BeginAddress) != caller) {
         printf("smo_fast: NOT installed: the lifted registerSampler_ or sead::PtrArrayImpl::sort was not found, or has no unwind entry\n");
         return;
@@ -230,7 +230,7 @@ void smo_fast_install(void) {
     void (*target)(Ctx *) = sampler_sort;
     static const uint8_t jmp_abs[6] = {0xFF, 0x25, 0, 0, 0, 0};      /* jmp [rip + 0], then the 8-byte address */
     memcpy(stub, jmp_abs, 6); memcpy(stub + 6, &target, 8);
-    DWORD old;
+    uint32_t old;
     VirtualProtect(stub, 0x1000, PAGE_EXECUTE_READ, &old);
     int64_t rel64 = stub - (at + 5);
     if (rel64 != (int32_t)rel64) { printf("smo_fast: NOT installed: the stub is out of rel32 range\n"); return; }

@@ -29,8 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <malloc.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 #include "eh_runtime.h"
@@ -56,7 +55,7 @@ uint64_t cxxrt_main_symbol(const char *name) {           /* address of a functio
     return 0;
 }
 /* Whether [p, p + n) is committed, accessible memory: one VirtualQuery. */
-static volatile LONG64 g_rd_asked;
+static volatile int64_t g_rd_asked;
 void cxxrt_readable_report(FILE *out) { fprintf(out, "nncxxrt: readable checks: %lld answered by VirtualQuery\n", (long long)g_rd_asked); }
 int cxxrt_readable(uint64_t p, size_t n) {
     MEMORY_BASIC_INFORMATION mi;
@@ -91,10 +90,10 @@ void cxxrt_print_guest_stack(void) {
     for (int depth = 0, shown = 0; depth < 600 && shown < 48; depth++) {
         uint64_t g = guest_function_of(ctx.Rip);
         if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); trace_printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
-        DWORD64 base;
+        uint64_t base;
         RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
         if (!rf) break;
-        void *hd; DWORD64 est;
+        void *hd; uint64_t est;
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
         if (!ctx.Rip) break;
     }
@@ -164,7 +163,7 @@ static uint64_t ti_upcast(uint64_t ti, uint64_t obj, uint64_t target) {
  * __cxa_exception, 0x80 bytes; the fields the SDK code touches are at the same offsets here. The two handler
  * pointers libc++abi keeps there are not used by anything, so their slots hold our magic and the object size. */
 typedef struct {
-    volatile LONG64 refs;            /* -0x80 */
+    volatile int64_t refs;            /* -0x80 */
     uint64_t type, dtor;             /* -0x78 std::type_info *, -0x70 void (*)(void *) */
     uint64_t magic, size;            /* -0x68, -0x60 */
     uint64_t next;                   /* -0x58 next older caught exception of the context (thrown object pointer) */
@@ -183,7 +182,7 @@ static ExcHeader *exc_header(uint64_t obj) {
 }
 static uint64_t exc_object(uint64_t obj) { ExcHeader *h = exc_header(obj); return h && h->primary ? h->primary : obj; }   /* the C++ object */
 uint64_t cxxrt_allocate_exception(size_t size) {
-    ExcHeader *h = _aligned_malloc(sizeof *h + (size ? size : 1), 16);
+    ExcHeader *h = plat_aligned_alloc(sizeof *h + (size ? size : 1), 16);
     if (!h) { printf("\nC++ RUNTIME: out of memory allocating an exception of %llu bytes\n", (unsigned long long)size); report_and_exit(3); }
     memset(h, 0, sizeof *h + size);
     h->magic = EXC_MAGIC;
@@ -198,7 +197,7 @@ const char *eh_type_name(uint64_t exception) { ExcHeader *h = exc_header(excepti
 typedef struct { Ctx *c; uint64_t in_flight, caught; int uncaught; } EhState;
 #define EH_STATES 4096
 static EhState g_eh_state[EH_STATES];
-static SRWLOCK g_eh_state_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_eh_state_lock = PLAT_RWLOCK_INIT;
 static EhState *eh_state(Ctx *c) {
     unsigned h = (unsigned)((P64(c) >> 6) * 2654435761u) % EH_STATES;
     for (int probe = 0; probe < EH_STATES; probe++, h = (h + 1) % EH_STATES) {       /* entries are never removed */
@@ -206,12 +205,12 @@ static EhState *eh_state(Ctx *c) {
         if (seen == c) return &g_eh_state[h];
         if (!seen) break;
     }
-    AcquireSRWLockExclusive(&g_eh_state_lock);
+    plat_rw_wlock(&g_eh_state_lock);
     for (;; h = (h + 1) % EH_STATES) {
         if (g_eh_state[h].c == c) break;
         if (!g_eh_state[h].c) { g_eh_state[h].c = c; break; }
     }
-    ReleaseSRWLockExclusive(&g_eh_state_lock);
+    plat_rw_wunlock(&g_eh_state_lock);
     return &g_eh_state[h];
 }
 uint64_t eh_in_flight(Ctx *c) { return eh_state(c)->in_flight; }
@@ -220,7 +219,7 @@ uint64_t eh_in_flight(Ctx *c) { return eh_state(c)->in_flight; }
 typedef struct { uint64_t base, size, hdr, table; uint32_t count; } EhImage;
 #define EH_IMAGES 256
 static EhImage g_eh_image[EH_IMAGES];
-static SRWLOCK g_eh_image_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_eh_image_lock = PLAT_RWLOCK_INIT;
 
 static uint64_t rd_uleb(uint64_t *p) { uint64_t r = 0; int s = 0; for (;;) { uint8_t b = rd8((*p)++); r |= (uint64_t)(b & 0x7f) << s; s += 7; if (!(b & 0x80)) return r; } }
 static int64_t rd_sleb(uint64_t *p) {
@@ -259,14 +258,14 @@ int eh_register_image(uint64_t base, uint64_t size, uint64_t hdr) {
     (void)rd_enc(&p, rd8(hdr + 1), hdr);                                              /* .eh_frame itself: not needed */
     uint64_t count = rd_enc(&p, rd8(hdr + 2), hdr);
     if (!count) return 0;
-    AcquireSRWLockExclusive(&g_eh_image_lock);
+    plat_rw_wlock(&g_eh_image_lock);
     int slot = -1;
     for (int i = 0; i < EH_IMAGES; i++) {
         if (g_eh_image[i].base == base && g_eh_image[i].size) { slot = i; break; }
         if (slot < 0 && !g_eh_image[i].size) slot = i;
     }
     if (slot >= 0) { EhImage im = {base, size, hdr, p, (uint32_t)count}; g_eh_image[slot] = im; }
-    ReleaseSRWLockExclusive(&g_eh_image_lock);
+    plat_rw_wunlock(&g_eh_image_lock);
     return slot >= 0;
 }
 /* Resume entries of main: only a game DLL lifted with resume entries exports game_eh_bind. This build lifts the game
@@ -278,7 +277,7 @@ void nro_catch_call(Ctx *c, void (*body)(Ctx *, uint64_t));               /* nnu
 static void eh_bind_main(void) {
     HMODULE dll = NULL;
     typedef void (*BindFn)(void (*)(Ctx *, void (*)(Ctx *, uint64_t)), const MainResume **, int *);
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)&fn_table[0], &dll)) return;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)&fn_table[0], &dll)) return;
     BindFn bind = (BindFn)(void *)GetProcAddress(dll, "game_eh_bind");
     if (bind) bind(nro_catch_call, &g_main_resume, &g_main_resume_n);
     trace_printf("nncxxrt: main %s\n", bind ? "has landing-pad resume entries" : "was lifted without resume entries (exceptions cannot be handled in main code)");
@@ -293,17 +292,17 @@ EhResumeFn eh_main_resume_entry(uint64_t lp) {
     return NULL;
 }
 void eh_unregister_image(uint64_t base) {
-    AcquireSRWLockExclusive(&g_eh_image_lock);
+    plat_rw_wlock(&g_eh_image_lock);
     for (int i = 0; i < EH_IMAGES; i++) if (g_eh_image[i].base == base) memset(&g_eh_image[i], 0, sizeof g_eh_image[i]);
-    ReleaseSRWLockExclusive(&g_eh_image_lock);
+    plat_rw_wunlock(&g_eh_image_lock);
 }
 int eh_find_function(uint64_t pc, EhFunction *out) {
     EhImage im = {0};
     memset(out, 0, sizeof *out);
-    AcquireSRWLockShared(&g_eh_image_lock);
+    plat_rw_rlock(&g_eh_image_lock);
     for (int i = 0; i < EH_IMAGES; i++)
         if (g_eh_image[i].size && pc >= g_eh_image[i].base && pc - g_eh_image[i].base < g_eh_image[i].size) { im = g_eh_image[i]; break; }
-    ReleaseSRWLockShared(&g_eh_image_lock);
+    plat_rw_runlock(&g_eh_image_lock);
     if (!im.size) return 0;
     /* binary search table: { s32 initial location, s32 FDE address }, both relative to the header, sorted */
     int64_t rel = (int64_t)(pc - im.hdr);
@@ -504,40 +503,40 @@ int cxxrt_uncaught(Ctx *c) { return eh_state(c)->uncaught > 0; }                
  * Itanium ABI: the first byte of the 64-bit guard is 1 once the object is initialised (the game tests it inline).
  * As in libc++abi the second byte marks "initialisation in progress" and the upper half records the initialising
  * thread, so other threads wait and a recursive initialisation is reported instead of deadlocking. */
-static CRITICAL_SECTION g_guard_lock;
-static CONDITION_VARIABLE g_guard_cv;
+static plat_lock_t g_guard_lock;
+static plat_cond_t g_guard_cv;
 static INIT_ONCE g_guard_once = INIT_ONCE_STATIC_INIT;
-static BOOL CALLBACK guard_init(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
+static int guard_init(PINIT_ONCE once, void * arg, void * *ctx) {
     (void)once; (void)arg; (void)ctx;
-    InitializeCriticalSection(&g_guard_lock);
-    InitializeConditionVariable(&g_guard_cv);
-    return TRUE;
+    plat_lock_init(&g_guard_lock);
+    plat_cond_init(&g_guard_cv);
+    return 1;
 }
 static void abi_guard_acquire(Ctx *c) {
     uint64_t g = A0;
     int r;
     InitOnceExecuteOnce(&g_guard_once, guard_init, NULL, NULL);
-    EnterCriticalSection(&g_guard_lock);
+    plat_lock(&g_guard_lock);
     for (;;) {
         if (rd8(g)) { r = 0; break; }
-        if (!rd8(g + 1)) { wr8(g + 1, 1); wr32(g + 4, GetCurrentThreadId()); r = 1; break; }
-        if (rd32(g + 4) == GetCurrentThreadId()) {
-            LeaveCriticalSection(&g_guard_lock);
+        if (!rd8(g + 1)) { wr8(g + 1, 1); wr32(g + 4, plat_tid()); r = 1; break; }
+        if (rd32(g + 4) == plat_tid()) {
+            plat_unlock(&g_guard_lock);
             fatal(c, "recursive initialisation of the static object guarded at 0x%llx", (unsigned long long)g);
         }
-        SleepConditionVariableCS(&g_guard_cv, &g_guard_lock, INFINITE);
+        plat_cond_wait_ms(&g_guard_cv, &g_guard_lock, PLAT_INFINITE);
     }
-    LeaveCriticalSection(&g_guard_lock);
+    plat_unlock(&g_guard_lock);
     RET(r);
 }
 static void guard_finish(uint64_t g, int done) {
     InitOnceExecuteOnce(&g_guard_once, guard_init, NULL, NULL);
-    EnterCriticalSection(&g_guard_lock);
+    plat_lock(&g_guard_lock);
     wr32(g + 4, 0);
     wr8(g + 1, 0);
-    if (done) { MemoryBarrier(); wr8(g, 1); }
-    WakeAllConditionVariable(&g_guard_cv);
-    LeaveCriticalSection(&g_guard_lock);
+    if (done) { plat_fence(); wr8(g, 1); }
+    plat_cond_broadcast(&g_guard_cv);
+    plat_unlock(&g_guard_lock);
 }
 static void abi_guard_release(Ctx *c) { guard_finish(A0, 1); }
 
@@ -561,7 +560,7 @@ uint64_t cxxrt_refstring_new(const char *s, size_t n) {
     ((char *)(rep + 3))[n] = 0;
     return P64(rep + 3);
 }
-static void refstring_release(uint64_t s) { if (s && InterlockedDecrement((volatile LONG *)(uintptr_t)(s - 8)) < 0) free((void *)(uintptr_t)(s - 0x18)); }
+static void refstring_release(uint64_t s) { if (s && plat_dec((volatile int32_t *)(uintptr_t)(s - 8)) < 0) free((void *)(uintptr_t)(s - 0x18)); }
 
 static void exc_dtor(Ctx *c) { RET(A0); }                                      /* ~exception, ~bad_alloc, ~bad_cast (D1/D2) */
 static void exc_dtor_delete(Ctx *c) { cxxrt_guest_delete(c, A0); }             /* D0 */

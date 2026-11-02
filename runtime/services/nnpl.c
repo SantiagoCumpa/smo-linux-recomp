@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -39,7 +39,7 @@ static const char *const free_files[FONT_TYPES][4] = {
 /* Windows' own, in %WINDIR%\Fonts: Segoe UI, Microsoft YaHei, Microsoft JhengHei, Malgun Gothic */
 static const char *const windows_files[FONT_TYPES] = {"segoeui.ttf", "msyh.ttc", "msyh.ttc", "msjh.ttc", "malgun.ttf", "segoeui.ttf", "segoeui.ttf"};
 static struct { void *data; size_t size; int tried; } g_fonts[FONT_TYPES];
-static CRITICAL_SECTION g_lock;
+static plat_lock_t g_lock;
 
 static int read_font(unsigned type, const char *path) {
     FILE *f = fopen(path, "rb");
@@ -47,10 +47,10 @@ static int read_font(unsigned type, const char *path) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    void *data = size > 0 ? _aligned_malloc((size_t)size + 16, 4096) : NULL;
+    void *data = size > 0 ? plat_aligned_alloc((size_t)size + 16, 4096) : NULL;
     int ok = data && fread(data, 1, (size_t)size, f) == (size_t)size;
     fclose(f);
-    if (!ok) { _aligned_free(data); return 0; }
+    if (!ok) { plat_aligned_free(data); return 0; }
     g_fonts[type].data = data;
     g_fonts[type].size = (size_t)size;
     return 1;
@@ -58,10 +58,10 @@ static int read_font(unsigned type, const char *path) {
 
 static void load_font(unsigned type) {
     if (type >= FONT_TYPES) return;
-    EnterCriticalSection(&g_lock);
+    plat_lock(&g_lock);
     if (!g_fonts[type].tried) {
         g_fonts[type].tried = 1;
-        char path[MAX_PATH] = "";
+        char path[PATH_MAX] = "";
         const char *dir = getenv("SMO_FONTS"), *from = "the console's (your dump)";
         snprintf(path, sizeof path, "%s\\%s", dir ? dir : "..\\sysdata\\fonts", console_files[type]);
         int ok = read_font(type, path);
@@ -70,7 +70,7 @@ static void load_font(unsigned type) {
             if ((ok = read_font(type, path))) from = "a free font (deps\\fonts)";
         }
         if (!ok) {
-            char windir[MAX_PATH] = "C:\\Windows";
+            char windir[PATH_MAX] = "C:\\Windows";
             GetWindowsDirectoryA(windir, sizeof windir);
             snprintf(path, sizeof path, "%s\\Fonts\\%s", windir, windows_files[type]);
             if ((ok = read_font(type, path))) from = "Windows' own (no dumped or free font found)";
@@ -83,7 +83,7 @@ static void load_font(unsigned type) {
             report_and_exit(7);
         }
     }
-    LeaveCriticalSection(&g_lock);
+    plat_unlock(&g_lock);
 }
 
 static void pl_GetSharedFontLoadState(Ctx *c) { load_font((unsigned)A0); RET(1); }
@@ -99,6 +99,6 @@ static const ImportDef pl_imports[] = {
 };
 
 void register_pl_imports(void) {
-    InitializeCriticalSection(&g_lock);
+    plat_lock_init(&g_lock);
     register_imports(pl_imports, (int)(sizeof pl_imports / sizeof pl_imports[0]));
 }

@@ -4,9 +4,15 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <sys/syscall.h>
+#include <execinfo.h>
+#include <ucontext.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 #include <sys/sysinfo.h>
 
 /* ---- locks ---- */
@@ -142,6 +148,7 @@ static void thread_free(plat_thread *t) {
 
 static void *thread_entry(void *p) {
     plat_thread *t = p;
+    plat_thread_altstack();
     __atomic_store_n(&t->tid, gettid(), __ATOMIC_RELEASE);
     t->fn(t->arg);
     pthread_mutex_lock(&t->m);
@@ -217,6 +224,44 @@ int plat_set_affinity(pid_t tid, const uint64_t *mask, int ncpu) {
 }
 
 int plat_cpu(void) { int c = sched_getcpu(); return c < 0 ? 0 : c; }
+uint64_t plat_thread_cpu_ns(pid_t tid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/task/%d/schedstat", (int)tid);
+    FILE *f = fopen(path, "r");
+    unsigned long long ns = 0;
+    if (f) { if (fscanf(f, "%llu", &ns) != 1) ns = 0; fclose(f); }
+    return ns;
+}
+
+void plat_system_cpu(uint64_t *busy, uint64_t *idle) {
+    unsigned long long v[10] = {0};
+    FILE *f = fopen("/proc/stat", "r");
+    if (f) {
+        if (fscanf(f, "cpu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5], &v[6], &v[7], &v[8], &v[9]) < 4) memset(v, 0, sizeof v);
+        fclose(f);
+    }
+    *idle = v[3] + v[4];
+    *busy = v[0] + v[1] + v[2] + v[5] + v[6] + v[7];
+}
+
+void plat_process_cpu(uint64_t *ticks, uint64_t *faults) {
+    char buf[1024];
+    *ticks = *faults = 0;
+    FILE *f = fopen("/proc/self/stat", "r");
+    if (!f) return;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');                             /* after the command name, which may hold spaces */
+    if (!p) return;
+    unsigned long long minflt = 0, majflt = 0, ut = 0, st = 0;
+    /* fields from 3: state ppid pgrp session tty tpgid flags minflt cminflt majflt cmajflt utime stime */
+    if (sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %llu %*u %llu %*u %llu %llu", &minflt, &majflt, &ut, &st) == 4) {
+        *ticks = ut + st;
+        *faults = minflt + majflt;
+    }
+}
+
 int plat_cpu_count(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (int)n : 1; }
 
 /* ---- memory ---- */
@@ -270,6 +315,27 @@ int plat_query(const void *addr, uintptr_t *base, size_t *size, int *prot) {
     }
     fclose(f);
     return found;
+}
+
+int plat_readable(const void *addr, size_t n) {
+    char buf[256];
+    for (size_t done = 0; done < n;) {
+        size_t k = n - done < sizeof buf ? n - done : sizeof buf;
+        struct iovec local = {buf, k}, remote = {(void *)((uintptr_t)addr + done), k};
+        if (process_vm_readv(getpid(), &local, 1, &remote, 1, 0) != (ssize_t)k) return 0;
+        done += k;
+    }
+    return 1;
+}
+
+static _Thread_local void *t_altstack;
+void plat_thread_altstack(void) {
+    if (t_altstack) return;
+    size_t size = 256 << 10;
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return;
+    stack_t ss = {.ss_sp = p, .ss_size = size, .ss_flags = 0};
+    if (sigaltstack(&ss, NULL) == 0) t_altstack = p; else munmap(p, size);
 }
 
 uint64_t plat_rss_bytes(void) {
@@ -347,4 +413,64 @@ int plat_fsync_dir(const char *path_in_dir) {
 void plat_exit(int code) {
     fflush(NULL);
     _exit(code);
+}
+
+int plat_argc;
+char **plat_argv;
+
+/* glibc calls .init_array functions with (argc, argv, envp) */
+static void plat_args(int argc, char **argv, char **envp) { (void)envp; plat_argc = argc; plat_argv = argv; }
+__attribute__((section(".init_array"), used)) static void (*const plat_args_init)(int, char **, char **) = plat_args;
+
+/* ---- sampling another thread's stack ---- */
+#define SAMPLE_SIG (SIGRTMIN + 4)
+static pthread_mutex_t g_sample_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { uintptr_t *pcs; int max, n; volatile int done; } g_sample;
+
+static void sample_handler(int sig, siginfo_t *si, void *ucv) {
+    (void)sig; (void)si;
+    ucontext_t *uc = ucv;
+    void *frames[96];
+    int n = backtrace(frames, 96), k = 0;
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+    if (g_sample.max > 0) g_sample.pcs[k++] = pc;
+    int start = 0;
+    for (int i = 0; i < n; i++) if ((uintptr_t)frames[i] == pc) { start = i + 1; break; }
+    for (int i = start; i < n && k < g_sample.max; i++) g_sample.pcs[k++] = (uintptr_t)frames[i];
+    g_sample.n = k;
+    __atomic_store_n(&g_sample.done, 1, __ATOMIC_RELEASE);
+}
+
+int plat_thread_backtrace(pid_t tid, uintptr_t *pcs, int max) {
+    static int installed;
+    pthread_mutex_lock(&g_sample_lock);
+    if (!installed) {
+        void *warm[2]; backtrace(warm, 2);                  /* loads the unwinder outside a signal handler */
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = sample_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SAMPLE_SIG, &sa, NULL);
+        installed = 1;
+    }
+    g_sample.pcs = pcs; g_sample.max = max; g_sample.n = 0; g_sample.done = 0;
+    int n = 0;
+    if (syscall(SYS_tgkill, getpid(), tid, SAMPLE_SIG) == 0) {
+        int64_t end = plat_ticks() + 200000000LL;
+        while (!__atomic_load_n(&g_sample.done, __ATOMIC_ACQUIRE) && plat_ticks() < end) sched_yield();
+        if (g_sample.done) n = g_sample.n;
+    }
+    g_sample.max = 0;
+    pthread_mutex_unlock(&g_sample_lock);
+    return n;
+}
+
+int plat_random(void *buf, size_t n) {
+    for (size_t done = 0; done < n;) {
+        ssize_t r = getrandom((uint8_t *)buf + done, n - done, 0);
+        if (r < 0) { if (errno == EINTR) continue; return 0; }
+        done += (size_t)r;
+    }
+    return 1;
 }

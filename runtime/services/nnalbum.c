@@ -1,18 +1,18 @@
 /* The album: pictures of the Capture button, kept in <userdata>\album (<userdata> = %SMO_USERDATA% or ..\userdata) as
  * <date>_<time>_<nn>.bmp (32-bit BMP; a console stores JPEG). The game imports no nn::album function. */
-#include <windows.h>
+#include "plat.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 const char *fs_user_root(void);                           /* nnfs.c: %SMO_USERDATA% or ..\userdata */
-static char g_album_dir[MAX_PATH];
+static char g_album_dir[PATH_MAX];
 static const char *album_dir(void) {
     if (!g_album_dir[0]) snprintf(g_album_dir, sizeof g_album_dir, "%s\\album", fs_user_root());
     return g_album_dir;
 }
-static volatile LONG g_shot_counter;
+static volatile int32_t g_shot_counter;
 
 /* Writes a top-down RGBA8 picture as a 32-bit BMP (BGRA, bottom-up). Returns 0 on success. */
 static int write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
@@ -24,7 +24,7 @@ static int write_bmp(const char *path, const uint8_t *rgba, int w, int h) {
     memset(&ih, 0, sizeof ih);
     fh.bfType = 0x4d42;
     fh.bfOffBits = sizeof fh + sizeof ih;
-    fh.bfSize = fh.bfOffBits + (DWORD)w * (DWORD)h * 4;
+    fh.bfSize = fh.bfOffBits + (uint32_t)w * (uint32_t)h * 4;
     ih.biSize = sizeof ih; ih.biWidth = w; ih.biHeight = h; ih.biPlanes = 1; ih.biBitCount = 32; ih.biCompression = BI_RGB;
     fwrite(&fh, sizeof fh, 1, f);
     fwrite(&ih, sizeof ih, 1, f);
@@ -59,11 +59,11 @@ int album_save_capture(const uint8_t *rgba, int w, int h, char *out_path, size_t
         pix = turned;
     }
     SYSTEMTIME t;
-    char path[MAX_PATH];
+    char path[PATH_MAX];
     GetLocalTime(&t);
-    CreateDirectoryA(album_dir(), NULL);
+    plat_mkdir(album_dir());
     snprintf(path, sizeof path, "%s\\%04d%02d%02d_%02d%02d%02d_%02ld.bmp", album_dir(), t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
-             InterlockedIncrement(&g_shot_counter) % 100);
+             plat_inc(&g_shot_counter) % 100);
     int bad = write_bmp(path, pix, ow, oh);
     if (out_path && out_cap) snprintf(out_path, out_cap, "%s", path);
     if (bad) printf("capture: cannot write %s\n", path);

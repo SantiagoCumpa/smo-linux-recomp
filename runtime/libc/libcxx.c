@@ -8,8 +8,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -27,7 +26,7 @@ typedef uint8_t Str;                                     /* pointer to a guest s
  * allocation size (libc++ keeps "size | 1"), rounded up to 16 as the inlined code does. */
 #define GAME_MEMALIGN GAME_SYM_aligned_alloc   /* the game's own allocator, by symbol */
 #define GAME_FREE GAME_SYM_free
-static __declspec(thread) Ctx *t_ctx;                     /* context of the string op in progress */
+static _Thread_local Ctx *t_ctx;                     /* context of the string op in progress */
 static char *sbuf_alloc(size_t alloc) {
     Ctx *c = t_ctx;
     uint64_t save[4] = {c->x[0], c->x[1], c->x[2], c->x[30]};

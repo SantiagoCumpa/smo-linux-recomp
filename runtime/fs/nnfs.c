@@ -27,7 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -63,44 +63,44 @@ enum { MK_ROM = 1, MK_SAVE, MK_CACHE, MK_PLAIN /* self-tests: a writable host fo
 typedef struct {
     char name[16];
     int kind;
-    char root[MAX_PATH];                     /* committed state (or the rom folder) */
-    char work[MAX_PATH];                     /* journal working folder ("" for the rom) */
+    char root[PATH_MAX];                     /* committed state (or the rom folder) */
+    char work[PATH_MAX];                     /* journal working folder ("" for the rom) */
     char **tomb;                             /* relative paths deleted since the last commit, '\\' separators */
     int tomb_n;
 } Mount;
 #define MOUNT_MAX 8
 static Mount g_mounts[MOUNT_MAX];
-static char g_rom_root[MAX_PATH], g_user_root[MAX_PATH];
-static volatile LONG g_open_log;
-static CRITICAL_SECTION g_fs_lock;
-static volatile LONG g_fs_lock_ready;
+static char g_rom_root[PATH_MAX], g_user_root[PATH_MAX];
+static volatile int32_t g_open_log;
+static plat_lock_t g_fs_lock;
+static volatile int32_t g_fs_lock_ready;
 
 static void fs_lock(void) {
-    if (InterlockedCompareExchange(&g_fs_lock_ready, 1, 0) == 0) { InitializeCriticalSection(&g_fs_lock); g_fs_lock_ready = 2; }
-    while (g_fs_lock_ready != 2) SwitchToThread();
-    EnterCriticalSection(&g_fs_lock);
+    if (plat_cas(&g_fs_lock_ready, 1, 0) == 0) { plat_lock_init(&g_fs_lock); g_fs_lock_ready = 2; }
+    while (g_fs_lock_ready != 2) plat_yield();
+    plat_lock(&g_fs_lock);
 }
-static void fs_unlock(void) { LeaveCriticalSection(&g_fs_lock); }
+static void fs_unlock(void) { plat_unlock(&g_fs_lock); }
 
 static void fs_roots(void) {
     if (g_rom_root[0]) return;
     const char *env = getenv("SMO_ROMFS"), *user = getenv("SMO_USERDATA");
-    strncpy(g_rom_root, env && env[0] ? env : "..\\romfs", MAX_PATH - 1);
-    strncpy(g_user_root, user && user[0] ? user : "..\\userdata", MAX_PATH - 1);
-    CreateDirectoryA(g_user_root, NULL);
+    strncpy(g_rom_root, env && env[0] ? env : "..\\romfs", PATH_MAX - 1);
+    strncpy(g_user_root, user && user[0] ? user : "..\\userdata", PATH_MAX - 1);
+    plat_mkdir(g_user_root);
 }
 const char *fs_user_root(void) { fs_roots(); return g_user_root; }
 const char *fs_rom_root(void) { fs_roots(); return g_rom_root; }           /* smo_ui.c: the game's own files for the host menus */
 
-static int is_dir(const char *p) { DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
+static int is_dir(const char *p) { uint32_t a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY); }
 static int exists(const char *p) { return GetFileAttributesA(p) != INVALID_FILE_ATTRIBUTES; }
 static void make_parents(const char *path) {             /* creates every missing folder above `path` */
-    char tmp[MAX_PATH];
+    char tmp[PATH_MAX];
     snprintf(tmp, sizeof tmp, "%s", path);
-    for (char *p = tmp + 3; *p; p++) if (*p == '\\') { *p = 0; CreateDirectoryA(tmp, NULL); *p = '\\'; }
+    for (char *p = tmp + 3; *p; p++) if (*p == '\\') { *p = 0; plat_mkdir(tmp); *p = '\\'; }
 }
 static void remove_tree(const char *dir) {
-    char pat[MAX_PATH], sub[MAX_PATH];
+    char pat[PATH_MAX], sub[PATH_MAX];
     WIN32_FIND_DATAA fd;
     snprintf(pat, sizeof pat, "%s\\*", dir);
     HANDLE h = FindFirstFileA(pat, &fd);
@@ -109,29 +109,29 @@ static void remove_tree(const char *dir) {
             if (!strcmp(fd.cFileName, ".") || !strcmp(fd.cFileName, "..")) continue;
             snprintf(sub, sizeof sub, "%s\\%s", dir, fd.cFileName);
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(sub);
-            else { SetFileAttributesA(sub, FILE_ATTRIBUTE_NORMAL); DeleteFileA(sub); }
+            else { SetFileAttributesA(sub, FILE_ATTRIBUTE_NORMAL); !unlink(sub); }
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
-    RemoveDirectoryA(dir);
+    !rmdir(dir);
 }
 
 /* ---- tombstones */
 static int tomb_find(Mount *m, const char *rel) {
-    for (int i = 0; i < m->tomb_n; i++) if (_stricmp(m->tomb[i], rel) == 0) return i;
+    for (int i = 0; i < m->tomb_n; i++) if (strcasecmp(m->tomb[i], rel) == 0) return i;
     return -1;
 }
 static int tomb_hides(Mount *m, const char *rel) {       /* rel itself or one of its parent folders was deleted */
     for (int i = 0; i < m->tomb_n; i++) {
         size_t n = strlen(m->tomb[i]);
-        if (_strnicmp(m->tomb[i], rel, n) == 0 && (rel[n] == 0 || rel[n] == '\\')) return 1;
+        if (strncasecmp(m->tomb[i], rel, n) == 0 && (rel[n] == 0 || rel[n] == '\\')) return 1;
     }
     return 0;
 }
 static void tomb_add(Mount *m, const char *rel) {
     if (tomb_find(m, rel) >= 0) return;
     m->tomb = realloc(m->tomb, sizeof(char *) * (size_t)(m->tomb_n + 1));
-    m->tomb[m->tomb_n++] = _strdup(rel);
+    m->tomb[m->tomb_n++] = strdup(rel);
 }
 static void tomb_clear(Mount *m) { for (int i = 0; i < m->tomb_n; i++) free(m->tomb[i]); free(m->tomb); m->tomb = NULL; m->tomb_n = 0; }
 
@@ -149,14 +149,14 @@ static uint32_t split_path(const char *guest, Mount **mount, char *rel) {
     if (!m) return RESULT_NOT_MOUNTED;
     const char *rest = colon + 1;
     while (*rest == '/' || *rest == '\\') rest++;
-    snprintf(rel, MAX_PATH, "%s", rest);
+    snprintf(rel, PATH_MAX, "%s", rest);
     for (char *p = rel; *p; p++) if (*p == '/') *p = '\\';
     size_t len = strlen(rel);
     while (len > 0 && rel[len - 1] == '\\') rel[--len] = 0;
     *mount = m;
     return 0;
 }
-static void join(char *out, const char *root, const char *rel) { if (rel[0]) snprintf(out, MAX_PATH, "%s\\%s", root, rel); else snprintf(out, MAX_PATH, "%s", root); }
+static void join(char *out, const char *root, const char *rel) { if (rel[0]) snprintf(out, PATH_MAX, "%s\\%s", root, rel); else snprintf(out, PATH_MAX, "%s", root); }
 /* The host path that currently holds `rel` in the mount's view; returns 0 when it does not exist in the view. */
 static int view_path(Mount *m, const char *rel, char *out) {
     if (m->work[0]) {
@@ -168,7 +168,7 @@ static int view_path(Mount *m, const char *rel, char *out) {
     return exists(out);
 }
 static int view_parent_is_dir(Mount *m, const char *rel) {
-    char parent[MAX_PATH], host[MAX_PATH];
+    char parent[PATH_MAX], host[PATH_MAX];
     snprintf(parent, sizeof parent, "%s", rel);
     char *s = strrchr(parent, '\\');
     if (!s) return 1;                                     /* directly under the root */
@@ -178,7 +178,7 @@ static int view_parent_is_dir(Mount *m, const char *rel) {
 /* (nnmovie_mf.c) the host file that holds guest path "mount:/dir/file" in its mount's view; 0 if none. On the
  * console the movie library's Extractor::SetDataSource(const char*) opens such a path through nn::fs itself. */
 int fs_host_path(const char *guest, char *out, size_t n) {
-    Mount *m; char rel[MAX_PATH], host[MAX_PATH];
+    Mount *m; char rel[PATH_MAX], host[PATH_MAX];
     int ok = 0;
     fs_lock();
     if (!split_path(guest, &m, rel) && view_path(m, rel, host) && !is_dir(host)) { snprintf(out, n, "%s", host); ok = 1; }
@@ -186,8 +186,8 @@ int fs_host_path(const char *guest, char *out, size_t n) {
     return ok;
 }
 /* Used by nnfsdir.c: the host folders to list for a guest directory (working folder first), 0 = no such directory. */
-int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result) {
-    Mount *m; char rel[MAX_PATH], host[MAX_PATH];
+int fs_dir_roots(const char *guest, char roots[2][PATH_MAX], uint32_t *result) {
+    Mount *m; char rel[PATH_MAX], host[PATH_MAX];
     int n = 0;
     fs_lock();
     *result = split_path(guest, &m, rel);
@@ -202,7 +202,7 @@ int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result) {
     return n;
 }
 int fs_dir_hidden(const char *guest_dir, const char *name) {      /* 1 = this entry of the committed folder was deleted in the working state */
-    Mount *m; char rel[MAX_PATH], full[MAX_PATH];
+    Mount *m; char rel[PATH_MAX], full[PATH_MAX];
     int hidden = 0;
     fs_lock();
     if (!split_path(guest_dir, &m, rel) && m->work[0]) { join(full, rel, name); hidden = tomb_hides(m, rel[0] ? full : name); }
@@ -229,13 +229,13 @@ static int open_mode(HANDLE h, int forget) {             /* mode of an open hand
 
 /* ---- journal: commit and recovery */
 static HANDLE commit_mutex(void) {
-    HANDLE mx = CreateMutexA(NULL, FALSE, "smo_native_save_commit");
-    if (mx) WaitForSingleObject(mx, INFINITE);
+    HANDLE mx = CreateMutexA(NULL, 0, "smo_native_save_commit");
+    if (mx) WaitForSingleObject(mx, PLAT_INFINITE);
     return mx;
 }
 static void commit_done(HANDLE mx) { if (mx) { ReleaseMutex(mx); CloseHandle(mx); } }
 static void journal_list(FILE *j, const char *work, const char *rel) {     /* every file of the working folder, depth first */
-    char dir[MAX_PATH], pat[MAX_PATH], sub[MAX_PATH];
+    char dir[PATH_MAX], pat[PATH_MAX], sub[PATH_MAX];
     WIN32_FIND_DATAA fd;
     join(dir, work, rel);
     snprintf(pat, sizeof pat, "%s\\*", dir);
@@ -246,7 +246,7 @@ static void journal_list(FILE *j, const char *work, const char *rel) {     /* ev
         if (rel[0]) snprintf(sub, sizeof sub, "%s\\%s", rel, fd.cFileName); else snprintf(sub, sizeof sub, "%s", fd.cFileName);
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { fprintf(j, "M\t%s\n", sub); journal_list(j, work, sub); }
         else {
-            char full[MAX_PATH];
+            char full[PATH_MAX];
             join(full, work, sub);
             HANDLE f = CreateFileA(full, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
             if (f != INVALID_HANDLE_VALUE) { FlushFileBuffers(f); CloseHandle(f); }
@@ -259,7 +259,7 @@ static void journal_list(FILE *j, const char *work, const char *rel) {     /* ev
  * "M rel" (make folder), "F rel" (move file). Every step can be repeated, so a commit interrupted here is finished by
  * running it again. */
 static int journal_apply(const char *marker) {
-    char line[MAX_PATH + 8], work[MAX_PATH] = "", root[MAX_PATH] = "", a[MAX_PATH], b[MAX_PATH];
+    char line[PATH_MAX + 8], work[PATH_MAX] = "", root[PATH_MAX] = "", a[PATH_MAX], b[PATH_MAX];
     FILE *j = fopen(marker, "r");
     int n = 0;
     if (!j) return -1;
@@ -271,20 +271,20 @@ static int journal_apply(const char *marker) {
         if (line[0] == 'W') snprintf(work, sizeof work, "%s", arg);
         else if (line[0] == 'R') snprintf(root, sizeof root, "%s", arg);
         else if (!root[0] || !work[0]) continue;
-        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else DeleteFileA(a); n++; }
-        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); CreateDirectoryA(a, NULL); }
+        else if (line[0] == 'D') { join(a, root, arg); if (is_dir(a)) remove_tree(a); else !unlink(a); n++; }
+        else if (line[0] == 'M') { join(a, root, arg); make_parents(a); plat_mkdir(a); }
         else if (line[0] == 'F') {
             join(a, work, arg); join(b, root, arg);
-            if (exists(a)) { make_parents(b); if (!MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) { fclose(j); return -2; } }
+            if (exists(a)) { make_parents(b); if (!plat_rename_replace(a, b)) { fclose(j); return -2; } }
             n++;
         }
     }
     fclose(j);
-    DeleteFileA(marker);
+    !unlink(marker);
     return n;
 }
-static int pid_alive(DWORD pid) {
-    HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, pid);
+static int pid_alive(uint32_t pid) {
+    HANDLE p = OpenProcess(SYNCHRONIZE, 0, pid);
     if (!p) return GetLastError() == ERROR_ACCESS_DENIED;
     int alive = WaitForSingleObject(p, 0) == WAIT_TIMEOUT;
     CloseHandle(p);
@@ -293,7 +293,7 @@ static int pid_alive(DWORD pid) {
 /* Before a save-type folder is mounted: finish a commit that was decided but not applied, and drop the working
  * folders and half-written journals of processes that no longer run. */
 static void journal_recover(const char *root) {
-    char marker[MAX_PATH], pat[MAX_PATH], path[MAX_PATH];
+    char marker[PATH_MAX], pat[PATH_MAX], path[PATH_MAX];
     WIN32_FIND_DATAA fd;
     HANDLE mx = commit_mutex();
     snprintf(marker, sizeof marker, "%s.commit", root);
@@ -309,10 +309,10 @@ static void journal_recover(const char *root) {
             const char *ext = strrchr(fd.cFileName, '.');
             const char *kind = ext && ext - 5 >= fd.cFileName && !strncmp(ext - 5, ".work", 5) ? "work" : ext && ext - 8 >= fd.cFileName && !strncmp(ext - 8, ".journal", 8) ? "journal" : NULL;
             if (!kind) continue;
-            DWORD pid = (DWORD)strtoul(ext + 1, NULL, 10);
-            if (!pid || pid == GetCurrentProcessId() || pid_alive(pid)) continue;
+            uint32_t pid = (uint32_t)strtoul(ext + 1, NULL, 10);
+            if (!pid || pid == getpid() || pid_alive(pid)) continue;
             snprintf(path, sizeof path, "%s\\..\\%s", root, fd.cFileName);
-            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path); else DeleteFileA(path);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) remove_tree(path); else !unlink(path);
             trace_printf("     fs journal: uncommitted %s of process %lu discarded (%s)\n", kind, (unsigned long)pid, fd.cFileName);
         } while (FindNextFileA(h, &fd));
         FindClose(h);
@@ -329,21 +329,21 @@ static uint32_t mount_add(const char *name, int kind, const char *root) {
     if (!m) { fs_unlock(); return RESULT_GENERIC_FAILURE; }
     memset(m, 0, sizeof *m);
     strcpy(m->name, name);
-    snprintf(m->root, MAX_PATH, "%s", root);
+    snprintf(m->root, PATH_MAX, "%s", root);
     if (kind != MK_ROM) {
-        snprintf(m->work, MAX_PATH, "%s.work.%lu", root, (unsigned long)GetCurrentProcessId());
+        snprintf(m->work, PATH_MAX, "%s.work.%lu", root, (unsigned long)getpid());
         remove_tree(m->work);                              /* a second mount in this process starts from the committed state */
-        CreateDirectoryA(m->work, NULL);
+        plat_mkdir(m->work);
     }
     m->kind = kind;
     fs_unlock();
     return 0;
 }
 
-static void save_dir(char *dir, const char *leaf) { fs_roots(); snprintf(dir, MAX_PATH, "%s\\%s", g_user_root, leaf); }
+static void save_dir(char *dir, const char *leaf) { fs_roots(); snprintf(dir, PATH_MAX, "%s\\%s", g_user_root, leaf); }
 /* Save data of the one local user lives in <userdata>\save. It exists once EnsureSaveData has created it;
  * MountSaveData of save data that does not exist fails as on the console. */
-static int save_exists(void) { char dir[MAX_PATH]; save_dir(dir, "save"); return is_dir(dir); }
+static int save_exists(void) { char dir[PATH_MAX]; save_dir(dir, "save"); return is_dir(dir); }
 static void fs_MountRom(Ctx *c) {                        /* (name, cache buffer, cache size): the buffer holds the RomFS metadata cache of the SDK's reader; the host reads the extracted tree */
     fs_roots();
     uint32_t r = mount_add(STR(0), MK_ROM, g_rom_root);
@@ -351,12 +351,12 @@ static void fs_MountRom(Ctx *c) {                        /* (name, cache buffer,
     RET(r);
 }
 static void fs_MountSaveData(Ctx *c) {                   /* (const char *name, const Uid &) */
-    char dir[MAX_PATH];
+    char dir[PATH_MAX];
     save_dir(dir, "save");
     if (!save_exists()) { trace_printf("     fs mount save data \"%s\": no save data (EnsureSaveData was not called)\n", STR(0)); RET(RESULT_TARGET_NOT_FOUND); return; }
     journal_recover(dir);
     uint32_t r = mount_add(STR(0), MK_SAVE, dir);
-    trace_printf("     fs mount save data \"%s\" -> %s, journal working folder %s.work.%lu (%x)\n", STR(0), dir, dir, (unsigned long)GetCurrentProcessId(), r);
+    trace_printf("     fs mount save data \"%s\" -> %s, journal working folder %s.work.%lu (%x)\n", STR(0), dir, dir, (unsigned long)getpid(), r);
     RET(r);
 }
 static void fs_Unmount(Ctx *c) {                         /* (const char *name): uncommitted changes are dropped */
@@ -373,13 +373,13 @@ static void fs_Unmount(Ctx *c) {                         /* (const char *name): 
     fs_unlock();
 }
 static void fs_EnsureSaveData(Ctx *c) {                  /* (const Uid &): creates the user's save data if there is none */
-    char dir[MAX_PATH];
+    char dir[PATH_MAX];
     save_dir(dir, "save");
-    RET(CreateDirectoryA(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS ? 0 : RESULT_GENERIC_FAILURE);
+    RET(plat_mkdir(dir) || GetLastError() == ERROR_ALREADY_EXISTS ? 0 : RESULT_GENERIC_FAILURE);
 }
 static void fs_Commit(Ctx *c) {                          /* (const char *mount name) */
     const char *name = STR(0);
-    char journal[MAX_PATH], marker[MAX_PATH];
+    char journal[PATH_MAX], marker[PATH_MAX];
     fs_lock();
     Mount *m = name ? mount_find(name, strlen(name)) : NULL;
     if (!m) { fs_unlock(); RET(RESULT_NOT_MOUNTED); return; }
@@ -387,7 +387,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
     for (int i = 0; i < OPEN_MAX; i++)
         if (g_open[i].h && g_open[i].mount == m && (g_open[i].mode & 2)) { fs_unlock(); trace_printf("     fs commit \"%s\": refused, a file is open for writing\n", name); RET(RESULT_WRITE_FILE_OPEN); return; }
     HANDLE mx = commit_mutex();
-    snprintf(journal, sizeof journal, "%s.journal.%lu", m->root, (unsigned long)GetCurrentProcessId());
+    snprintf(journal, sizeof journal, "%s.journal.%lu", m->root, (unsigned long)getpid());
     snprintf(marker, sizeof marker, "%s.commit", m->root);
     FILE *j = fopen(journal, "w");
     int ok = j != NULL, changes = -1;
@@ -398,7 +398,7 @@ static void fs_Commit(Ctx *c) {                          /* (const char *mount n
         ok = fflush(j) == 0 && FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(j)));
         fclose(j);
     }
-    if (ok) ok = MoveFileExA(journal, marker, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);      /* the commit is decided here */
+    if (ok) ok = plat_rename_replace(journal, marker);      /* the commit is decided here */
     if (ok) { changes = journal_apply(marker); ok = changes >= 0; }
     if (ok) tomb_clear(m);
     commit_done(mx);
@@ -422,11 +422,11 @@ static uint32_t romfs_buckets(uint32_t n) {
     return n;
 }
 static void romfs_walk(const char *dir, uint32_t *dirs, uint32_t *files, uint64_t *dir_bytes, uint64_t *file_bytes) {
-    wchar_t wpat[MAX_PATH + 4];
-    char pat[MAX_PATH + 4], sub[MAX_PATH], utf8[1024];
+    wchar_t wpat[PATH_MAX + 4];
+    char pat[PATH_MAX + 4], sub[PATH_MAX], utf8[1024];
     WIN32_FIND_DATAW fd;
     snprintf(pat, sizeof pat, "%s\\*", dir);
-    MultiByteToWideChar(CP_ACP, 0, pat, -1, wpat, MAX_PATH + 4);
+    MultiByteToWideChar(CP_ACP, 0, pat, -1, wpat, PATH_MAX + 4);
     HANDLE h = FindFirstFileW(wpat, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
@@ -454,7 +454,7 @@ static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
 }
 
 static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const char *path, int mode) */
-    char rel[MAX_PATH], path[MAX_PATH];
+    char rel[PATH_MAX], path[PATH_MAX];
     Mount *m = NULL;
     HANDLE h = INVALID_HANDLE_VALUE;
     int write = (A2 & 2) != 0;
@@ -465,9 +465,9 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
         int found = view_path(m, rel, path) && !is_dir(path);
         if (!found) r = RESULT_PATH_NOT_FOUND;
         else if (write && m->work[0]) {                    /* copy-on-write: the committed file is never opened for writing */
-            char w[MAX_PATH];
+            char w[PATH_MAX];
             join(w, m->work, rel);
-            if (_stricmp(w, path) != 0) { make_parents(w); if (!CopyFileA(path, w, TRUE)) r = RESULT_GENERIC_FAILURE; }
+            if (strcasecmp(w, path) != 0) { make_parents(w); if (!CopyFileA(path, w, 1)) r = RESULT_GENERIC_FAILURE; }
             strcpy(path, w);
         }
     }
@@ -476,7 +476,7 @@ static void fs_OpenFile(Ctx *c) {                     /* (FileHandle *out, const
         h = CreateFileA(path, GENERIC_READ | (write ? GENERIC_WRITE : 0), FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) r = RESULT_PATH_NOT_FOUND;
     }
-    if (InterlockedIncrement(&g_open_log) <= 200 || r)     /* D2: every failed open is logged, not only the first 200 */
+    if (plat_inc(&g_open_log) <= 200 || r)     /* D2: every failed open is logged, not only the first 200 */
         trace_printf("     fs open \"%s\" mode %d -> %s\n", STR(1), (int)A2, r == RESULT_NOT_MOUNTED ? "NOT MOUNTED" : r ? "NOT FOUND" : "ok");
     {   static int on = -1; if (on < 0) on = getenv("SMO_FSLOG") != NULL;       /* D2 debug: every open on stdout */
         if (on) printf("fslog: open \"%s\" mode %d -> %s\n", STR(1), (int)A2, r ? "NOT FOUND" : "ok"); }
@@ -493,9 +493,9 @@ static uint64_t read_at(HANDLE h, int64_t offset, void *buf, uint64_t size) {
     while (total < size) {
         OVERLAPPED ov = {0};
         uint64_t pos = (uint64_t)offset + total;
-        ov.Offset = (DWORD)pos;
-        ov.OffsetHigh = (DWORD)(pos >> 32);
-        DWORD chunk = size - total > 0x40000000 ? 0x40000000 : (DWORD)(size - total), got = 0;
+        ov.Offset = (uint32_t)pos;
+        ov.OffsetHigh = (uint32_t)(pos >> 32);
+        uint32_t chunk = size - total > 0x40000000 ? 0x40000000 : (uint32_t)(size - total), got = 0;
         if (!ReadFile(h, (char *)buf + total, chunk, &got, &ov) || got == 0) break;
         total += got;
     }
@@ -510,19 +510,19 @@ static void fs_ReadFileCount(Ctx *c) {                /* (size_t *outRead, handl
 }
 static void fs_WriteFile(Ctx *c) {                    /* (handle, offset, buffer, size, option) */
     OVERLAPPED ov = {0};
-    ov.Offset = (DWORD)A1;
-    ov.OffsetHigh = (DWORD)(A1 >> 32);
-    DWORD put = 0;
+    ov.Offset = (uint32_t)A1;
+    ov.OffsetHigh = (uint32_t)(A1 >> 32);
+    uint32_t put = 0;
     int mode = open_mode((HANDLE)A0, 0);
-    LARGE_INTEGER size;
+    plat_counter size;
     if (!(mode & 2)) { RET(RESULT_WRITE_NOT_PERMITTED); return; }
     if (!(mode & 4) && GetFileSizeEx((HANDLE)A0, &size) && (int64_t)(A1 + A3) > size.QuadPart) { RET(RESULT_NO_APPEND); return; }   /* a file only grows in append mode */
-    if (A3 && !WriteFile((HANDLE)A0, (void *)(uintptr_t)A2, (DWORD)A3, &put, &ov)) { RET(RESULT_GENERIC_FAILURE); return; }
+    if (A3 && !WriteFile((HANDLE)A0, (void *)(uintptr_t)A2, (uint32_t)A3, &put, &ov)) { RET(RESULT_GENERIC_FAILURE); return; }
     if (A4 && (rd32(A4) & 1)) FlushFileBuffers((HANDLE)A0);                  /* WriteOption::Flush */
     RET(0);
 }
 static void fs_GetFileSize(Ctx *c) {                  /* (s64 *out, handle) */
-    LARGE_INTEGER size;
+    plat_counter size;
     if (!GetFileSizeEx((HANDLE)A1, &size)) { RET(RESULT_GENERIC_FAILURE); return; }
     wr64(A0, (uint64_t)size.QuadPart);
     RET(0);
@@ -531,17 +531,17 @@ static void fs_GetFileSize(Ctx *c) {                  /* (s64 *out, handle) */
  * writing (on a journaled mount that is the working copy, committed with the rest). sead::NinFileDeviceBase::doOpen_
  * calls it when it opens a file to write it new. FlushFile (handle): what was written reaches the disk. */
 static void fs_SetFileSize(Ctx *c) {
-    LARGE_INTEGER pos;
+    plat_counter pos;
     if (!(open_mode((HANDLE)A0, 0) & 2)) { RET(RESULT_WRITE_NOT_PERMITTED); return; }
     if ((int64_t)A1 < 0) { RET(RESULT_OUT_OF_RANGE); return; }
-    pos.QuadPart = (LONGLONG)A1;
+    pos.QuadPart = (int64_t)A1;
     if (!SetFilePointerEx((HANDLE)A0, pos, NULL, FILE_BEGIN) || !SetEndOfFile((HANDLE)A0)) { RET(RESULT_GENERIC_FAILURE); return; }
     RET(0);
 }
 static void fs_FlushFile(Ctx *c) { if (open_mode((HANDLE)A0, 0) & 2) FlushFileBuffers((HANDLE)A0); RET(0); }
 /* Where a new entry goes: the working folder of a journaled mount. Result code; `path` = host path to create. */
 static uint32_t create_target(const char *guest, Mount **mount, char *rel, char *path) {
-    char host[MAX_PATH];
+    char host[PATH_MAX];
     uint32_t r = split_path(guest, mount, rel);
     if (r) return r;
     if ((*mount)->kind == MK_ROM) return RESULT_PERMISSION_DENIED;
@@ -552,7 +552,7 @@ static uint32_t create_target(const char *guest, Mount **mount, char *rel, char 
     return 0;
 }
 static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
-    char rel[MAX_PATH], path[MAX_PATH];
+    char rel[PATH_MAX], path[PATH_MAX];
     Mount *m;
     fs_lock();
     uint32_t r = create_target(STR(0), &m, rel, path);
@@ -560,8 +560,8 @@ static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
         HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h == INVALID_HANDLE_VALUE) r = RESULT_GENERIC_FAILURE;
         else {
-            LARGE_INTEGER size;
-            size.QuadPart = (LONGLONG)A1;
+            plat_counter size;
+            size.QuadPart = (int64_t)A1;
             SetFilePointerEx(h, size, NULL, FILE_BEGIN);
             SetEndOfFile(h);
             CloseHandle(h);
@@ -572,7 +572,7 @@ static void fs_CreateFile(Ctx *c) {                   /* (path, size) */
     RET(r);
 }
 static void fs_DeleteFile(Ctx *c) {
-    char rel[MAX_PATH], path[MAX_PATH], w[MAX_PATH], cm[MAX_PATH];
+    char rel[PATH_MAX], path[PATH_MAX], w[PATH_MAX], cm[PATH_MAX];
     Mount *m;
     fs_lock();
     uint32_t r = split_path(STR(0), &m, rel);
@@ -580,23 +580,23 @@ static void fs_DeleteFile(Ctx *c) {
     if (!r && (!view_path(m, rel, path) || is_dir(path))) r = RESULT_PATH_NOT_FOUND;
     if (!r) {
         join(w, m->work, rel); join(cm, m->root, rel);
-        if (exists(w)) DeleteFileA(w);
+        if (exists(w)) !unlink(w);
         if (exists(cm)) tomb_add(m, rel);
     }
     fs_unlock();
     RET(r);
 }
 static void fs_CreateDirectory(Ctx *c) {
-    char rel[MAX_PATH], path[MAX_PATH];
+    char rel[PATH_MAX], path[PATH_MAX];
     Mount *m;
     fs_lock();
     uint32_t r = create_target(STR(0), &m, rel, path);
-    if (!r && !CreateDirectoryA(path, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) r = RESULT_GENERIC_FAILURE;
+    if (!r && !plat_mkdir(path) && GetLastError() != ERROR_ALREADY_EXISTS) r = RESULT_GENERIC_FAILURE;
     fs_unlock();
     RET(r);
 }
 static void fs_GetEntryType(Ctx *c) {                 /* (DirectoryEntryType *out, path): 0 directory, 1 file */
-    char rel[MAX_PATH], path[MAX_PATH];
+    char rel[PATH_MAX], path[PATH_MAX];
     Mount *m;
     fs_lock();
     uint32_t r = split_path(STR(1), &m, rel);
@@ -642,21 +642,21 @@ static int st_read_is(Ctx *c, const char *guest, const char *text) {
     return text && strcmp(buf, text) == 0;
 }
 int nnfs_selftest(Ctx *c) {
-    char saved_root[MAX_PATH], t[MAX_PATH], save[MAX_PATH], a[MAX_PATH], n[MAX_PATH], work[MAX_PATH], marker[MAX_PATH], journal[MAX_PATH];
+    char saved_root[PATH_MAX], t[PATH_MAX], save[PATH_MAX], a[PATH_MAX], n[PATH_MAX], work[PATH_MAX], marker[PATH_MAX], journal[PATH_MAX];
     int bad = 0;
     uint64_t uid[2] = {1, 0}, h = 0;
     #define FSCHECK(cond, text) do { if (!(cond)) { printf("  FAIL fs journal: %s\n", text); bad++; } } while (0)
     fs_roots();
     strcpy(saved_root, g_user_root);
-    GetTempPathA(MAX_PATH - 64, t);
-    snprintf(t + strlen(t), 64, "smo_fs_selftest_%lu", (unsigned long)GetCurrentProcessId());
+    GetTempPathA(PATH_MAX - 64, t);
+    snprintf(t + strlen(t), 64, "smo_fs_selftest_%lu", (unsigned long)getpid());
     remove_tree(t);
-    CreateDirectoryA(t, NULL);
+    plat_mkdir(t);
     strcpy(g_user_root, t);
-    snprintf(save, sizeof save, "%s\\save", t); CreateDirectoryA(save, NULL);
+    snprintf(save, sizeof save, "%s\\save", t); plat_mkdir(save);
     snprintf(a, sizeof a, "%s\\a.bin", save); snprintf(n, sizeof n, "%s\\sub\\new.bin", save);
-    snprintf(work, sizeof work, "%s.work.%lu", save, (unsigned long)GetCurrentProcessId());
-    snprintf(marker, sizeof marker, "%s.commit", save); snprintf(journal, sizeof journal, "%s.journal.%lu", save, (unsigned long)GetCurrentProcessId());
+    snprintf(work, sizeof work, "%s.work.%lu", save, (unsigned long)getpid());
+    snprintf(marker, sizeof marker, "%s.commit", save); snprintf(journal, sizeof journal, "%s.journal.%lu", save, (unsigned long)getpid());
     FILE *f = fopen(a, "wb"); if (f) { fputs("committed", f); fclose(f); }
 
     c->x[0] = (uint64_t)(uintptr_t)"nosuch:/a.bin"; c->x[1] = 0; fs_CreateFile(c);
@@ -699,15 +699,15 @@ int nnfs_selftest(Ctx *c) {
     FSCHECK(st_write(c, "st:/a.bin", "THIRD!!!!", NULL) == 0, "write failed");
     f = fopen(journal, "w");
     if (f) { fprintf(f, "W\t%s\nR\t%s\n", work, save); journal_list(f, work, ""); fclose(f); }
-    MoveFileExA(journal, marker, MOVEFILE_REPLACE_EXISTING);
+    plat_rename_replace(journal, marker);
     FSCHECK(st_host_is(a, "SECOND!!!") && exists(marker), "test setup: decided commit");
     journal_recover(save);
     FSCHECK(st_host_is(a, "THIRD!!!!") && !exists(marker), "a decided commit was not rolled forward at the next mount");
     /* 6. a process killed before the commit was decided: its working folder is dropped (pid 4 is the System process: use a dead pid) */
     {
-        char dead[MAX_PATH];
+        char dead[PATH_MAX];
         snprintf(dead, sizeof dead, "%s.work.4294967294", save);
-        CreateDirectoryA(dead, NULL);
+        plat_mkdir(dead);
         snprintf(dead + strlen(dead), 32, "\\a.bin");
         f = fopen(dead, "wb"); if (f) { fputs("LOST", f); fclose(f); }
         journal_recover(save);
@@ -735,14 +735,14 @@ static void acc_GetLastOpenedUser(Ctx *c) { wr64(A0, 1); wr64(A0 + 8, 0); RET(0)
  * bytes, NUL-terminated, in the 33-byte Nickname. */
 static void acc_GetNickname(Ctx *c) {
     static char name[33];
-    static volatile LONG ready;
-    if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
+    static volatile int32_t ready;
+    if (plat_cas(&ready, 1, 0) == 0) {
         const char *env = getenv("SMO_NICKNAME");
         char utf8[512] = "";
         if (env && env[0]) snprintf(utf8, sizeof utf8, "%s", env);
         else {
             wchar_t wname[257] = L"";
-            DWORD n = 257;
+            uint32_t n = 257;
             if (GetUserNameW(wname, &n)) WideCharToMultiByte(CP_UTF8, 0, wname, -1, utf8, sizeof utf8, NULL, NULL);
         }
         if (!utf8[0]) strcpy(utf8, "Player");
@@ -752,7 +752,7 @@ static void acc_GetNickname(Ctx *c) {
         name[len] = 0;
         ready = 2;
     }
-    while (ready != 2) SwitchToThread();
+    while (ready != 2) plat_yield();
     memset((void *)(uintptr_t)A0, 0, 33);
     strcpy((char *)(uintptr_t)A0, name);
     RET(0);

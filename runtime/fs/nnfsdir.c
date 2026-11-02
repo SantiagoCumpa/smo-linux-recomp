@@ -16,7 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "sdklift.h"
 
 #define A0 (c->x[0])
@@ -34,13 +34,13 @@
 typedef struct { char name[0x301]; int is_file; int64_t size; } HostEntry;
 typedef struct { uint32_t magic; int count, pos; HostEntry *entries; } HostDir;
 
-int fs_dir_roots(const char *guest, char roots[2][MAX_PATH], uint32_t *result);   /* nnfs.c: mount table + save data journal view */
+int fs_dir_roots(const char *guest, char roots[2][PATH_MAX], uint32_t *result);   /* nnfs.c: mount table + save data journal view */
 int fs_dir_hidden(const char *guest_dir, const char *name);
 
 static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *out, const char *path, int mode) -> Result */
     uint64_t out = A0;
     int mode = (int)A2;
-    char roots[2][MAX_PATH], pattern[MAX_PATH + 4];
+    char roots[2][PATH_MAX], pattern[PATH_MAX + 4];
     uint32_t result = 0;
     if (out) wr64(out, 0);
     /* the folders that make up this directory: for journaled save data the working folder, then the committed one */
@@ -52,8 +52,8 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
     for (int r = 0; r < nroots; r++) {
         snprintf(pattern, sizeof pattern, "%s\\*", roots[r]);
         WIN32_FIND_DATAW fd;
-        wchar_t wpattern[MAX_PATH + 4];
-        MultiByteToWideChar(CP_ACP, 0, pattern, -1, wpattern, MAX_PATH + 4);
+        wchar_t wpattern[PATH_MAX + 4];
+        MultiByteToWideChar(CP_ACP, 0, pattern, -1, wpattern, PATH_MAX + 4);
         HANDLE h = FindFirstFileW(wpattern, &fd);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
@@ -63,11 +63,11 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
             memset(name, 0, sizeof name);
             if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, 0x300, NULL, NULL)) continue;
             if (r == nroots - 1 && nroots == 2) {            /* committed folder under a working folder: skip what the working state replaced or deleted */
-                char ansi[MAX_PATH];
+                char ansi[PATH_MAX];
                 WideCharToMultiByte(CP_ACP, 0, fd.cFileName, -1, ansi, sizeof ansi, NULL, NULL);
                 if (fs_dir_hidden((const char *)(uintptr_t)A1, ansi)) continue;
             }
-            for (int k = 0; k < d->count && !dup; k++) dup = _stricmp(d->entries[k].name, name) == 0;
+            for (int k = 0; k < d->count && !dup; k++) dup = strcasecmp(d->entries[k].name, name) == 0;
             if (dup) continue;
             if (is_dir ? !(mode & 1) : !(mode & 2)) {
                 if (nroots < 2) continue;                    /* still remembered (below) so the committed twin is not listed either */
@@ -134,13 +134,13 @@ void register_nnfsdir_imports(void) {
 int nnfsdir_selftest(Ctx *c) {
     /* a scratch mount under %TEMP% (never the user's save data): two files and one folder, listed with each mode */
     int ok = 1;
-    char base[MAX_PATH], p[MAX_PATH];
+    char base[PATH_MAX], p[PATH_MAX];
     uint32_t fs_mount_plain(const char *name, const char *host_dir);
-    GetTempPathA(MAX_PATH - 64, base);
-    snprintf(base + strlen(base), 64, "smo_fsdir_selftest_%lu", (unsigned long)GetCurrentProcessId());
-    CreateDirectoryA(base, NULL);
-    snprintf(p, sizeof p, "%s\\d", base); CreateDirectoryA(p, NULL);
-    snprintf(p, sizeof p, "%s\\d\\sub", base); CreateDirectoryA(p, NULL);
+    GetTempPathA(PATH_MAX - 64, base);
+    snprintf(base + strlen(base), 64, "smo_fsdir_selftest_%lu", (unsigned long)getpid());
+    plat_mkdir(base);
+    snprintf(p, sizeof p, "%s\\d", base); plat_mkdir(p);
+    snprintf(p, sizeof p, "%s\\d\\sub", base); plat_mkdir(p);
     snprintf(p, sizeof p, "%s\\d\\a.bin", base);
     FILE *f = fopen(p, "wb"); if (f) { fwrite("12345", 1, 5, f); fclose(f); }
     snprintf(p, sizeof p, "%s\\d\\b.bin", base);
@@ -175,11 +175,11 @@ int nnfsdir_selftest(Ctx *c) {
     uint64_t handle = 1;
     c->x[0] = P(&handle); c->x[1] = P("sdkselftest:/missing"); c->x[2] = 3; fs_OpenDirectory(c);
     ok = ok && c->x[0] == RESULT_PATH_NOT_FOUND && handle == 0;
-    snprintf(p, sizeof p, "%s\\d\\a.bin", base); DeleteFileA(p);
-    snprintf(p, sizeof p, "%s\\d\\b.bin", base); DeleteFileA(p);
-    snprintf(p, sizeof p, "%s\\d\\sub", base); RemoveDirectoryA(p);
-    snprintf(p, sizeof p, "%s\\d", base); RemoveDirectoryA(p);
-    RemoveDirectoryA(base);
+    snprintf(p, sizeof p, "%s\\d\\a.bin", base); !unlink(p);
+    snprintf(p, sizeof p, "%s\\d\\b.bin", base); !unlink(p);
+    snprintf(p, sizeof p, "%s\\d\\sub", base); !rmdir(p);
+    snprintf(p, sizeof p, "%s\\d", base); !rmdir(p);
+    !rmdir(base);
     printf("  fs: OpenDirectory / ReadDirectory (modes 1, 2, 3; 0x310-byte entries): %s\n", ok ? "ok" : "FAILED");
     return !ok;
 }

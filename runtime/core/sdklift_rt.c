@@ -14,7 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "sdklift.h"
 
 static int g_ready;
@@ -38,7 +38,7 @@ static void die(const char *fmt, ...) {
 static int load_image(void) {
     char path[1024];
     const char *env = getenv("SMO_SDK_ELF");
-    const char *g_elf = __argc > 1 ? __argv[1] : NULL;       /* same argument boot.c uses for main.elf */
+    const char *g_elf = plat_argc > 1 ? plat_argv[1] : NULL;       /* same argument boot.c uses for main.elf */
     if (env && env[0]) snprintf(path, sizeof path, "%s", env);
     else {
         snprintf(path, sizeof path, "%s", g_elf ? g_elf : GAME_ELF_DEFAULT);
@@ -54,7 +54,7 @@ static int load_image(void) {
     g_file = malloc(g_file_size);
     if (fread(g_file, 1, g_file_size, f) != g_file_size || memcmp(g_file, "\x7f" "ELF", 4)) { fclose(f); printf("sdklift: %s is not readable as an ELF\n", path); return 0; }
     fclose(f);
-    uint8_t *img = VirtualAlloc((void *)(uintptr_t)SDK_BASE, SDK_IMAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint8_t *img = plat_alloc((void *)(uintptr_t)SDK_BASE, SDK_IMAGE_SIZE, PLAT_RW);
     if (img != (uint8_t *)(uintptr_t)SDK_BASE) { printf("sdklift: cannot map the SDK image at %llx\n", (unsigned long long)SDK_BASE); return 0; }
     uint64_t phoff = *(uint64_t *)(g_file + 0x20);
     int phnum = *(uint16_t *)(g_file + 0x38);
@@ -221,11 +221,11 @@ void sdk_trap_call(Ctx *c, const char *name) {
 
 /* ---------------------------------------------------------------- setjmp / longjmp (see sdklift.h) */
 #define SDK_JMP_SLOTS 8
-static __declspec(thread) SdkJmpRec *t_jmp;
-static __declspec(thread) unsigned long long t_jmp_stamp;
+static _Thread_local SdkJmpRec *t_jmp;
+static _Thread_local unsigned long long t_jmp_stamp;
 
 SdkJmpRec *sdk_jmp_record(Ctx *c) {
-    if (!t_jmp) t_jmp = _aligned_malloc(sizeof(SdkJmpRec) * SDK_JMP_SLOTS, 16), memset(t_jmp, 0, sizeof(SdkJmpRec) * SDK_JMP_SLOTS);
+    if (!t_jmp) t_jmp = plat_aligned_alloc(sizeof(SdkJmpRec) * SDK_JMP_SLOTS, 16), memset(t_jmp, 0, sizeof(SdkJmpRec) * SDK_JMP_SLOTS);
     uint64_t key = c->x[0];
     SdkJmpRec *r = NULL;
     for (int i = 0; i < SDK_JMP_SLOTS; i++) if (t_jmp[i].key == key) r = &t_jmp[i];

@@ -3,7 +3,7 @@
  * the AudioRenderer's (smo_audio.c). */
 #include <stdio.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 

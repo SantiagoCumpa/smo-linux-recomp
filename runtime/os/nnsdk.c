@@ -3,8 +3,7 @@
  * names the mangled symbol; behaviour follows the public SDK semantics. */
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"
@@ -38,10 +37,10 @@ void host_clock_caller(const char *what, uint64_t lr) {
     if (n < 512) { seen[n++] = lr; printf("clock caller: %s from %llx\n", what, (unsigned long long)lr); }
 }
 static void os_GetSystemTick(Ctx *c) {
-    LARGE_INTEGER now, freq;
+    plat_counter now, freq;
     host_clock_caller("GetSystemTick", c->x[30]);
-    QueryPerformanceCounter(&now);
-    QueryPerformanceFrequency(&freq);
+    plat_qpc(&now);
+    plat_qpf(&freq);
     RET((uint64_t)((double)now.QuadPart * (double)TICK_HZ / (double)freq.QuadPart));
 }
 static void os_GetSystemTickFrequency(Ctx *c) { RET(TICK_HZ); }
@@ -215,14 +214,14 @@ static void result_GetDescription(Ctx *c) { RET(((uint32_t)A0 >> 9) & 0x1fff); }
  * [sdk] 0xc1be0 DirectoryName::IsValid: 1..31 characters of A-Z a-z 0-9 _ - (nnonline.inc opens directories). */
 #define BCAT_ALREADY_MOUNTED 0x87au
 #define BCAT_INTERNET_REQUEST_NOT_ACCEPTED 0x107au
-volatile LONG g_bcat_mounted;                             /* also read by nnonline.inc (DeliveryCacheDirectory / File Open) */
+volatile int32_t g_bcat_mounted;                             /* also read by nnonline.inc (DeliveryCacheDirectory / File Open) */
 static void bcat_Mount(Ctx *c) {
-    if (InterlockedCompareExchange(&g_bcat_mounted, 1, 0) != 0) { RET(BCAT_ALREADY_MOUNTED); return; }
+    if (plat_cas(&g_bcat_mounted, 1, 0) != 0) { RET(BCAT_ALREADY_MOUNTED); return; }
     trace_printf("     nn::bcat::MountDeliveryCacheStorage -> mounted (empty delivery cache)\n");
     RET(0);
 }
 static void bcat_Unmount(Ctx *c) {
-    if (InterlockedCompareExchange(&g_bcat_mounted, 0, 1) != 1)
+    if (plat_cas(&g_bcat_mounted, 0, 1) != 1)
         guest_trap("nn::bcat::UnmountDeliveryCacheStorage without a mounted storage (the SDK aborts, sdk 0xc5514)", c->x[30] - 4);
 }
 static void bcat_Enumerate(Ctx *c) {                         /* (int *outCount, DirectoryName *names, int max) */
@@ -278,9 +277,9 @@ static void bcat_unavailable(Ctx *c) { RET(RESULT_UNAVAILABLE); }
  * Initialize is left untouched; its size is only remembered for GetTotalFreeSize. */
 static uint64_t g_std_alloc_size = 0x10000000;
 static void stdalloc_Initialize(Ctx *c) { g_std_alloc_size = A2; }
-static void stdalloc_Allocate(Ctx *c) { RET(_aligned_malloc(A1 ? (size_t)A1 : 1, 16)); }
-static void stdalloc_AllocateAligned(Ctx *c) { RET(_aligned_malloc(A1 ? (size_t)A1 : 1, A2 < 16 ? 16 : (size_t)A2)); }
-static void stdalloc_Free(Ctx *c) { _aligned_free((void *)(uintptr_t)A1); }
+static void stdalloc_Allocate(Ctx *c) { RET(plat_aligned_alloc(A1 ? (size_t)A1 : 1, 16)); }
+static void stdalloc_AllocateAligned(Ctx *c) { RET(plat_aligned_alloc(A1 ? (size_t)A1 : 1, A2 < 16 ? 16 : (size_t)A2)); }
+static void stdalloc_Free(Ctx *c) { plat_aligned_free((void *)(uintptr_t)A1); }
 static void stdalloc_Reallocate(Ctx *c) { RET(_aligned_realloc((void *)(uintptr_t)A1, A2 ? (size_t)A2 : 1, 16)); }
 
 /* ---- nn::util string and bit helpers */
@@ -288,25 +287,25 @@ static void util_SNPrintf(Ctx *c) {                       /* (char *buf, size_t 
     const char *fmt = (const char *)(uintptr_t)A2;
     /* SMO_SNPRINTF_LOG=1: how often the game formats and what one call costs. A line per 2,000 calls:
      * the frame, the time those calls took, the slowest one with its format and caller. */
-    static int lg = -1; static LONG64 n_calls, tk_sum, tk_max; static char max_fmt[64]; static uint64_t max_ra;
+    static int lg = -1; static int64_t n_calls, tk_sum, tk_max; static char max_fmt[64]; static uint64_t max_ra;
     if (lg < 0) lg = getenv("SMO_SNPRINTF_LOG") && atoi(getenv("SMO_SNPRINTF_LOG"));
-    LARGE_INTEGER q0, q1;
-    if (lg) QueryPerformanceCounter(&q0);
+    plat_counter q0, q1;
+    if (lg) plat_qpc(&q0);
     if (format_has_float(fmt)) guest_trap("nn::util::SNPrintf with a floating-point conversion is not supported", c->x[30] - 4);
     int n = snprintf((char *)(uintptr_t)A0, (size_t)A1, fmt, (unsigned long long)A3, (unsigned long long)A4,
                      (unsigned long long)c->x[5], (unsigned long long)c->x[6], (unsigned long long)c->x[7]);
     if (lg) {
         extern long long nvn_front_frame_next(void);
-        QueryPerformanceCounter(&q1);
-        LONG64 d = q1.QuadPart - q0.QuadPart;
+        plat_qpc(&q1);
+        int64_t d = q1.QuadPart - q0.QuadPart;
         tk_sum += d;
         if (d > tk_max) { tk_max = d; max_ra = c->x[30]; snprintf(max_fmt, sizeof max_fmt, "%.60s", fmt); }
-        {   static LONG nslow; LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-            if (d * 5000 > fq.QuadPart && InterlockedIncrement(&nslow) <= 300)      /* one call over 0.2 ms */
+        {   static int32_t nslow; plat_counter fq; plat_qpf(&fq);
+            if (d * 5000 > fq.QuadPart && plat_inc(&nslow) <= 300)      /* one call over 0.2 ms */
                 printf("snprintf_log: SLOW call, frame %lld: %.3f ms, format \"%.60s\" (%llu characters), buffer size %llu, result %d, called from %llx\n", nvn_front_frame_next(), (double)d * 1000.0 / (double)fq.QuadPart, fmt, (unsigned long long)strlen(fmt), (unsigned long long)A1, n, (unsigned long long)c->x[30]);
         }
         if (++n_calls % 2000 == 0) {
-            LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+            plat_counter fq; plat_qpf(&fq);
             printf("snprintf_log: frame %lld: %lld calls so far, the last 2000 took %.2f ms, slowest %.3f ms (format \"%s\", buffer size %llu, called from %llx); this one: \"%.40s\" size %llu from %llx\n", nvn_front_frame_next(), (long long)n_calls,
                    (double)tk_sum * 1000.0 / (double)fq.QuadPart, (double)tk_max * 1000.0 / (double)fq.QuadPart, max_fmt, (unsigned long long)A1, (unsigned long long)max_ra, fmt, (unsigned long long)A1, (unsigned long long)c->x[30]);
             tk_sum = tk_max = 0;

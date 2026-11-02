@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "sdklift.h"
 
 void register_nnapplet_imports(void);
@@ -304,7 +304,7 @@ static int libc_selftest(Ctx *c) {
         printf("  nn::crypto: MD5(\"abc\") = RFC 1321 test vector: %s\n", ok ? "ok" : "FAILED");
         bad += !ok;
         free(md5);
-        uint8_t *region = _aligned_malloc(0x4000, 0x1000);
+        uint8_t *region = plat_aligned_alloc(0x4000, 0x1000);
         c->x[0] = P(region); c->x[1] = 0x4000; c->x[2] = 0; handler("_ZN2nn4lmem15CreateFrameHeapEPvmi")(c);
         uint64_t heap = c->x[0], p1, p2;
         c->x[0] = heap; c->x[1] = 0x100; c->x[2] = 16; handler("_ZN2nn4lmem21AllocateFromFrameHeapEPNS0_6detail8HeapHeadEmi")(c); p1 = c->x[0];
@@ -314,7 +314,7 @@ static int libc_selftest(Ctx *c) {
         c->x[0] = heap; handler("_ZN2nn4lmem16DestroyFrameHeapEPNS0_6detail8HeapHeadE")(c);
         printf("  nn::lmem: frame heap inside the caller's region, aligned blocks, too-large request refused: %s\n", ok ? "ok" : "FAILED");
         bad += !ok;
-        _aligned_free(region);
+        plat_aligned_free(region);
     }
     return bad;
 }
@@ -332,13 +332,13 @@ static int libc_selftest(Ctx *c) {
  * The game gives its StandardAllocator a buffer (trace: Initialize(this, buffer, 0x100000) from 0x71036f8780), so the
  * memory-block functions are only reached by the self-test's buffer-less allocator. */
 static void pt_once(Ctx *c) {
-    volatile LONG *ctl = (volatile LONG *)(uintptr_t)c->x[0];
+    volatile int32_t *ctl = (volatile int32_t *)(uintptr_t)c->x[0];
     uint64_t fn = c->x[1];
     for (;;) {
-        LONG v = InterlockedCompareExchange(ctl, 1, 0);
+        int32_t v = plat_cas(ctl, 1, 0);
         if (v == 2) break;
-        if (v == 0) { call_guest(c, fn); InterlockedExchange(ctl, 2); break; }
-        SwitchToThread();
+        if (v == 0) { call_guest(c, fn); plat_xchg(ctl, 2); break; }
+        plat_yield();
     }
     c->x[0] = 0;
 }
@@ -346,15 +346,15 @@ static void pt_key_create(Ctx *c) { uint64_t key = c->x[0]; handler("_ZN2nn2os15
 static void pt_getspecific(Ctx *c) { c->x[0] &= 0xffffffffu; handler("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE")(c); }
 static void pt_setspecific(Ctx *c) { c->x[0] &= 0xffffffffu; handler("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm")(c); c->x[0] = 0; }
 static void os_AllocateMemoryBlock(Ctx *c) {
-    void *p = VirtualAlloc(NULL, (SIZE_T)c->x[1], MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void *p = VirtualAlloc(NULL, (size_t)c->x[1], MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (p) wr64(c->x[0], P(p));
     c->x[0] = p ? 0 : 0x1003;
 }
 static void os_FreeMemoryBlock(Ctx *c) { VirtualFree((void *)(uintptr_t)c->x[0], 0, MEM_RELEASE); }
 static void os_SetMemoryPermission(Ctx *c) {
-    DWORD old, prot = (uint32_t)c->x[2] == 3 ? PAGE_READWRITE : (uint32_t)c->x[2] == 1 ? PAGE_READONLY : PAGE_NOACCESS;
+    uint32_t old, prot = (uint32_t)c->x[2] == 3 ? PAGE_READWRITE : (uint32_t)c->x[2] == 1 ? PAGE_READONLY : PAGE_NOACCESS;
     if ((uint32_t)c->x[2] != 0 && (uint32_t)c->x[2] != 1 && (uint32_t)c->x[2] != 3) guest_trap("nn::os::SetMemoryPermission: invalid permission", c->x[30] - 4);
-    if (!VirtualProtect((void *)(uintptr_t)c->x[0], (SIZE_T)c->x[1], prot, &old)) guest_trap("nn::os::SetMemoryPermission: VirtualProtect failed", c->x[0]);
+    if (!VirtualProtect((void *)(uintptr_t)c->x[0], (size_t)c->x[1], prot, &old)) guest_trap("nn::os::SetMemoryPermission: VirtualProtect failed", c->x[0]);
 }
 static void os_SetMemoryAttribute(Ctx *c) { (void)c; }
 static void os_FreeAddressRegion2(Ctx *c) { VirtualFree((void *)(uintptr_t)c->x[0], 0, MEM_RELEASE); c->x[0] = 0; }
@@ -373,16 +373,16 @@ static void install_mem_overrides(void) {
 }
 
 /* ---- nn::mem::NumberLineAllocator and StandardAllocator: the lifted SDK classes, driven like the game drives them */
-static void st_alloc_cb(Ctx *c) { c->x[0] = P(_aligned_malloc((size_t)c->x[0], 16)); }      /* void *(*)(size_t, void *) */
-static void st_free_cb(Ctx *c) { _aligned_free((void *)(uintptr_t)c->x[0]); }               /* void (*)(void *, void *) */
+static void st_alloc_cb(Ctx *c) { c->x[0] = P(plat_aligned_alloc((size_t)c->x[0], 16)); }      /* void *(*)(size_t, void *) */
+static void st_free_cb(Ctx *c) { plat_aligned_free((void *)(uintptr_t)c->x[0]); }               /* void (*)(void *, void *) */
 static int mem_selftest(Ctx *c) {
     int bad = 0;
     #define MEMCHECK(cond, text) do { if (!(cond)) { printf("  FAIL mem: %s\n", text); bad++; } } while (0)
     ImportFn nla_init = sdk_lifted("_ZN2nn3mem19NumberLineAllocator10InitializeEPFPvmS2_ES2_PFvS2_S2_ES2_b"), nla_add = sdk_lifted("_ZN2nn3mem19NumberLineAllocator8AddRangeEii"),
              nla_alloc = sdk_lifted("_ZN2nn3mem19NumberLineAllocator8AllocateEPii"), nla_free = sdk_lifted("_ZN2nn3mem19NumberLineAllocator4FreeEi");
     if (!nla_init || !nla_add || !nla_alloc || !nla_free) { printf("  FAIL mem: NumberLineAllocator is not lifted\n"); return 1; }
-    uint64_t *obj = _aligned_malloc(0x40, 16);
-    int32_t *ids = _aligned_malloc(64, 16);
+    uint64_t *obj = plat_aligned_alloc(0x40, 16);
+    int32_t *ids = plat_aligned_alloc(64, 16);
     memset(obj, 0, 0x40);
     c->x[0] = P(obj); c->x[1] = hostfn_address("selftest alloc callback", st_alloc_cb); c->x[2] = 0; c->x[3] = hostfn_address("selftest free callback", st_free_cb); c->x[4] = 0; c->x[5] = 0;
     nla_init(c);
@@ -404,7 +404,7 @@ static int mem_selftest(Ctx *c) {
              sa_realloc = sdk_lifted("_ZN2nn3mem17StandardAllocator10ReallocateEPvm"), sa_fin = sdk_lifted("_ZN2nn3mem17StandardAllocator8FinalizeEv");
     if (!sa_ctor || !sa_init || !sa_alloc || !sa_free || !sa_total || !sa_realloc || !sa_fin) { printf("  FAIL mem: StandardAllocator is not lifted\n"); return bad + 1; }
     for (int mode = 0; mode < 2; mode++) {                       /* 0: on a buffer, as the game does; 1: buffer-less (virtual address memory) */
-        uint8_t *sa = _aligned_malloc(0x400, 16), *buf = mode ? NULL : VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        uint8_t *sa = plat_aligned_alloc(0x400, 16), *buf = mode ? NULL : VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         memset(sa, 0, 0x400);
         c->x[0] = P(sa); sa_ctor(c);
         c->x[0] = P(sa); c->x[1] = P(buf); c->x[2] = 0x100000; sa_init(c);
@@ -433,14 +433,14 @@ static int mem_selftest(Ctx *c) {
 }
 
 static void selftest(void) {
-    Ctx *c = _aligned_malloc(sizeof *c, 16);
+    Ctx *c = plat_aligned_alloc(sizeof *c, 16);
     uint8_t *stack = VirtualAlloc(NULL, 8 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     memset(c, 0, sizeof *c);
     c->x[31] = P(stack + (8 << 20) - 0x1000);
     c->tpidr = P(VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));   /* the thread's own block: lifted libc keeps errno there */
     int bad = 0;
     printf("SDK self-test (lifted sdk.elf code + offline service answers)\n");
-    if (!sdk_image_ready()) { printf("  sdk.elf is not loaded: nothing can be tested\n"); fflush(stdout); ExitProcess(99); }
+    if (!sdk_image_ready()) { printf("  sdk.elf is not loaded: nothing can be tested\n"); fflush(stdout); plat_exit(99); }
     int missing = sdk_missing_host_callees(stdout);
     printf("  sdklift: %d functions lifted, %d host callees, %d without a handler\n", sdk_fn_count, sdk_host_name_count, missing);
     bad += missing;
@@ -458,7 +458,7 @@ static void selftest(void) {
     { int image_protect_selftest(Ctx *c); bad += image_protect_selftest(c); }  /* nnmisc.c: image protection */
     printf("SDK self-test: %d failure(s)\n", bad);
     fflush(stdout);
-    ExitProcess((UINT)bad);
+    plat_exit((unsigned)bad);
 }
 
 /* Imports whose host re-implementation is replaced by the real code lifted from sdk.elf (the list:

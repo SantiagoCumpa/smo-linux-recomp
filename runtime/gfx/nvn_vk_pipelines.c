@@ -12,11 +12,10 @@
  *     clamp and the sample mask are dynamic state, so the key is (stages, topology class, pass formats, samples, logic op,
  *     sample shading): few keys per pair, which is what makes the prediction possible.
  * One lock (g_sh_lock) guards the stage table, the pipeline table, the signature / pair tables and the job queue. */
-#include <psapi.h>
 typedef struct { uint8_t unit, dim, shadow; uint16_t binding; } VSmp;
 typedef struct VStage {
     uint64_t h, hb;                                /* h: this variant (code, constants, canonical key, forced outputs); hb: code and constants only */
-    int stage, code_len, ok; volatile LONG state, cp_state;      /* state: 1 being made, 2 made (ok says how it went); cp_state: compute pipeline 0 none, 1 being made, 2 made */
+    int stage, code_len, ok; volatile int32_t state, cp_state;      /* state: 1 being made, 2 made (ok says how it went); cp_state: compute pipeline 0 none, 1 being made, 2 made */
     int gprim;                                     /* a geometry stage: the primitive class of the draws it serves (MxIn.gs_in_prim; part of hb) */
     uint32_t images_w; uint16_t img_fmt[8]; uint8_t img_type[8];      /* a compute stage's images (MxOut): written ones, declared format and type */
     uint32_t key[4], fo, in_attr, out_attr, id, cbufs, ssbos, ssbo_w, images, dep, tex_units; int uses_alpha, nsmp, cp_recorded, from_rec, fragonly;      /* fragonly: handed over by a program without a vertex stage */
@@ -24,7 +23,7 @@ typedef struct VStage {
     uint32_t local[3];
     VSmp smp[64];
     VkShaderModule mod; struct VStage *next, *next_h;
-    VkPipeline lib, lib2; volatile LONG lib_state, lib2_state;      /* SMO_VK_GPL=2: the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
+    VkPipeline lib, lib2; volatile int32_t lib_state, lib2_state;      /* SMO_VK_GPL=2: the stage's pipeline library; lib2: a vertex stage with the empty fragment shader state */
     uint64_t spv; int mod_users, mod_rel;          /* spv: name of the stage's SPIR-V file; the module is used by mod_users threads now and may be released (mod_rel) once its library or compute pipeline is made (stage_mod_get) */
 } VStage;
 #define MX_VK_VERSION 10u                        /* part of every hash: change it when mx_translate's Vulkan text or these records change */
@@ -32,43 +31,43 @@ typedef struct { uint32_t magic; int32_t stage, code_len; uint32_t key[4], fo; u
 typedef struct { uint32_t magic, key[4], fo, dep, tex; uint64_t vh; } VarRec;      /* ..\cache\vk\stage\<stage>_<hb>.var: the variants of one code */
 #define STAGEREC_MAGIC (0x52545356u + MX_VK_VERSION)
 typedef struct { int stage, code_len, serial; const uint8_t *code, *cdata; uint32_t cdata_size, local[3], smem, lmem; int gprim; /* geometry stage, as VStage */ } SSrc;
-static CRITICAL_SECTION g_sh_lock;
-static CONDITION_VARIABLE g_sh_cv, g_jq_cv;        /* g_sh_cv: something was finished; g_jq_cv: a job was queued */
+static plat_lock_t g_sh_lock;
+static plat_cond_t g_sh_cv, g_jq_cv;        /* g_sh_cv: something was finished; g_jq_cv: a job was queued */
 /* ---- the freeze watchdog's wait registry (nvn_vk_watchdog.c writes the report). Every wait of ours that has no
  * time-out, and the long ones, are entered here with the function and line that waits; the report names them. */
-typedef struct { volatile LONG tid; const char *fn; int line; LONG64 since; } WdWait;
+typedef struct { volatile int32_t tid; const char *fn; int line; int64_t since; } WdWait;
 static WdWait g_wd_wait[64];
-static volatile LONG64 g_wd_beat;                  /* QueryPerformanceCounter of the last present (normal or progress bar) */
-static volatile LONG g_wd_where;                   /* the render thread's place in a present (1 barrier, 2 acquire, 4 present) */
-static volatile LONG64 g_wd_try;                /* present attempts (one that failed or was skipped counts here, not in g_wd_beat) */
+static volatile int64_t g_wd_beat;                  /* plat_qpc of the last present (normal or progress bar) */
+static volatile int32_t g_wd_where;                   /* the render thread's place in a present (1 barrier, 2 acquire, 4 present) */
+static volatile int64_t g_wd_try;                /* present attempts (one that failed or was skipped counts here, not in g_wd_beat) */
 static int wd_enter(const char *fn, int line) {
-    LARGE_INTEGER t; QueryPerformanceCounter(&t);
-    LONG me = (LONG)GetCurrentThreadId();
-    for (int i = 0; i < 64; i++) if (!g_wd_wait[i].tid && InterlockedCompareExchange(&g_wd_wait[i].tid, me, 0) == 0) { g_wd_wait[i].fn = fn; g_wd_wait[i].line = line; g_wd_wait[i].since = t.QuadPart; return i; }
+    plat_counter t; plat_qpc(&t);
+    int32_t me = (int32_t)plat_tid();
+    for (int i = 0; i < 64; i++) if (!g_wd_wait[i].tid && plat_cas(&g_wd_wait[i].tid, me, 0) == 0) { g_wd_wait[i].fn = fn; g_wd_wait[i].line = line; g_wd_wait[i].since = t.QuadPart; return i; }
     return -1;
 }
 static void wd_leave(int i) { if (i >= 0) g_wd_wait[i].tid = 0; }
-#define WD_SLEEP(cv, lock, ms) do { int wd_i_ = wd_enter(__func__, __LINE__); SleepConditionVariableCS(cv, lock, ms); wd_leave(wd_i_); } while (0)
+#define WD_SLEEP(cv, lock, ms) do { int wd_i_ = wd_enter(__func__, __LINE__); plat_cond_wait_ms(cv, lock, ms); wd_leave(wd_i_); } while (0)
 static VkPipelineCache g_pcache;
-static LONG64 g_pw_stages, g_pw_pipes, g_pw_failed, g_pipe_miss;
+static int64_t g_pw_stages, g_pw_pipes, g_pw_failed, g_pipe_miss;
 static VStage *g_vstage[4096], *g_vh[4096];        /* by hb, by h */
 static uint32_t g_vstage_ids;
 static int (*g_glsl_to_spirv)(int, const char *, uint32_t **, size_t *, char *, size_t);
 static void (*g_spirv_free)(uint32_t *);
 enum { H_STAGE_DRAW, H_STAGE_WAIT, H_PIPE_DRAW, H_PIPE_WAIT, H_N };
-static LONG64 g_hold_n[H_N], g_hold_tk[H_N], g_hold_max;
-static LONG64 g_w_progs, g_w_stages, g_w_pipes, g_pred_made, g_pred_used, g_set_held, g_set_held_tk;
-static void hold_note(int what, LONG64 ticks) { g_hold_n[what]++; g_hold_tk[what] += ticks; if (ticks > g_hold_max) g_hold_max = ticks; }
+static int64_t g_hold_n[H_N], g_hold_tk[H_N], g_hold_max;
+static int64_t g_w_progs, g_w_stages, g_w_pipes, g_pred_made, g_pred_used, g_set_held, g_set_held_tk;
+static void hold_note(int what, int64_t ticks) { g_hold_n[what]++; g_hold_tk[what] += ticks; if (ticks > g_hold_max) g_hold_max = ticks; }
 static int holdlog_on(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_HOLDLOG") && atoi(getenv("SMO_VK_HOLDLOG")); return on; }      /* a "nvn_vk_hold:" line for every stage / pipeline made at a draw */
 /* g_in_scene: the last frame had compute dispatches. The game dispatches compute in the frames that draw a scene, not
  * in every frame of its boot and loading screens ("nvn_vk_frames:" at exit counts both). It is per frame, and a scene can
  * have a frame without a dispatch: "near a scene", for the purpose of NOT holding a caller, is a scene frame within the
  * last 600 frames (scene_recent). */
-static volatile LONG g_in_scene;
-static volatile LONG64 g_scene_last = -100000;
+static volatile int32_t g_in_scene;
+static volatile int64_t g_scene_last = -100000;
 static int scene_recent(void) { return g_in_scene || nvn_front_frame_next() - g_scene_last < 600; }
-static LONG64 g_var_known;
-static LONG64 g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
+static int64_t g_var_known;
+static int64_t g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
 /* SMO_VK_HOLDLOG=1 only: when a stage's code was first handed to the workers (nvnProgramSetShaders), so that a hold
  * can say whether anyone knew the code before its draw. */
 static struct { uint64_t hb; int32_t frame; } g_ho[65536];
@@ -100,7 +99,7 @@ static const char *vkc_dir(void) {
     if (!d[0]) { const char *e = getenv("SMO_VK_CACHE"); snprintf(d, sizeof d, "%s", e && e[0] ? e : "../cache/vk"); }
     return d;
 }
-static const char *vkc_file(const char *name) { static char p[4][260]; static LONG i; char *b = p[InterlockedIncrement(&i) & 3]; snprintf(b, 260, "%s/%s", vkc_dir(), name); return b; }
+static const char *vkc_file(const char *name) { static char p[4][260]; static int32_t i; char *b = p[plat_inc(&i) & 3]; snprintf(b, 260, "%s/%s", vkc_dir(), name); return b; }
 static void compute_pipe_make(VStage *v);
 static uint64_t g_spv_unused;
 static PFN_vkCmdSetColorBlendEnableEXT vkCmdSetColorBlendEnableEXT;
@@ -152,11 +151,11 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
          * stage cache are not translated again: clear build/cache/vk/stage and spv to dump everything) */
         const char *dir = getenv("SMO_VK_GLSLDUMP");
         if (dir) {
-            static LONG n;
+            static int32_t n;
             char dp[300]; snprintf(dp, sizeof dp, "%s/%s.glsl", dir, what); for (char *q = dp + strlen(dir) + 1; *q; q++) if (*q == ' ' || *q == '#') *q = '_';
             FILE *f = fopen(dp, "wb");
             if (f) { fputs(glsl, f); fclose(f); }
-            if (InterlockedIncrement(&n) <= 2) printf("nvn_vk: GLSL dump %s: %s\n", dp, f ? "written" : "NOT written");
+            if (plat_inc(&n) <= 2) printf("nvn_vk: GLSL dump %s: %s\n", dp, f ? "written" : "NOT written");
         }
     }
     char path[128], log[2000];
@@ -166,7 +165,7 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
     uint64_t h = fnv(0xcbf29ce484222325ULL ^ (uint64_t)stage ^ 0x5601, glsl, strlen(glsl));
     *spv_hash = h;
     if (on_disk) *on_disk = 0;
-    if ((mod = module_from_spv(h)) != NULL) { InterlockedIncrement64(&R.modules); if (on_disk) *on_disk = 1; return mod; }
+    if ((mod = module_from_spv(h)) != NULL) { plat_inc(&R.modules); if (on_disk) *on_disk = 1; return mod; }
     if (!g_glsl_to_spirv(stage, glsl, &words, &count, log, sizeof log)) { printf("nvn_vk: %s: glslang rejected the translated text: %s\n", what, log); fflush(stdout); return NULL; }
     snprintf(path, sizeof path, "%s/spv/%016llx.spv", vkc_dir(), (unsigned long long)h);
     FILE *fp = fopen(path, "wb");
@@ -175,7 +174,7 @@ static VkShaderModule module_from_glsl(int stage, const char *glsl, const char *
     ci.codeSize = count * 4; ci.pCode = words;
     VKC(vkCreateShaderModule(V.device, &ci, NULL, &mod));
     g_spirv_free(words);
-    InterlockedIncrement64(&R.modules);
+    plat_inc(&R.modules);
     return mod;
 }
 static int stage_rec_read(int s, uint64_t vh, StageRec *r) {
@@ -192,33 +191,33 @@ static int stage_rec_read(int s, uint64_t vh, StageRec *r) {
  * needs the module again unless a pipeline of another kind is made from the stage (a pair library, a whole pipeline, a
  * vertex stage drawn alone). So the module is destroyed when no thread uses it, and made again from the SPIR-V file of the
  * stage cache when it is needed: the same words, so the same pipelines. SMO_VK_MODREL=0 keeps every module (as before). */
-static LONG64 g_mod_released, g_mod_again, g_mod_destroy_tk;
+static int64_t g_mod_released, g_mod_again, g_mod_destroy_tk;
 static int modrel_on(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_MODREL") ? atoi(getenv("SMO_VK_MODREL")) : 1; return on; }      /* 2 (measurement): released as soon as the stage is made */
 static VkShaderModule module_from_spv(uint64_t h);
 static VkShaderModule stage_mod_get(VStage *v) {   /* any thread, no lock held; stage_mod_put when the module is no longer used */
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     v->mod_users++;
     if (!v->mod && v->spv) {
         v->mod = module_from_spv(v->spv);
-        if (!v->mod) { LeaveCriticalSection(&g_sh_lock); vkd_fail("the SPIR-V file %016llx of a stage whose module was released cannot be read again (was the stage cache folder removed while the game ran?)", (unsigned long long)v->spv); }
+        if (!v->mod) { plat_unlock(&g_sh_lock); vkd_fail("the SPIR-V file %016llx of a stage whose module was released cannot be read again (was the stage cache folder removed while the game ran?)", (unsigned long long)v->spv); }
         g_mod_again++;
     }
     VkShaderModule m = v->mod;
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
     return m;
 }
 static void stage_mod_put(VStage *v) {
     VkShaderModule m = NULL;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     if (--v->mod_users == 0 && v->mod_rel && v->spv && modrel_on()) { m = v->mod; v->mod = NULL; if (m) g_mod_released++; }
-    LeaveCriticalSection(&g_sh_lock);
-    if (m) { LONG64 t0 = tk(); vkDestroyShaderModule(V.device, m, NULL); InterlockedAdd64(&g_mod_destroy_tk, tk() - t0); }
+    plat_unlock(&g_sh_lock);
+    if (m) { int64_t t0 = tk(); vkDestroyShaderModule(V.device, m, NULL); plat_add(&g_mod_destroy_tk, tk() - t0); }
 }
 static void stage_mod_releasable(VStage *v) {      /* its library or compute pipeline is made: the module goes when its last user is done */
     if (!v->spv) return;                /* spv 0: no SPIR-V file to make it again from, the module is kept */
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     v->mod_rel = 1;
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 static void vstage_from_rec(VStage *v, const StageRec *r, uint64_t vh, VkShaderModule mod) {
     v->h = vh; v->hb = r->hb; v->code_len = r->code_len; memcpy(v->key, r->key, 16); v->fo = r->fo; v->spv = r->spv;
@@ -261,7 +260,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
             VkShaderModule mod;
             if (e.magic != STAGEREC_MAGIC || e.fo != v->fo || !key_fits(s, v->key, e.key, e.dep, e.tex)) continue;
-            if (stage_rec_read(s, e.vh, &r) && !r.images && (mod = module_from_spv(r.spv)) != NULL) { vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; InterlockedIncrement64(&R.modules); done = 1; }      /* not a stage with images (their formats and types are not in the record) */
+            if (stage_rec_read(s, e.vh, &r) && !r.images && (mod = module_from_spv(r.spv)) != NULL) { vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; plat_inc(&R.modules); done = 1; }      /* not a stage with images (their formats and types are not in the record) */
         }
         fclose(fp);
     }
@@ -293,7 +292,7 @@ static void vstage_build(VStage *v, const SSrc *src) {
         }
         else {
             uint64_t spv_hash = 0;
-            if (in.screen_scale) { InterlockedIncrement64(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) InterlockedIncrement64(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) InterlockedIncrement64(&g_rs_tf); }
+            if (in.screen_scale) { plat_inc(&g_rs_stages); if (strstr(out.glsl, "mx_fcs)")) plat_inc(&g_rs_fcs); if (strstr(out.glsl, "mx_tf(")) plat_inc(&g_rs_tf); }
             int on_disk;
             v->mod = module_from_glsl(s, out.glsl, what, &spv_hash, &on_disk);
             v->spv = on_disk ? spv_hash : 0;       /* no SPIR-V file: the module is kept (stage_mod_releasable) */
@@ -328,11 +327,11 @@ static void vstage_build(VStage *v, const SSrc *src) {
         }
     }
     if (v->ok && v->mod && modrel_on() == 2) { stage_mod_get(v); stage_mod_releasable(v); stage_mod_put(v); }
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     if (v->ok) { v->next_h = g_vh[v->h & 4095]; g_vh[v->h & 4095] = v; }
     v->state = 2;
-    WakeAllConditionVariable(&g_sh_cv);
-    LeaveCriticalSection(&g_sh_lock);
+    plat_cond_broadcast(&g_sh_cv);
+    plat_unlock(&g_sh_lock);
 }
 /* Any thread: the variant of this code for (key, fo). *how: 0 it was there, 1 made by this call, 2 waited for the thread
  * that was making it. */
@@ -340,19 +339,19 @@ static void workers_boost(void);
 static VStage *stage_ensure(const SSrc *src, uint64_t hb, const uint32_t *key, uint32_t fo, int *how) {
     VStage *v, *busy;
     *how = 0;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     for (;;) {
         v = vstage_find(hb, src->stage, src->code_len, key, fo, &busy);
         if (v && v->state == 2) break;
         if (!v) v = busy;
-        if (v) { if (!*how) { *how = 2; workers_boost(); } while (v->state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, INFINITE); continue; }
+        if (v) { if (!*how) { *how = 2; workers_boost(); } while (v->state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, PLAT_INFINITE); continue; }
         v = vstage_new(hb, src->stage, src->code_len, key, fo);
-        LeaveCriticalSection(&g_sh_lock);
+        plat_unlock(&g_sh_lock);
         vstage_build(v, src);
         *how = 1;
-        EnterCriticalSection(&g_sh_lock);
+        plat_lock(&g_sh_lock);
     }
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
     return v;
 }
 /* Render thread, at a draw or dispatch. */
@@ -364,14 +363,14 @@ static VStage *stage_ensure(const SSrc *src, uint64_t hb, const uint32_t *key, u
 static int skip_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_NOHOLD"); on = e ? atoi(e) != 0 : gfx_options()->shader_skip; } return on; }
 static int scene_recent(void);
 static int skip_active(void) { return skip_on() && scene_recent(); }
-static LONG64 g_skip_n, g_skip_frames, g_skip_fr_n, g_skip_stage, g_skip_pipe;
+static int64_t g_skip_n, g_skip_frames, g_skip_fr_n, g_skip_stage, g_skip_pipe;
 static int g_skip_flag;                            /* set by vstage_get when it returned NULL because the stage is being made */
 static void skip_queue_stage(const SSrc *src, const uint32_t *key, uint32_t fo);
 static void skip_note(int what, uint64_t vh, uint64_t fh) {
     g_skip_n++; g_skip_fr_n++; if (what) g_skip_pipe++; else g_skip_stage++;
     { static int nl; if (nl++ < 600) printf("nvn_vk_skip: frame %lld: a draw left out, its %s was not ready: vertex code %016llx, fragment code %016llx\n", (long long)nvn_front_frame_next(), what ? "pipeline (stage library or link)" : "stage", (unsigned long long)vh, (unsigned long long)fh); }
 }
-static LONG64 g_vstage_slow;          /* vstage_get calls that missed the stage's last variant (ssrc_hb over the code, the table under g_sh_lock) */
+static int64_t g_vstage_slow;          /* vstage_get calls that missed the stage's last variant (ssrc_hb over the code, the table under g_sh_lock) */
 static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int gprim) {      /* gprim: a geometry stage's primitive class (0 for the others) */
     Stage *st = &p->st[s];
     VStage *v = st->vk;
@@ -385,22 +384,22 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
     if (s != 5 && skip_active()) {                 /* shader_wait = skip: only what is ready */
         VStage *busy = NULL;
         uint64_t hb = ssrc_hb(&src);
-        EnterCriticalSection(&g_sh_lock);
+        plat_lock(&g_sh_lock);
         v = vstage_find(hb, src.stage, src.code_len, key, fo, &busy);
         int ready = v && v->state == 2;
-        LeaveCriticalSection(&g_sh_lock);
+        plat_unlock(&g_sh_lock);
         if (!ready) { if (!v && !busy) skip_queue_stage(&src, key, fo); g_skip_flag = 1; skip_note(0, s ? 0 : hb, s ? hb : 0); return NULL; }
     }
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     v = stage_ensure(&src, ssrc_hb(&src), key, fo, &how);
-    if (how) { LONG64 dt = tk() - t0; hold_note(how == 1 ? H_STAGE_DRAW : H_STAGE_WAIT, dt); g_tm[6] += dt;
-        if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    if (how) { int64_t dt = tk() - t0; hold_note(how == 1 ? H_STAGE_DRAW : H_STAGE_WAIT, dt); g_tm[6] += dt;
+        if (holdlog_on()) { plat_counter fq; plat_qpf(&fq);
             printf("nvn_vk_hold: frame %lld (%s): %s STAGE %s, %.2f ms: program #%d, code %016llx, key asked %x %x %x %x (kept %x %x %x %x), forced outputs %x; %s\n", (long long)nvn_front_frame_next(), g_in_scene ? "scene" : "no scene",
                    s == 5 ? "compute" : s == 2 ? "geometry" : s ? "fragment" : "vertex", how == 1 ? "made at the draw" : "waited for (a worker was making it)", (double)dt * 1000.0 / (double)fq.QuadPart, p->serial, (unsigned long long)v->hb,
                    key[0], key[1], key[2], key[3], v->key[0], v->key[1], v->key[2], v->key[3], fo, v->from_rec ? "from its record on disk" : "translated now (no record)");
-            EnterCriticalSection(&g_sh_lock);
+            plat_lock(&g_sh_lock);
             printf("nvn_vk_hold:     %s; jobs waiting now: %lld foreground, %lld background\n", ho_text(v->hb), (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done));
-            LeaveCriticalSection(&g_sh_lock); } }
+            plat_unlock(&g_sh_lock); } }
     st->vk = v; memcpy(v->local, st->local, sizeof v->local);
     return v->ok ? v : NULL;
 }
@@ -408,7 +407,7 @@ static VStage *vstage_get(Prog *p, int s, const uint32_t *key, uint32_t fo, int 
 /* ---------------------------------------------------------------- pipelines */
 typedef struct { uint32_t vs, fs, chanmask, sample_mask; int32_t cfmt[8], dfmt; uint8_t topo_class, ncolor, samples, poly, a2c, dclamp, logic, sshade, blend_on, pad[3]; uint8_t blend[8][8]; } PKey;
 static uint64_t pkey_hash(const PKey *k) { return hmix(0xcbf29ce484222325ULL, k, sizeof *k); }      /* the table of pipelines (g_pipes, in memory only) */
-typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs, *gs /* see gs_pipe_get */; volatile LONG state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
+typedef struct Pipe { PKey k; VkPipeline p, p_fast; /* p_fast: the pipeline linked at once, after the optimised one took its place */ VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; VStage *vs, *fs, *gs /* see gs_pipe_get */; volatile int32_t state; uint8_t recorded, predicted, used, libbed, lib_how; struct Pipe *next; } Pipe;      /* libbed: linked from libraries (layout and set layouts belong to the pair library); lib_how: 0 the pair library was there, 1 compiled by this build, 2 waited for */      /* state: 0 queued for a worker, 1 being made, 2 made */
 static Pipe *g_pipes[1024];
 static VkShaderModule g_gs_dbg_fs;                 /* SMO_VK_GS_DEBUG=3 (gs_pipe_get): the fragment stage of draws with a geometry stage */
 /* debug aid SMO_VK_GS_DEBUG=<mode> for the draws with a geometry stage (the lightning): 1 measures them (nvn_vk_draw.c
@@ -449,15 +448,15 @@ static Pipe *pipe_new(const PKey *k, VStage *vs, VStage *fs, uint64_t h, int sta
  * library (three of them): both hold no shader and are made in microseconds. A draw LINKS the three (no compilation).
  * Not covered: a pair nobody announced (a fragment stage bound with the vertex stage of another program): its pair
  * library is compiled at the draw as the whole pipeline was before (counted: "pair library compiled at a draw"). */
-typedef struct PairLib { VStage *vs, *fs; uint8_t samples, sshade; volatile LONG state; VkPipeline lib; VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; struct PairLib *next; } PairLib;
+typedef struct PairLib { VStage *vs, *fs; uint8_t samples, sshade; volatile int32_t state; VkPipeline lib; VkPipelineLayout layout; VkDescriptorSetLayout dl[2]; int nb[2], push0; struct PairLib *next; } PairLib;
 static PairLib *g_plib[1024];
-static CRITICAL_SECTION g_gpl_lock;
-static volatile LONG g_in_scene;
+static plat_lock_t g_gpl_lock;
+static volatile int32_t g_in_scene;
 static struct { PKey k; VkPipeline lib; } g_olib[128];
 static int g_nolib;
 static VkPipeline g_vilib[3];
-static LONG64 g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk, g_gpl_link_max, g_gpl_dlink, g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_scene;
-static DWORD g_render_tid;
+static int64_t g_gpl_made, g_gpl_made_tk, g_gpl_draw, g_gpl_draw_tk, g_gpl_draw_max, g_gpl_wait, g_gpl_wait_tk, g_gpl_link, g_gpl_link_tk, g_gpl_link_max, g_gpl_dlink, g_gpl_dlink_tk, g_gpl_dlink_max, g_gpl_dlink_scene;
+static uint32_t g_render_tid;
 static uint32_t pipe_dyn_list(VkDynamicState *dyn) {
     static const VkDynamicState base[20] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
         VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,
@@ -484,14 +483,14 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     unsigned h = (vs->id * 2654435761u ^ (fs ? fs->id * 40503u : 0) ^ (unsigned)(samples * 131 + sshade)) & 1023;
     PairLib *l;
     int mine = 0;
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     *how = 0;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     for (l = g_plib[h]; l; l = l->next) if (l->vs == vs && l->fs == fs && l->samples == samples && l->sshade == sshade) break;
     if (!l) { l = calloc(1, sizeof *l); l->vs = vs; l->fs = fs; l->samples = (uint8_t)samples; l->sshade = (uint8_t)sshade; l->state = 1; l->next = g_plib[h]; g_plib[h] = l; mine = 1; }
-    else if (l->state == 1) { *how = 2; while (l->state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, INFINITE); }
-    LeaveCriticalSection(&g_sh_lock);
-    if (!mine) { if (*how == 2) { InterlockedIncrement64(&g_gpl_wait); InterlockedAdd64(&g_gpl_wait_tk, tk() - t0); } return l; }
+    else if (l->state == 1) { *how = 2; while (l->state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, PLAT_INFINITE); }
+    plat_unlock(&g_sh_lock);
+    if (!mine) { if (*how == 2) { plat_inc(&g_gpl_wait); plat_add(&g_gpl_wait_tk, tk() - t0); } return l; }
     *how = 1;
     VkDescriptorSetLayoutBinding b0[80], b1[140];
     layout_bindings(vs, 0, b0, &l->nb[0], b1, &l->nb[1]);
@@ -534,20 +533,20 @@ static PairLib *pairlib_ensure(VStage *vs, VStage *fs, int samples, int sshade, 
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &l->lib);
     stage_mod_put(vs); if (fs) stage_mod_put(fs);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, pair library (vertex stage %u, fragment stage %u): %s", vs->id, fs ? fs->id : 0, vk_result_name(r));
-    LONG64 dt = tk() - t0;
-    EnterCriticalSection(&g_sh_lock);
+    int64_t dt = tk() - t0;
+    plat_lock(&g_sh_lock);
     l->state = 2;
-    WakeAllConditionVariable(&g_sh_cv);
-    LeaveCriticalSection(&g_sh_lock);
-    if (GetCurrentThreadId() == g_render_tid) {    /* compiled at a draw: the hold the libraries are there to remove */
+    plat_cond_broadcast(&g_sh_cv);
+    plat_unlock(&g_sh_lock);
+    if (plat_tid() == g_render_tid) {    /* compiled at a draw: the hold the libraries are there to remove */
         g_gpl_draw++; g_gpl_draw_tk += dt; if (dt > g_gpl_draw_max) g_gpl_draw_max = dt;
-        if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); printf("nvn_vk_hold: frame %lld (%s): PAIR LIBRARY compiled at the draw, %.2f ms: vertex code %016llx (forced outputs %x), fragment code %016llx (%s)\n", (long long)nvn_front_frame_next(), g_in_scene ? "scene" : "no scene",
+        if (holdlog_on()) { plat_counter fq; plat_qpf(&fq); printf("nvn_vk_hold: frame %lld (%s): PAIR LIBRARY compiled at the draw, %.2f ms: vertex code %016llx (forced outputs %x), fragment code %016llx (%s)\n", (long long)nvn_front_frame_next(), g_in_scene ? "scene" : "no scene",
                                    (double)dt * 1000.0 / (double)fq.QuadPart, (unsigned long long)vs->hb, vs->fo, (unsigned long long)(fs ? fs->hb : 0), fs && fs->fragonly ? "a fragment stage of a program without a vertex stage" : "a program with both stages, or a pair the look-ahead met"); }
-    } else { InterlockedIncrement64(&g_gpl_made); InterlockedAdd64(&g_gpl_made_tk, dt); }
+    } else { plat_inc(&g_gpl_made); plat_add(&g_gpl_made_tk, dt); }
     return l;
 }
 static VkPipeline gpl_vilib(int topo_class) {
-    EnterCriticalSection(&g_gpl_lock);
+    plat_lock(&g_gpl_lock);
     if (!g_vilib[topo_class]) {
         VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
         ia.topology = topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -561,13 +560,13 @@ static VkPipeline gpl_vilib(int topo_class) {
         VKC(vkCreateGraphicsPipelines(V.device, NULL, 1, &gi, NULL, &g_vilib[topo_class]));
     }
     VkPipeline p = g_vilib[topo_class];
-    LeaveCriticalSection(&g_gpl_lock);
+    plat_unlock(&g_gpl_lock);
     return p;
 }
 static VkPipeline gpl_olib(const PKey *k0) {
     PKey k = *k0;
     k.vs = k.fs = 0; k.topo_class = 0;
-    EnterCriticalSection(&g_gpl_lock);
+    plat_lock(&g_gpl_lock);
     int i;
     for (i = 0; i < g_nolib; i++) if (!memcmp(&g_olib[i].k, &k, sizeof k)) break;
     if (i == g_nolib) {
@@ -597,7 +596,7 @@ static VkPipeline gpl_olib(const PKey *k0) {
         g_olib[i].k = k; g_nolib++;
     }
     VkPipeline p = g_olib[i].lib;
-    LeaveCriticalSection(&g_gpl_lock);
+    plat_unlock(&g_gpl_lock);
     return p;
 }
 /* ---- SMO_VK_GPL=2: one library per STAGE instead of per pair, so that no pair has to be known before its draw (a fragment
@@ -613,7 +612,7 @@ static VkDescriptorSetLayout g_udl[2];
 static VkPipelineLayout g_ulayout;
 static int gpl_sep(void) { static int m = -1; if (m < 0) m = D.has_gpl && vk_gpl_mode() >= 2; return m; }
 static void gpl_universal(void) {
-    EnterCriticalSection(&g_gpl_lock);
+    plat_lock(&g_gpl_lock);
     if (!g_ulayout) {
         static VkDescriptorSetLayoutBinding b0[66], b1[128];
         int n0 = 0, n1 = 0;
@@ -633,23 +632,23 @@ static void gpl_universal(void) {
         pl.setLayoutCount = 2; pl.pSetLayouts = g_udl; pl.pushConstantRangeCount = 1; pl.pPushConstantRanges = &pc;
         VKC(vkCreatePipelineLayout(V.device, &pl, NULL, &g_ulayout));
     }
-    LeaveCriticalSection(&g_gpl_lock);
+    plat_unlock(&g_gpl_lock);
 }
 static int gpl_opt_on(void);
 static int stage_fits_universal(const VStage *v) { for (int i = 0; i < v->nsmp; i++) { unsigned b = v->smp[i].binding; if (b >= 240) b -= 240; if (b >= 80 || b % 40u >= 32) return 0; } return 1; }      /* texture units 0..31 only */
 /* Any thread, no lock held: the library of one stage (alone: a vertex stage that is drawn without a fragment stage). */
 static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
     VkPipeline *lib = alone ? &v->lib2 : &v->lib;
-    volatile LONG *state = alone ? &v->lib2_state : &v->lib_state;
+    volatile int32_t *state = alone ? &v->lib2_state : &v->lib_state;
     int mine = 0;
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     *how = 0;
     gpl_universal();
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     if (*state == 0) { *state = 1; mine = 1; }
-    else if (*state == 1) { *how = 2; workers_boost(); while (*state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, INFINITE); }
-    LeaveCriticalSection(&g_sh_lock);
-    if (!mine) { if (*how == 2) { InterlockedIncrement64(&g_gpl_wait); InterlockedAdd64(&g_gpl_wait_tk, tk() - t0); } return *lib; }
+    else if (*state == 1) { *how = 2; workers_boost(); while (*state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, PLAT_INFINITE); }
+    plat_unlock(&g_sh_lock);
+    if (!mine) { if (*how == 2) { plat_inc(&g_gpl_wait); plat_add(&g_gpl_wait_tk, tk() - t0); } return *lib; }
     *how = 1;
     int isfs = v->stage == 1;
     VkPipelineShaderStageCreateInfo st = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -680,25 +679,25 @@ static VkPipeline stagelib_ensure(VStage *v, int alone, int *how) {
         if (lim == -2) { const char *e = getenv("SMO_VK_NOOPT_BYTES"); lim = e ? atoll(e) : -1; }
         if (lim >= 0 && v->code_len > lim) gi.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
     }
-    LONG64 tc0 = tk();
+    int64_t tc0 = tk();
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, lib);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, stage library (%s stage %u): %s", isfs ? "fragment" : "vertex", v->id, vk_result_name(r));
     if (!alone) stage_mod_releasable(v);
     stage_mod_put(v);
-    {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    {   plat_counter fq; plat_qpf(&fq);
         double sec = (double)(tk() - tc0) / (double)fq.QuadPart;
         if (sec > 1.0) printf("nvn_vk_gpl: stage library (%s stage %u, %d bytes of machine code%s) took %.1f s in the driver\n", isfs ? "fragment" : "vertex", v->id, v->code_len, (gi.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT) ? ", NOT optimised" : "", sec);
     }
-    LONG64 dt = tk() - t0;
-    EnterCriticalSection(&g_sh_lock);
+    int64_t dt = tk() - t0;
+    plat_lock(&g_sh_lock);
     *state = 2;
-    WakeAllConditionVariable(&g_sh_cv);
-    LeaveCriticalSection(&g_sh_lock);
-    if (GetCurrentThreadId() == g_render_tid) {
+    plat_cond_broadcast(&g_sh_cv);
+    plat_unlock(&g_sh_lock);
+    if (plat_tid() == g_render_tid) {
         g_gpl_draw++; g_gpl_draw_tk += dt; if (dt > g_gpl_draw_max) g_gpl_draw_max = dt;
-        if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); printf("nvn_vk_hold: frame %lld (%s): STAGE LIBRARY compiled at the draw, %.2f ms: %s code %016llx (key %x %x %x %x, forced outputs %x)%s\n", (long long)nvn_front_frame_next(), g_in_scene ? "scene" : "no scene",
+        if (holdlog_on()) { plat_counter fq; plat_qpf(&fq); printf("nvn_vk_hold: frame %lld (%s): STAGE LIBRARY compiled at the draw, %.2f ms: %s code %016llx (key %x %x %x %x, forced outputs %x)%s\n", (long long)nvn_front_frame_next(), g_in_scene ? "scene" : "no scene",
                                    (double)dt * 1000.0 / (double)fq.QuadPart, isfs ? "fragment" : "vertex", (unsigned long long)v->hb, v->key[0], v->key[1], v->key[2], v->key[3], v->fo, alone ? " (a vertex stage drawn without a fragment stage)" : ""); }
-    } else { InterlockedIncrement64(&g_gpl_made); InterlockedAdd64(&g_gpl_made_tk, dt); }
+    } else { plat_inc(&g_gpl_made); plat_add(&g_gpl_made_tk, dt); }
     return *lib;
 }
 static void gpl_destroy(void) {
@@ -714,7 +713,7 @@ static void gpl_destroy(void) {
  * VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION (a full compilation, background queue) and the handle is exchanged; the first
  * one stays alive until shutdown (command buffers in flight use it). SMO_VK_GPL_OPT=0 turns this off. */
 static void gpl_opt_push(struct Pipe *p);          /* g_sh_lock held (defined after the job queue) */
-static LONG64 g_gpl_opt_q, g_gpl_opt_n, g_gpl_opt_tk;
+static int64_t g_gpl_opt_q, g_gpl_opt_n, g_gpl_opt_tk;
 static int g_workers_quit;
 /* OFF by default. Measured by ssbu-recomp in Super Smash Bros. Ultimate (first runs): it cost 195 s (NVIDIA) and 304 s
  * (Intel) of worker time in one run, the GPU time per frame did not change (NVIDIA 3.23 against 3.34 ms, Intel 8.60
@@ -723,7 +722,7 @@ static int g_workers_quit;
 static int gpl_opt_on(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_GPL_OPT") && atoi(getenv("SMO_VK_GPL_OPT")); return on; }
 static void gpl_optimise(Pipe *p) {                /* a worker */
     const PKey *k = &p->k;
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     int n = 0;
     VkPipeline libs[4], opt = NULL;
     libs[n++] = gpl_vilib(k->topo_class < 3 ? k->topo_class : 2);
@@ -736,15 +735,15 @@ static void gpl_optimise(Pipe *p) {                /* a worker */
     VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
     gi.pNext = &pli; gi.layout = g_ulayout; gi.flags = VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT;
     if (vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &opt) != VK_SUCCESS || !opt) return;
-    p->p_fast = InterlockedExchangePointer((void *volatile *)&p->p, opt);
-    InterlockedIncrement64(&g_gpl_opt_n); InterlockedAdd64(&g_gpl_opt_tk, tk() - t0);
+    p->p_fast = plat_xchg((void *volatile *)&p->p, opt);
+    plat_inc(&g_gpl_opt_n); plat_add(&g_gpl_opt_tk, tk() - t0);
 }
 /* Makes the pipeline of p->k (any thread, no lock: the device calls are thread-safe, the pipeline cache is synchronised by
  * the driver), then marks it made. Returns the milliseconds it took. */
 static double pipe_build(Pipe *p) {
     const PKey *k = &p->k;
     VStage *vs = p->vs, *fs = p->fs;
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     if (D.has_gpl && !p->gs && gpl_sep() && !k->sshade && stage_fits_universal(vs) && (!fs || stage_fits_universal(fs))) {      /* SMO_VK_GPL=2: linked from one library per stage */
         int how, how2 = 0, n = 0;
         VkPipeline libs[4];
@@ -753,47 +752,47 @@ static double pipe_build(Pipe *p) {
         if (fs) libs[n++] = stagelib_ensure(fs, 0, &how2);
         libs[n++] = gpl_olib(k);
         if (how2 == 1 || how == 1) how = 1; else if (how2 == 2 || how == 2) how = 2;
-        LONG64 t1 = tk();
+        int64_t t1 = tk();
         VkPipelineLibraryCreateInfoKHR pli = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
         pli.libraryCount = (uint32_t)n; pli.pLibraries = libs;
         VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gi.pNext = &pli; gi.layout = g_ulayout;
         VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
         if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, link of stage libraries (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
-        LONG64 dt = tk() - t1;
+        int64_t dt = tk() - t1;
         p->layout = g_ulayout; p->dl[0] = g_udl[0]; p->dl[1] = g_udl[1]; p->nb[0] = 66; p->nb[1] = 128; p->push0 = 0; p->libbed = 1; p->lib_how = (uint8_t)how;
-        InterlockedIncrement64(&R.pipelines);
-        if (GetCurrentThreadId() == g_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_scene) g_gpl_dlink_scene++; }
-        else { InterlockedIncrement64(&g_gpl_link); InterlockedAdd64(&g_gpl_link_tk, dt); }
-        EnterCriticalSection(&g_sh_lock);
+        plat_inc(&R.pipelines);
+        if (plat_tid() == g_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_scene) g_gpl_dlink_scene++; }
+        else { plat_inc(&g_gpl_link); plat_add(&g_gpl_link_tk, dt); }
+        plat_lock(&g_sh_lock);
         p->state = 2;
         if (gpl_opt_on() && !g_workers_quit) gpl_opt_push(p);      /* the same pipeline again, optimised across its stages, on a worker */
-        WakeAllConditionVariable(&g_sh_cv);
-        LeaveCriticalSection(&g_sh_lock);
-        { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
+        plat_cond_broadcast(&g_sh_cv);
+        plat_unlock(&g_sh_lock);
+        { plat_counter fq; plat_qpf(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
     }
     if (D.has_gpl && !p->gs) {                     /* linked from libraries */
         int how;
         PairLib *l = pairlib_ensure(vs, fs, k->samples, k->sshade, &how);
         VkPipeline libs[3];
         libs[0] = gpl_vilib(k->topo_class < 3 ? k->topo_class : 2); libs[1] = l->lib; libs[2] = gpl_olib(k);
-        LONG64 t1 = tk();
+        int64_t t1 = tk();
         VkPipelineLibraryCreateInfoKHR pli = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
         pli.libraryCount = 3; pli.pLibraries = libs;
         VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         gi.pNext = &pli; gi.layout = l->layout;
         VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
         if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines, link of libraries (vertex stage %u, fragment stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, k->ncolor, k->dfmt, vk_result_name(r));
-        LONG64 dt = tk() - t1;
+        int64_t dt = tk() - t1;
         p->layout = l->layout; p->dl[0] = l->dl[0]; p->dl[1] = l->dl[1]; p->nb[0] = l->nb[0]; p->nb[1] = l->nb[1]; p->push0 = l->push0; p->libbed = 1; p->lib_how = (uint8_t)how;
-        InterlockedIncrement64(&R.pipelines);
-        if (GetCurrentThreadId() == g_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_scene) g_gpl_dlink_scene++; }
-        else { InterlockedIncrement64(&g_gpl_link); InterlockedAdd64(&g_gpl_link_tk, dt); }
-        EnterCriticalSection(&g_sh_lock);
+        plat_inc(&R.pipelines);
+        if (plat_tid() == g_render_tid) { g_gpl_dlink++; g_gpl_dlink_tk += dt; if (dt > g_gpl_dlink_max) g_gpl_dlink_max = dt; if (g_in_scene) g_gpl_dlink_scene++; }
+        else { plat_inc(&g_gpl_link); plat_add(&g_gpl_link_tk, dt); }
+        plat_lock(&g_sh_lock);
         p->state = 2;
-        WakeAllConditionVariable(&g_sh_cv);
-        LeaveCriticalSection(&g_sh_lock);
-        { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
+        plat_cond_broadcast(&g_sh_cv);
+        plat_unlock(&g_sh_lock);
+        { plat_counter fq; plat_qpf(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
     }
     VkDescriptorSetLayoutBinding b0[120], b1[200];
     layout_bindings(vs, 0, b0, &p->nb[0], b1, &p->nb[1]);
@@ -867,12 +866,12 @@ static double pipe_build(Pipe *p) {
     VkResult r = vkCreateGraphicsPipelines(V.device, g_pcache, 1, &gi, NULL, &p->p);
     stage_mod_put(vs); if (p->gs) stage_mod_put(p->gs); if (fs) stage_mod_put(fs);
     if (r != VK_SUCCESS) vkd_fail("vkCreateGraphicsPipelines (vertex stage %u, fragment stage %u, geometry stage %u, %d colour targets, depth format %d): %s", k->vs, k->fs, p->gs ? p->gs->id : 0, k->ncolor, k->dfmt, vk_result_name(r));
-    InterlockedIncrement64(&R.pipelines);
-    EnterCriticalSection(&g_sh_lock);
+    plat_inc(&R.pipelines);
+    plat_lock(&g_sh_lock);
     p->state = 2;
-    WakeAllConditionVariable(&g_sh_cv);
-    LeaveCriticalSection(&g_sh_lock);
-    { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
+    plat_cond_broadcast(&g_sh_cv);
+    plat_unlock(&g_sh_lock);
+    { plat_counter fq; plat_qpf(&fq); return (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart; }
 }
 /* ..\cache\vk\pipes.bin: every pipeline key a draw on this PC ever USED, with its stages named by their variant hashes.
  * Read at start by the workers. A predicted pipeline is written here only when a draw uses it. */
@@ -915,16 +914,16 @@ static void gpl_shared_vs(VStage *vs);
 /* ---- the job queue of the workers */
 typedef struct Job { struct Job *next; int kind, sshade, has[3], fragonly; /* kind 3: the fragment stage of a program without a vertex stage */ Pipe *pipe; VStage *lvs, *lfs; /* kind 5: the pair library of these two stages */ PKey k; uint32_t key0[4], key1[4]; SSrc src[3]; uint8_t data[1]; } Job;      /* kind: 0 a program handed over, 1 one pipeline, 2 the stages and the pipeline of a draw the look-ahead met, 3 one stage, 5 a pair library, 6 an optimised link, 7 the stage a skipped draw waits for */
 /* debug aid: what each worker is doing now (printed when the loading barrier times out) */
-static struct { volatile LONG kind; volatile LONG serial; volatile LONG64 t0; volatile DWORD tid; } g_wk[64];
-static volatile LONG g_wk_n;
+static struct { volatile int32_t kind; volatile int32_t serial; volatile int64_t t0; volatile uint32_t tid; } g_wk[64];
+static volatile int32_t g_wk_n;
 static Job *g_jq_head, *g_jq_tail, *g_bq_head, *g_bq_tail;      /* g_bq: the background queue (pair libraries without a program of their own, optimised links): taken only when g_jq is empty */
-static LONG64 g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
-static LONG64 g_boosts;                            /* times the render thread raised the workers' priority because it waited for one (workers_boost) */
+static int64_t g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
+static int64_t g_boosts;                            /* times the render thread raised the workers' priority because it waited for one (workers_boost) */
 static void job_push_bg(Job *j) {                  /* g_sh_lock held */
     j->next = NULL;
     if (g_bq_tail) g_bq_tail->next = j; else g_bq_head = j;
     g_bq_tail = j; g_bq_queued++;
-    WakeConditionVariable(&g_jq_cv);
+    plat_cond_signal(&g_jq_cv);
 }
 static void job_push_front(Job *j);
 static void job_copy_src(Job *j, uint8_t **d, int i, const SSrc *s);
@@ -937,27 +936,27 @@ static void skip_queue_stage(const SSrc *src, const uint32_t *key, uint32_t fo) 
     uint8_t *d = j->data;
     j->kind = 7; j->sshade = (int)fo; memcpy(j->key1, key, 16);
     job_copy_src(j, &d, 1, src);
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     job_push_front(j);
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 static void gpl_opt_push(Pipe *p) { Job *j = calloc(1, sizeof *j); j->kind = 6; j->pipe = p; g_gpl_opt_q++; job_push_bg(j); }
 static int g_handover_on, g_workers_quit, g_scan_on;
-static LONG64 g_scan_jobs, g_scan_pipes;
+static int64_t g_scan_jobs, g_scan_pipes;
 static struct { int w, h, ncol, cf, df, lv; long long n, scene, first; } g_rtlog[256];      /* SMO_VK_RTLOG=1: render-target sizes (nvn_vk_draw.c, where a pass begins) */
 static int g_rtlog_n;
 static void job_push(Job *j) {                     /* g_sh_lock held */
     j->next = NULL;
     if (g_jq_tail) g_jq_tail->next = j; else g_jq_head = j;
     g_jq_tail = j; g_jq_queued++;
-    WakeConditionVariable(&g_jq_cv);
+    plat_cond_signal(&g_jq_cv);
 }
 static void job_push_front(Job *j) {               /* g_sh_lock held: needed by the batch about to be replayed */
     j->next = g_jq_head;
     g_jq_head = j;
     if (!g_jq_tail) g_jq_tail = j;
     g_jq_queued++;
-    WakeConditionVariable(&g_jq_cv);
+    plat_cond_signal(&g_jq_cv);
 }
 static void job_copy_src(Job *j, uint8_t **d, int i, const SSrc *s) {
     j->has[i] = 1; j->src[i] = *s;
@@ -1003,22 +1002,22 @@ static Pipe *pipe_get(const PKey *k, VStage *vs, VStage *fs) {
 static Pipe *pipe_get2(const PKey *k, VStage *vs, VStage *fs) {
     uint64_t h = pkey_hash(k);
     int mine = 0, waited = 0;
-    LONG64 t0 = 0;
-    EnterCriticalSection(&g_sh_lock);
+    int64_t t0 = 0;
+    plat_lock(&g_sh_lock);
     Pipe *p = pipe_find(k, h);
     int was_queued = 0;
     if (skip_active() && !(p && p->state == 2)) {  /* shader_wait = skip: a pipeline that is not there is made by a worker; ready stage libraries are linked here (microseconds) */
         int libs_ready = D.has_gpl && gpl_sep() && !k->sshade && (fs ? vs->lib_state == 2 && fs->lib_state == 2 : vs->lib2_state == 2);
         if (!(libs_ready && (!p || p->state == 0))) {
             if (!p) { Job *j = calloc(1, sizeof *j); j->kind = 1; j->pipe = pipe_new(k, vs, fs, h, 0); job_push_front(j); }
-            LeaveCriticalSection(&g_sh_lock);
+            plat_unlock(&g_sh_lock);
             skip_note(1, vs->hb, fs ? fs->hb : 0);
             return NULL;
         }
     }
     if (!p) { p = pipe_new(k, vs, fs, h, 1); mine = 1; }
     else if (p->state == 0) { p->state = 1; mine = 1; was_queued = 1; }          /* queued, no worker has begun: made here rather than waited for behind the queue */
-    else if (p->state == 1) { waited = 1; t0 = tk(); while (p->state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, INFINITE); }
+    else if (p->state == 1) { waited = 1; t0 = tk(); while (p->state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, PLAT_INFINITE); }
     if (!p->used) {
         int idx, i = sig_note(k, &idx);
         PairRec *pr0 = pair_get(vs, fs);
@@ -1026,19 +1025,19 @@ static Pipe *pipe_get2(const PKey *k, VStage *vs, VStage *fs) {
         if (D.has_gpl && !gpl_sep() && fs && fs->fragonly) gpl_shared_vs(vs);
         if (i >= 0 && g_predict) for (PairRec *pr = g_pair_all; pr; pr = pr->all) predict_pair(pr, i);      /* a pass signature never seen: the pairs not yet drawn get it now, on the workers */
     }
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
     if (waited) {
-        LONG64 dt = tk() - t0; hold_note(H_PIPE_WAIT, dt); g_tm[5] += dt;
+        int64_t dt = tk() - t0; hold_note(H_PIPE_WAIT, dt); g_tm[5] += dt;
         /* a wait for a pipeline a worker was making is a hold too */
-        if (holdlog_on()) { LARGE_INTEGER fq; QueryPerformanceFrequency(&fq); printf("nvn_vk_hold: frame %lld (%s): PIPELINE waited for (a worker was making it), %.2f ms: vertex code %016llx (key %x %x %x %x, forced outputs %x), fragment code %016llx, topology class %d, %d colour (format %d), depth %d; made %s\n",
+        if (holdlog_on()) { plat_counter fq; plat_qpf(&fq); printf("nvn_vk_hold: frame %lld (%s): PIPELINE waited for (a worker was making it), %.2f ms: vertex code %016llx (key %x %x %x %x, forced outputs %x), fragment code %016llx, topology class %d, %d colour (format %d), depth %d; made %s\n",
                                  (long long)nvn_front_frame_next(), g_in_scene ? "scene" : "no scene", (double)dt * 1000.0 / (double)fq.QuadPart, (unsigned long long)vs->hb, vs->key[0], vs->key[1], vs->key[2], vs->key[3], vs->fo, (unsigned long long)(fs ? fs->hb : 0),
                                  k->topo_class, k->ncolor, k->cfmt[0], k->dfmt, !D.has_gpl ? "whole (no libraries)" : p->lib_how == 0 ? "by a link of ready stage libraries" : "with a library compiled for it"); }
     }
     if (mine) {
         t0 = tk();
-        g_render_tid = GetCurrentThreadId();
+        g_render_tid = plat_tid();
         double ms = pipe_build(p);
-        LONG64 dt = tk() - t0;
+        int64_t dt = tk() - t0;
         g_tm[5] += dt;
         if (!(D.has_gpl && p->lib_how == 0)) { hold_note(H_PIPE_DRAW, dt); g_pipe_miss++; }      /* a link of ready libraries is not a hold (counted on its own: "linked at a draw") */
         if (holdlog_on() && !(D.has_gpl && p->lib_how == 0)) printf("nvn_vk_hold: frame %lld (%s): PIPELINE made at the draw, %.2f ms: vertex code %016llx (variant key %x %x %x %x, forced outputs %x), fragment code %016llx, topology class %d, %d colour (format %d), depth %d, samples %d; it was %s\n",
@@ -1059,7 +1058,7 @@ static Pipe *pipe_get2(const PKey *k, VStage *vs, VStage *fs) {
  * variant, which holds the draw's primitive class. */
 typedef struct GsPipe { PKey k; uint32_t gs; Pipe *p; struct GsPipe *next; } GsPipe;
 static GsPipe *g_gspipes;
-static LONG64 g_gs_draws, g_gs_pipes;
+static int64_t g_gs_draws, g_gs_pipes;
 static Pipe *gs_pipe_get(const PKey *k, VStage *vs, VStage *gs, VStage *fs) {
     static int dbg = -1;                           /* SMO_VK_GS_DEBUG=3: these draws in magenta, without the depth test (draw_prepare) */
     if (dbg < 0 && (dbg = gs_dbg_mode() == 3) != 0) {
@@ -1071,8 +1070,8 @@ static Pipe *gs_pipe_get(const PKey *k, VStage *vs, VStage *gs, VStage *fs) {
     Pipe *p = calloc(1, sizeof *p);
     q->k = *k; q->gs = gs->id; q->p = p;
     p->k = *k; p->vs = vs; p->fs = fs; p->gs = gs; p->state = 1; p->used = 1;
-    LONG64 t0 = tk();
-    g_render_tid = GetCurrentThreadId();
+    int64_t t0 = tk();
+    g_render_tid = plat_tid();
     double ms = pipe_build(p);
     hold_note(H_PIPE_DRAW, tk() - t0); g_pipe_miss++; g_gs_pipes++;
     printf("nvn_vk: pipeline with a geometry stage made at a draw: stages %u/%u/%u (geometry code %016llx, %d bytes, primitive class %d), %d colour (format %d), depth %d, samples %d: %.1f ms\n",
@@ -1084,16 +1083,16 @@ static Pipe *gs_pipe_get(const PKey *k, VStage *vs, VStage *gs, VStage *fs) {
 static int compute_pipe_ensure(VStage *v) {
     int how = 0;
     if (v->cp_state == 2) return 0;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     if (v->cp_state == 0) { v->cp_state = 1; how = 1; }
-    else if (v->cp_state == 1) { how = 2; while (v->cp_state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, INFINITE); }
-    LeaveCriticalSection(&g_sh_lock);
+    else if (v->cp_state == 1) { how = 2; while (v->cp_state < 2) WD_SLEEP(&g_sh_cv, &g_sh_lock, PLAT_INFINITE); }
+    plat_unlock(&g_sh_lock);
     if (how == 1) {
         compute_pipe_make(v);
-        EnterCriticalSection(&g_sh_lock);
+        plat_lock(&g_sh_lock);
         v->cp_state = 2;
-        WakeAllConditionVariable(&g_sh_cv);
-        LeaveCriticalSection(&g_sh_lock);
+        plat_cond_broadcast(&g_sh_cv);
+        plat_unlock(&g_sh_lock);
     }
     return how;
 }
@@ -1104,15 +1103,15 @@ static HANDLE g_pw_thread[16], g_pw_gate;
  * (pw_main): every worker back to normal priority (each sets its own again at its next job). */
 static int g_pw_nthread;
 static void workers_boost(void) {
-    if (GetCurrentThreadId() != g_render_tid) return;
+    if (plat_tid() != g_render_tid) return;
     for (int i = 0; i < g_pw_nthread; i++) if (g_pw_thread[i]) SetThreadPriority(g_pw_thread[i], THREAD_PRIORITY_NORMAL);
     g_boosts++;
 }
 static int g_pw_nthread, g_pw_n, g_pw_waited;
 typedef struct { uint32_t magic, compute; uint64_t vs_h, fs_h; PKey k; } PipeRecIn;
 static PipeRec *g_pw_rec;
-static volatile LONG g_pw_next, g_pw_left;
-static LONG64 g_pw_t0, g_pw_t1;
+static volatile int32_t g_pw_next, g_pw_left;
+static int64_t g_pw_t0, g_pw_t1;
 static char g_pcache_path[160];
 static VStage *pw_stage(int s, uint64_t vh) {      /* g_sh_lock held: a variant named by pipes.bin, from its record */
     StageRec r;
@@ -1122,7 +1121,7 @@ static VStage *pw_stage(int s, uint64_t vh) {      /* g_sh_lock held: a variant 
     VStage *v = vstage_new(r.hb, s, r.code_len, r.key, r.fo);
     vstage_from_rec(v, &r, vh, mod);
     v->next_h = g_vh[vh & 4095]; g_vh[vh & 4095] = v; v->state = 2;
-    InterlockedIncrement64(&R.modules); InterlockedIncrement64(&g_pw_stages);
+    plat_inc(&R.modules); plat_inc(&g_pw_stages);
     return v;
 }
 /* A worker that is about to make a vertex stage gives the fragment stage of the same program to another worker first
@@ -1132,9 +1131,9 @@ static void spawn_stage(const SSrc *src, const uint32_t *key) {
     uint8_t *d = j->data;
     j->kind = 3; memcpy(j->key1, key, 16);
     job_copy_src(j, &d, 1, src);
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     job_push_front(j);
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 /* ---- pairs nobody announces. A program without a vertex stage is drawn with the
  * vertex stage of ANOTHER program, so its pair is only known at the draw. The vertex stages used that way are few (one
@@ -1143,7 +1142,7 @@ static void spawn_stage(const SSrc *src, const uint32_t *key) {
  * is made by the workers (background queue) as soon as both are known. */
 static VStage *g_fo[8192], *g_shvs[64];
 static int g_nfo, g_nshvs;
-static LONG64 g_gpl_cross;
+static int64_t g_gpl_cross;
 /* SMO_VK_GPL_CROSS: 0 no such pairs are made ahead; 1 (default) only where the fragment stage reads EXACTLY what the vertex
  * stage writes; 2 wherever the draw would take this vertex variant (measured by ssbu-recomp in Super Smash Bros. Ultimate: 3,906 such
  * fragment stages x 21 shared vertex stages = 37,059 libraries asked for, 17,693 compiled in 1,216 s of worker time: the
@@ -1162,9 +1161,9 @@ static void gpl_cross_push(VStage *vs, VStage *fs) {       /* g_sh_lock held */
 }
 static void gpl_fo_made(VStage *v) {               /* a worker: the fragment stage of a program without a vertex stage is ready */
     if (!D.has_gpl) return;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     if (!v->fragonly && g_nfo < 8192) { v->fragonly = 1; g_fo[g_nfo++] = v; for (int i = 0; i < g_nshvs; i++) gpl_cross_push(g_shvs[i], v); }
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 static void gpl_shared_vs(VStage *vs) {            /* g_sh_lock held, render thread: vs was drawn with a fragment stage of a program without a vertex stage */
     for (int i = 0; i < g_nshvs; i++) if (g_shvs[i] == vs) return;
@@ -1177,36 +1176,36 @@ static void spawn_stage_fo(const SSrc *src, const uint32_t *key) {      /* as sp
     uint8_t *d = j->data;
     j->kind = 3; j->fragonly = 1; memcpy(j->key1, key, 16);
     job_copy_src(j, &d, 1, src);
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     job_push_front(j);
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 /* The barrier: a frame that is a loading screen (at most 60 draws) is not presented while the workers still have
  * a queued stage, pair library or pipeline: the game leaves its loading screen only when everything handed over is ready.
  * On by default with pipeline libraries (SMO_VK_BARRIER=0 / =1 forces it). Time-out 20 s, logged loudly. */
-static LONG64 g_bar_n, g_bar_tk, g_bar_max, g_bar_timeout;
-static void wd_dump(double stall_s, LONG64 tries_since);     /* nvn_vk_watchdog.c */
-static void loading_barrier(LONG64 frame, LONG64 draws) {
+static int64_t g_bar_n, g_bar_tk, g_bar_max, g_bar_timeout;
+static void wd_dump(double stall_s, int64_t tries_since);     /* nvn_vk_watchdog.c */
+static void loading_barrier(int64_t frame, int64_t draws) {
     static int on = -1;
     int want_dump = 0;
     if (on < 0) { const char *e = getenv("SMO_VK_BARRIER"); on = e ? atoi(e) != 0 : D.has_gpl; }
     if (!on || draws > 60 || !g_pw_nthread) return;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) {
-        LONG64 t0 = tk();
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-        LONG64 d0 = g_jq_done + g_bq_done, tlast = t0;
+        int64_t t0 = tk();
+        plat_counter fq; plat_qpf(&fq);
+        int64_t d0 = g_jq_done + g_bq_done, tlast = t0;
         while ((g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) && tk() - t0 < 20 * fq.QuadPart) {
             WD_SLEEP(&g_sh_cv, &g_sh_lock, 20);
             if (tk() - t0 > fq.QuadPart * 15 / 100 && tk() - tlast > fq.QuadPart / 10) {      /* held longer than 150 ms: the same picture again, with the progress bar, ten times a second */
-                LONG64 tot = g_jq_queued + g_bq_queued - d0, dn = g_jq_done + g_bq_done - d0;
+                int64_t tot = g_jq_queued + g_bq_queued - d0, dn = g_jq_done + g_bq_done - d0;
                 tlast = tk();
-                LeaveCriticalSection(&g_sh_lock);
+                plat_unlock(&g_sh_lock);
                 present_progress(tot > 0 ? (float)dn / (float)tot : 0.0f);
-                EnterCriticalSection(&g_sh_lock);
+                plat_lock(&g_sh_lock);
             }
         }
-        LONG64 dt = tk() - t0;
+        int64_t dt = tk() - t0;
         g_bar_n++; g_bar_tk += dt; if (dt > g_bar_max) g_bar_max = dt;
         if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) {
             static int nrep;
@@ -1218,7 +1217,7 @@ static void loading_barrier(LONG64 frame, LONG64 draws) {
         if (g_jq_queued != g_jq_done || g_bq_queued != g_bq_done) { g_bar_timeout++; printf("nvn_vk_barrier: TIME-OUT at frame %lld: after 20 s the workers still have %lld + %lld jobs: the frame is presented, pipelines may be made at a draw\n", (long long)frame, (long long)(g_jq_queued - g_jq_done), (long long)(g_bq_queued - g_bq_done)); }
         else if (dt * 10 > fq.QuadPart) printf("nvn_vk_barrier: frame %lld (a loading screen: %lld draws) was held %.0f ms until the workers had finished every queued stage and pipeline\n", (long long)frame, (long long)draws, (double)dt * 1000.0 / (double)fq.QuadPart);
     }
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
     if (want_dump) wd_dump(20.0, 0);
 }
 /* The variants of one code that only a draw decides (integer vertex attributes, integer textures, vertex outputs
@@ -1236,37 +1235,37 @@ static void variants_known(const SSrc *src, uint64_t hb) {
     for (int i = 0; i < n; i++) {
         if (e[i].magic != STAGEREC_MAGIC || !(e[i].key[0] | e[i].key[1] | e[i].key[2] | e[i].key[3] | e[i].fo)) continue;
         stage_ensure(src, hb, e[i].key, e[i].fo, &how);
-        if (how == 1) { InterlockedIncrement64(&g_w_stages); InterlockedIncrement64(&g_var_known); }
+        if (how == 1) { plat_inc(&g_w_stages); plat_inc(&g_var_known); }
     }
 }
 static void job_prog(Job *j) {
     static const uint32_t zero[4];
     int how;
-    InterlockedIncrement64(&g_w_progs);
+    plat_inc(&g_w_progs);
     if (j->has[0] && j->has[1]) spawn_stage(&j->src[1], zero);
     if (j->has[2]) {
         VStage *c = stage_ensure(&j->src[2], ssrc_hb(&j->src[2]), zero, 0, &how);
-        if (how == 1) InterlockedIncrement64(&g_w_stages);
+        if (how == 1) plat_inc(&g_w_stages);
         if (c->ok && !c->images && c->nsmp <= 32) compute_pipe_ensure(c);
     }
     if (!j->has[0]) return;
     uint64_t hv = ssrc_hb(&j->src[0]);
     VStage *vs = stage_ensure(&j->src[0], hv, zero, 0, &how), *fs = NULL;
-    if (how == 1) InterlockedIncrement64(&g_w_stages);
-    if (j->has[1]) { fs = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), zero, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); }
+    if (how == 1) plat_inc(&g_w_stages);
+    if (j->has[1]) { fs = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), zero, 0, &how); if (how == 1) plat_inc(&g_w_stages); }
     if (!vs->ok || (fs && !fs->ok)) return;
     variants_known(&j->src[0], hv);                /* what earlier runs needed of this code at a draw */
     if (fs) variants_known(&j->src[1], fs->hb);
     if (fs && (fs->in_attr & ~vs->out_attr)) {    /* fragment inputs the vertex code never writes: the variant that declares them */
         vs = stage_ensure(&j->src[0], hv, zero, fs->in_attr & ~vs->out_attr, &how);
-        if (how == 1) InterlockedIncrement64(&g_w_stages);
+        if (how == 1) plat_inc(&g_w_stages);
         if (!vs->ok) return;
     }
     if (D.has_gpl && gpl_sep() && !(fs && j->sshade) && stage_fits_universal(vs) && (!fs || stage_fits_universal(fs))) { int lh; stagelib_ensure(vs, 0, &lh); if (fs) stagelib_ensure(fs, 0, &lh); else stagelib_ensure(vs, 1, &lh); }      /* SMO_VK_GPL=2: a library per stage (a program without a fragment stage: both forms of its vertex stage) */
     else
     if (D.has_gpl) { int lh; pairlib_ensure(vs, fs, 1, fs ? j->sshade : 0, &lh); }      /* the pair's shaders compiled now, without pass formats; a draw links */
     if (!g_predict) return;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     PairRec *pr = pair_get(vs, fs);
     pr->sshade = (uint8_t)j->sshade;
     for (int n = 0; n < 3 && !pr->drawn; n++) {    /* the three signatures most used so far */
@@ -1275,7 +1274,7 @@ static void job_prog(Job *j) {
         if (best < 0) break;
         predict_pair(pr, best);
     }
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 static void job_draw(Job *j) {                     /* a draw the look-ahead met whose stages were not all made yet */
     int how;
@@ -1283,31 +1282,31 @@ static void job_draw(Job *j) {                     /* a draw the look-ahead met 
     if (j->has[1]) spawn_stage(&j->src[1], j->key1);
     uint64_t hv = ssrc_hb(&j->src[0]);
     VStage *vs = stage_ensure(&j->src[0], hv, j->key0, 0, &how);
-    if (how == 1) InterlockedIncrement64(&g_w_stages);
-    if (j->has[1]) { fs = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (!fs->ok) return; }
+    if (how == 1) plat_inc(&g_w_stages);
+    if (j->has[1]) { fs = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) plat_inc(&g_w_stages); if (!fs->ok) return; }
     if (!vs->ok) return;
-    if (fs && (fs->in_attr & ~vs->out_attr)) { vs = stage_ensure(&j->src[0], hv, j->key0, fs->in_attr & ~vs->out_attr, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (!vs->ok) return; }
+    if (fs && (fs->in_attr & ~vs->out_attr)) { vs = stage_ensure(&j->src[0], hv, j->key0, fs->in_attr & ~vs->out_attr, &how); if (how == 1) plat_inc(&g_w_stages); if (!vs->ok) return; }
     if (!D.has_eds3) return;                       /* the key holds blend state the look-ahead does not follow */
     PKey k = j->k;
     k.vs = vs->id; k.fs = fs ? fs->id : 0;
     uint64_t h = pkey_hash(&k);
     int mine = 0;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     Pipe *p = pipe_find(&k, h);
     if (!p) { p = pipe_new(&k, vs, fs, h, 1); mine = 1; } else if (p->state == 0) { p->state = 1; mine = 1; }
-    LeaveCriticalSection(&g_sh_lock);
-    if (mine) { pipe_build(p); InterlockedIncrement64(&g_w_pipes); }
+    plat_unlock(&g_sh_lock);
+    if (mine) { pipe_build(p); plat_inc(&g_w_pipes); }
 }
-static DWORD WINAPI pw_main(void *arg) {
+static uint32_t pw_main(void *arg) {
     (void)arg;
     os_pin_host_thread();
-    LONG wslot = InterlockedIncrement(&g_wk_n) - 1;
-    if (wslot < 64) { g_wk[wslot].kind = -1; g_wk[wslot].tid = GetCurrentThreadId(); }
+    int32_t wslot = plat_inc(&g_wk_n) - 1;
+    if (wslot < 64) { g_wk[wslot].kind = -1; g_wk[wslot].tid = plat_tid(); }
     for (;;) {                                     /* 1. the keys of earlier runs */
-        LONG i = InterlockedIncrement(&g_pw_next) - 1;
+        int32_t i = plat_inc(&g_pw_next) - 1;
         if (i >= g_pw_n) break;
         PipeRec *r = &g_pw_rec[i];
-        EnterCriticalSection(&g_sh_lock);
+        plat_lock(&g_sh_lock);
         VStage *vs = pw_stage(r->compute ? 5 : 0, r->vs_h), *fs = r->fs_h ? pw_stage(1, r->fs_h) : NULL;
         Pipe *p = NULL;
         if (vs && !r->compute && (!r->fs_h || fs)) {
@@ -1318,13 +1317,13 @@ static DWORD WINAPI pw_main(void *arg) {
             sig_note(&r->k, &idx);
             pair_get(vs, fs)->drawn = 1;           /* a pair with recorded keys needs no prediction */
         }
-        LeaveCriticalSection(&g_sh_lock);
-        if (!vs || (r->fs_h && !fs)) { InterlockedIncrement64(&g_pw_failed); continue; }      /* a stage record or SPIR-V file is gone: made when the game hands the program over, as on a first run */
-        if (r->compute) { vs->cp_recorded = 1; if (compute_pipe_ensure(vs) == 1) InterlockedIncrement64(&g_pw_pipes); continue; }
-        if (p) { pipe_build(p); InterlockedIncrement64(&g_pw_pipes); }
+        plat_unlock(&g_sh_lock);
+        if (!vs || (r->fs_h && !fs)) { plat_inc(&g_pw_failed); continue; }      /* a stage record or SPIR-V file is gone: made when the game hands the program over, as on a first run */
+        if (r->compute) { vs->cp_recorded = 1; if (compute_pipe_ensure(vs) == 1) plat_inc(&g_pw_pipes); continue; }
+        if (p) { pipe_build(p); plat_inc(&g_pw_pipes); }
     }
-    InterlockedExchange64(&g_pw_t1, tk());
-    if (InterlockedDecrement(&g_pw_left) == 0) SetEvent(g_pw_gate);
+    plat_xchg(&g_pw_t1, tk());
+    if (plat_dec(&g_pw_left) == 0) plat_event_set(g_pw_gate);
     int prio = THREAD_PRIORITY_NORMAL;
     for (;;) {                                     /* 2. what the game hands over while it runs */
         {   /* while a scene is drawn the workers run BELOW the game's threads (measured by ssbu-recomp in Super Smash Bros. Ultimate: 16
@@ -1335,30 +1334,30 @@ static DWORD WINAPI pw_main(void *arg) {
             int want = on && g_in_scene ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL;
             if (want != prio) { SetThreadPriority(GetCurrentThread(), want); prio = want; }
         }
-        EnterCriticalSection(&g_sh_lock);
-        while (!g_jq_head && !g_bq_head && !g_workers_quit) SleepConditionVariableCS(&g_jq_cv, &g_sh_lock, INFINITE);
+        plat_lock(&g_sh_lock);
+        while (!g_jq_head && !g_bq_head && !g_workers_quit) plat_cond_wait_ms(&g_jq_cv, &g_sh_lock, PLAT_INFINITE);
         Job *j = g_jq_head;
         int bg = 0;
         if (j) { g_jq_head = j->next; if (!g_jq_head) g_jq_tail = NULL; }
         else if (!g_workers_quit && (j = g_bq_head) != NULL) { g_bq_head = j->next; if (!g_bq_head) g_bq_tail = NULL; bg = 1; }      /* at exit the background work is left undone */
         Pipe *p = NULL;
         if (j && j->kind == 1 && j->pipe->state == 0) { p = j->pipe; p->state = 1; }
-        LeaveCriticalSection(&g_sh_lock);
+        plat_unlock(&g_sh_lock);
         if (!j) break;
         if (wslot < 64) { g_wk[wslot].serial = j->has[1] ? j->src[1].serial : j->has[0] ? j->src[0].serial : 0; g_wk[wslot].t0 = tk(); g_wk[wslot].kind = j->kind * 10 + bg; }
         if (j->kind == 0) job_prog(j);
         else if (j->kind == 2) job_draw(j);
-        else if (j->kind == 3) { int how; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && stage_fits_universal(v)) { int lh; stagelib_ensure(v, 0, &lh); } else if (j->fragonly && v && v->ok) gpl_fo_made(v); }
+        else if (j->kind == 3) { int how; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, 0, &how); if (how == 1) plat_inc(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && stage_fits_universal(v)) { int lh; stagelib_ensure(v, 0, &lh); } else if (j->fragonly && v && v->ok) gpl_fo_made(v); }
         else if (j->kind == 5) { int lh; pairlib_ensure(j->lvs, j->lfs, 1, 0, &lh); }
         else if (j->kind == 6) gpl_optimise(j->pipe);
-        else if (j->kind == 7) { int how, lh; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, (uint32_t)j->sshade, &how); if (how == 1) InterlockedIncrement64(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && stage_fits_universal(v)) stagelib_ensure(v, 0, &lh); }      /* the stage a skipped draw waits for */
-        else if (p) { pipe_build(p); InterlockedIncrement64(&g_w_pipes); }
+        else if (j->kind == 7) { int how, lh; VStage *v = stage_ensure(&j->src[1], ssrc_hb(&j->src[1]), j->key1, (uint32_t)j->sshade, &how); if (how == 1) plat_inc(&g_w_stages); if (v && v->ok && D.has_gpl && gpl_sep() && stage_fits_universal(v)) stagelib_ensure(v, 0, &lh); }      /* the stage a skipped draw waits for */
+        else if (p) { pipe_build(p); plat_inc(&g_w_pipes); }
         if (wslot < 64) g_wk[wslot].kind = -1;
         free(j);
-        EnterCriticalSection(&g_sh_lock);
+        plat_lock(&g_sh_lock);
         if (bg) g_bq_done++; else g_jq_done++;
-        WakeAllConditionVariable(&g_sh_cv);
-        LeaveCriticalSection(&g_sh_lock);
+        plat_cond_broadcast(&g_sh_cv);
+        plat_unlock(&g_sh_lock);
     }
     return 0;
 }
@@ -1372,7 +1371,7 @@ static DWORD WINAPI pw_main(void *arg) {
  * stage's bytes (program header, code, constant-buffer-1 data, in their relative places) are copied at the call and the
  * stage points at the copy; the copy of an earlier call for the same stage is freed. */
 static struct { Stage *st; void *blk; } g_scopy[65536];
-static LONG64 g_scopy_n, g_scopy_bytes;
+static int64_t g_scopy_n, g_scopy_bytes;
 static void stage_copy(Stage *st, int s) {
     if (!st->code || st->code_len <= 0) return;
     const uint8_t *lo = st->code - (s == 5 ? 0 : 0x30), *hi = st->code + st->code_len;
@@ -1390,27 +1389,27 @@ static void stage_copy(Stage *st, int s) {
     free(g_scopy[i].blk);
     g_scopy[i].st = st; g_scopy[i].blk = blk;
     st->code = blk + (st->code - lo);
-    g_scopy_n++; g_scopy_bytes += (LONG64)n;
+    g_scopy_n++; g_scopy_bytes += (int64_t)n;
 }
 /* programs handed over per game thread (the exit report): which threads load shaders, how many near a scene, how long
  * the hand-over held them */
 #define HOTHR_N 32
-static struct { const char *name; LONG64 n, near_scene, held, held_tk; } g_hothr[HOTHR_N];
-static volatile LONG g_hothr_n;
-static __declspec(thread) int t_hothr = -1;
+static struct { const char *name; int64_t n, near_scene, held, held_tk; } g_hothr[HOTHR_N];
+static volatile int32_t g_hothr_n;
+static _Thread_local int t_hothr = -1;
 static int hothr_slot(void) {
     if (t_hothr >= 0) return t_hothr;
-    LONG i = InterlockedIncrement(&g_hothr_n) - 1;
+    int32_t i = plat_inc(&g_hothr_n) - 1;
     if (i >= HOTHR_N) return t_hothr = HOTHR_N - 1;            /* more threads than slots: the last slot takes the rest */
-    const char *guest_thread_name_of(DWORD tid);                   /* os_threads.c */
-    g_hothr[i].name = guest_thread_name_of(GetCurrentThreadId());
+    const char *guest_thread_name_of(uint32_t tid);                   /* os_threads.c */
+    g_hothr[i].name = guest_thread_name_of(plat_tid());
     return t_hothr = (int)i;
 }
 void nvn_vk_program_set(void *prog) {
     Prog *p = prog;
     SSrc s[3];
-    {   static volatile LONG first;                /* the process before any stage, library or pipeline of the game exists (nvn_vk_mem lines follow every 300 frames) */
-        if (!first && InterlockedExchange(&first, 1) == 0) {
+    {   static volatile int32_t first;                /* the process before any stage, library or pipeline of the game exists (nvn_vk_mem lines follow every 300 frames) */
+        if (!first && plat_xchg(&first, 1) == 0) {
             PROCESS_MEMORY_COUNTERS_EX pm;
             memset(&pm, 0, sizeof pm); pm.cb = sizeof pm;
             K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
@@ -1421,7 +1420,7 @@ void nvn_vk_program_set(void *prog) {
     if (!g_handover_on || p->st[2].state || p->st[3].state || p->st[4].state) return;
     {   static int on = -1;
         if (on < 0) on = getenv("SMO_VK_STAGECOPY") && atoi(getenv("SMO_VK_STAGECOPY"));
-        if (on) { EnterCriticalSection(&g_sh_lock); stage_copy(&p->st[0], 0); stage_copy(&p->st[1], 1); stage_copy(&p->st[5], 5); LeaveCriticalSection(&g_sh_lock); }
+        if (on) { plat_lock(&g_sh_lock); stage_copy(&p->st[0], 0); stage_copy(&p->st[1], 1); stage_copy(&p->st[5], 5); plat_unlock(&g_sh_lock); }
     }
     int has[3] = {ssrc_of(&s[0], p, 0), ssrc_of(&s[1], p, 1), ssrc_of(&s[2], p, 5)};
     {   /* debug aid: SMO_VK_DUMP_SERIAL=<n> also when program n is handed over (its stages may come from the cache) */
@@ -1445,11 +1444,11 @@ void nvn_vk_program_set(void *prog) {
          * over the whole first run (a second run reads them from the cache). */
         static int on = -1;
         if (on < 0) on = !(getenv("SMO_VK_FRAGONLY") && !atoi(getenv("SMO_VK_FRAGONLY")));
-        if (on) { static const uint32_t zero[4]; if (holdlog_on()) { EnterCriticalSection(&g_sh_lock); ho_note(ssrc_hb(&s[1])); LeaveCriticalSection(&g_sh_lock); } spawn_stage_fo(&s[1], zero); }
+        if (on) { static const uint32_t zero[4]; if (holdlog_on()) { plat_lock(&g_sh_lock); ho_note(ssrc_hb(&s[1])); plat_unlock(&g_sh_lock); } spawn_stage_fo(&s[1], zero); }
         return;
     }
     if (!has[0] && !has[2]) return;
-    LONG64 ta = tk();
+    int64_t ta = tk();
     size_t need = 0;
     for (int i = 0; i < 3; i++) if (has[i]) need += (size_t)s[i].code_len + s[i].cdata_size + 16;
     Job *j = calloc(1, sizeof *j + need);
@@ -1458,9 +1457,9 @@ void nvn_vk_program_set(void *prog) {
     for (int i = 0; i < 3; i++) if (has[i]) job_copy_src(j, &d, i, &s[i]);
     uint64_t hn[2] = {0, 0};
     if (holdlog_on()) for (int i = 0; i < 2; i++) if (has[i]) hn[i] = ssrc_hb(&s[i]);      /* hashed before the lock is taken */
-    LONG64 tb = tk();
+    int64_t tb = tk();
     nvn_setsh_part[5] += tb - ta;
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     nvn_setsh_part[6] += tk() - tb;
     if (holdlog_on()) for (int i = 0; i < 2; i++) if (has[i]) ho_note(hn[i]);
     job_push(j);
@@ -1471,20 +1470,20 @@ void nvn_vk_program_set(void *prog) {
     /* near a scene the caller (a game thread) is not held at all: a draw that needs the program waits for it
      * on the render thread, a program not drawn in this frame costs nothing */
     if (!fr && (g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done)) {
-        LONG64 t0 = tk();
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        int64_t t0 = tk();
+        plat_counter fq; plat_qpf(&fq);
         while ((g_jq_queued - g_jq_done > g_pw_nthread || g_bq_queued > g_bq_done) && tk() - t0 < 30 * fq.QuadPart) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
         g_set_held++; g_set_held_tk += tk() - t0;
         g_hothr[ht].held++; g_hothr[ht].held_tk += tk() - t0;
         nvn_setsh_part[7] += tk() - t0;
     }
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeof(PipeRec)); }
 static void prewarm_start(void) {
-    InitializeCriticalSection(&g_sh_lock); InitializeCriticalSection(&g_gpl_lock);
-    InitializeConditionVariable(&g_sh_cv); InitializeConditionVariable(&g_jq_cv);
-    CreateDirectoryA(vkc_dir(), NULL); CreateDirectoryA(vkc_file("spv"), NULL); CreateDirectoryA(vkc_file("stage"), NULL);
+    plat_lock_init(&g_sh_lock); plat_lock_init(&g_gpl_lock);
+    plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
+    plat_mkdir(vkc_dir()); plat_mkdir(vkc_file("spv")); plat_mkdir(vkc_file("stage"));
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
     {   HMODULE m = LoadLibraryA("smo_glslang.dll");
         g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "smo_spirv_free") : NULL;
@@ -1501,10 +1500,10 @@ static void prewarm_start(void) {
         VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         void *data = NULL;
         snprintf(g_pcache_path, sizeof g_pcache_path, "%s/pipelines_%04x_%04x_%08x.bin", vkc_dir(), (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, (unsigned)V.props.driverVersion);
-        LONG64 tp0 = tk(), tp1;
-        LARGE_INTEGER pfq; QueryPerformanceFrequency(&pfq);
+        int64_t tp0 = tk(), tp1;
+        plat_counter pfq; plat_qpf(&pfq);
         FILE *fp = fopen(g_pcache_path, "rb");
-        if (fp) { _fseeki64(fp, 0, SEEK_END); long long n = _ftelli64(fp); _fseeki64(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
+        if (fp) { fseeko(fp, 0, SEEK_END); long long n = ftello(fp); fseeko(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
         tp1 = tk();
         PROCESS_MEMORY_COUNTERS_EX pm0, pm1;
         memset(&pm0, 0, sizeof pm0); pm0.cb = sizeof pm0; pm1 = pm0;
@@ -1539,7 +1538,7 @@ static void prewarm_start(void) {
     if (g_pw_nthread < 1) g_pw_nthread = 1;
     if (g_pw_nthread > 16) g_pw_nthread = 16;
     if (getenv("SMO_VK_WORKERS") && atoi(getenv("SMO_VK_WORKERS")) > 0 && atoi(getenv("SMO_VK_WORKERS")) <= 16) g_pw_nthread = atoi(getenv("SMO_VK_WORKERS"));
-    g_pw_gate = CreateEventA(NULL, TRUE, FALSE, NULL);
+    g_pw_gate = plat_event_new(1, 0);
     g_pw_left = g_pw_nthread;
     g_pw_t0 = tk();
     for (int i = 0; i < g_pw_nthread; i++) g_pw_thread[i] = CreateThread(NULL, 0, pw_main, NULL, 0, NULL);
@@ -1597,7 +1596,7 @@ static void scan_draw(Scan *s, unsigned prim) {
         if (!vs->ok || (fs && !fs->ok)) return;
         k.vs = vs->id; k.fs = fs ? fs->id : 0;
         uint64_t h = pkey_hash(&k);
-        EnterCriticalSection(&g_sh_lock);
+        plat_lock(&g_sh_lock);
         Pipe *pf = pipe_find(&k, h);
         if (!pf || pf->state == 0) {               /* not there, or waiting in the background queue: to the front */
             Job *j = calloc(1, sizeof *j);
@@ -1605,7 +1604,7 @@ static void scan_draw(Scan *s, unsigned prim) {
             job_push_front(j);
             g_scan_pipes++;
         }
-        LeaveCriticalSection(&g_sh_lock);
+        plat_unlock(&g_sh_lock);
         return;
     }
     SSrc a, b;
@@ -1616,10 +1615,10 @@ static void scan_draw(Scan *s, unsigned prim) {
     j->kind = 2; j->k = k; memcpy(j->key0, key0, 16); memcpy(j->key1, key1, 16);
     job_copy_src(j, &d, 0, &a);
     if (has_f) job_copy_src(j, &d, 1, &b);
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     job_push_front(j);
     g_scan_jobs++;
-    LeaveCriticalSection(&g_sh_lock);
+    plat_unlock(&g_sh_lock);
 }
 static void scan_list(uint64_t handle, int depth, Scan *s) {
     size_t len = 0;
@@ -1657,44 +1656,44 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
  * not needed. scan_async_wait() before the batch's job returns: the lists stay valid while it reads them. */
 static struct { HANDLE thread, go, done; const uint64_t *handles; int count, busy; Scan s; } SA;
 static int mt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_MT"); on = e && atoi(e) > 0; } return on; }
-static DWORD WINAPI scan_thread(void *arg) {
+static uint32_t scan_thread(void *arg) {
     (void)arg;
     os_pin_host_thread();
     for (;;) {
-        WaitForSingleObject(SA.go, INFINITE);
-        LONG64 ts = tk();
+        WaitForSingleObject(SA.go, PLAT_INFINITE);
+        int64_t ts = tk();
         for (int i = 0; i < SA.count; i++) scan_list(SA.handles[i], 0, &SA.s);
         g_tm[9] += tk() - ts;
-        SetEvent(SA.done);
+        plat_event_set(SA.done);
     }
     return 0;
 }
 static void scan_async_start(const uint64_t *handles, int count) {
-    if (!SA.thread) { SA.go = CreateEventA(NULL, FALSE, FALSE, NULL); SA.done = CreateEventA(NULL, FALSE, FALSE, NULL); SA.thread = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL); }
+    if (!SA.thread) { SA.go = plat_event_new(0, 0); SA.done = plat_event_new(0, 0); SA.thread = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL); }
     scan_begin(&SA.s);
     SA.handles = handles; SA.count = count; SA.busy = 1;
-    SetEvent(SA.go);
+    plat_event_set(SA.go);
 }
-static void scan_async_wait(void) { if (SA.busy) { WaitForSingleObject(SA.done, INFINITE); SA.busy = 0; } }
+static void scan_async_wait(void) { if (SA.busy) { WaitForSingleObject(SA.done, PLAT_INFINITE); SA.busy = 0; } }
 static void prewarm_wait(void) {                   /* render thread, before its first batch */
     if (g_pw_waited) return;
     g_pw_waited = 1;
-    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-    LONG64 t0 = tk();
-    WaitForSingleObject(g_pw_gate, INFINITE);
+    plat_counter fq; plat_qpf(&fq);
+    int64_t t0 = tk();
+    WaitForSingleObject(g_pw_gate, PLAT_INFINITE);
     printf("nvn_vk: pipelines made ahead: %lld of %d listed (%lld stages from their records, %lld entries without their stage files) in %.0f ms on %d threads; the first batch waited %.0f ms for them\n",
            (long long)g_pw_pipes, g_pw_n, (long long)g_pw_stages, (long long)g_pw_failed, (double)(g_pw_t1 - g_pw_t0) * 1000.0 / (double)fq.QuadPart, g_pw_nthread, (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart);
     fflush(stdout);
     free(g_pw_rec); g_pw_rec = NULL;
 }
 void nvn_vk_hold_counts(long long *holds, long long *hold_ms, long long *dummies) {     /* smo_nerve.c (SMO_STAGE_LIST): so far */
-    LARGE_INTEGER fq;
-    QueryPerformanceFrequency(&fq);
+    plat_counter fq;
+    plat_qpf(&fq);
     *holds = g_bar_n; *hold_ms = (long long)((double)g_bar_tk * 1000.0 / (double)fq.QuadPart); *dummies = R.dummy_kind;
 }
 
 static void pipelines_report(void) {
-    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    plat_counter fq; plat_qpf(&fq);
     if (D.has_gpl) {
         double q = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_gpl: pair libraries compiled by the workers: %lld (%.0f ms of worker time; %lld of them asked for as shared vertex stage x fragment stage without a program of its own: %d such fragment stages, %d shared vertex stages); "
@@ -1707,7 +1706,7 @@ static void pipelines_report(void) {
     printf("nvn_vk_barrier: loading-screen frames held for the workers: %lld, %.0f ms in all, longest %.0f ms, time-outs %lld | progress bar: %lld extra presents of a held loading screen\n", (long long)g_bar_n, (double)g_bar_tk * 1000.0 / (double)fq.QuadPart, (double)g_bar_max * 1000.0 / (double)fq.QuadPart, (long long)g_bar_timeout, (long long)g_ovl_presents);
     for (int i = 0; i < g_rtlog_n; i++) printf("nvn_vk_rt: %d x %d (mip level %d), %d colour targets (first format 0x%x), depth format 0x%x: %lld passes, %lld of them in scene frames, first in frame %lld\n", g_rtlog[i].w, g_rtlog[i].h, g_rtlog[i].lv, g_rtlog[i].ncol, g_rtlog[i].cf, g_rtlog[i].df, g_rtlog[i].n, g_rtlog[i].scene, g_rtlog[i].first);
     double k = 1000.0 / (double)fq.QuadPart;
-    LONG64 n = 0, t = 0;
+    int64_t n = 0, t = 0;
     for (int i = 0; i < H_N; i++) { n += g_hold_n[i]; t += g_hold_tk[i]; }
     printf("nvn_vk: texture descriptor sets: %lld reused after a full comparison of their lists, %lld hash hits with a different list (given a set of their own); samplers given a dummy because the texture is of another kind than the shader declares: %lld\n", (long long)R.sets_reused, (long long)R.tset_collisions, (long long)R.dummy_kind);
     if (tc_on()) printf("nvn_vk: texture sets kept across command buffers: %lld allocated (%d pools), %lld written again for another list, %lld lists given a set of the command buffer (every entry of their bucket still in use by the GPU, or the pools full)\n", (long long)g_tc_made, g_tc_npool, (long long)g_tc_rewritten, (long long)g_tc_busy);
@@ -1722,11 +1721,11 @@ static void pipelines_report(void) {
 static void workers_stop(void) {
     if (!g_pw_nthread) return;
     prewarm_wait();
-    EnterCriticalSection(&g_sh_lock);
+    plat_lock(&g_sh_lock);
     g_handover_on = 0; g_workers_quit = 1;
-    WakeAllConditionVariable(&g_jq_cv);
-    LeaveCriticalSection(&g_sh_lock);
-    WaitForMultipleObjects((DWORD)g_pw_nthread, g_pw_thread, TRUE, 60000);
+    plat_cond_broadcast(&g_jq_cv);
+    plat_unlock(&g_sh_lock);
+    WaitForMultipleObjects((uint32_t)g_pw_nthread, g_pw_thread, 1, 60000);
     for (int i = 0; i < g_pw_nthread; i++) CloseHandle(g_pw_thread[i]);
     g_pw_nthread = 0;
     pipelines_report();
@@ -1737,12 +1736,12 @@ static void workers_stop(void) {
  * minute on a busy PC, when a thread of lower priority did it during play). One call with a buffer sized from the file of
  * the last save; the two-call form (size, then data) is the fallback. */
 static void pcache_save(void) {
-    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    plat_counter fq; plat_qpf(&fq);
     size_t n = 0;
     void *data = NULL;
     int one = 0, ok = 0;
     if (!g_pcache) return;
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     WIN32_FILE_ATTRIBUTE_DATA fa;
     if (GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa) && (fa.nFileSizeLow || fa.nFileSizeHigh)) {
         n = (size_t)(((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
@@ -1755,11 +1754,11 @@ static void pcache_save(void) {
         if (!(data = malloc(n))) return;
         if (vkGetPipelineCacheData(V.device, g_pcache, &n, data) != VK_SUCCESS) { free(data); return; }
     }
-    LONG64 t1 = tk();
+    int64_t t1 = tk();
     char tmp[176];
     snprintf(tmp, sizeof tmp, "%s.tmp", g_pcache_path);
     FILE *fp = fopen(tmp, "wb");
-    if (fp) { ok = fwrite(data, 1, n, fp) == n; fclose(fp); if (ok) ok = MoveFileExA(tmp, g_pcache_path, MOVEFILE_REPLACE_EXISTING) != 0; }
+    if (fp) { ok = fwrite(data, 1, n, fp) == n; fclose(fp); if (ok) ok = plat_rename_replace(tmp, g_pcache_path) != 0; }
     printf("nvn_vk: pipeline cache %s: %llu KB, on the exit path; vkGetPipelineCacheData %.0f ms (%s); file written in %.0f ms\n",
            ok ? "saved" : "NOT SAVED (the file could not be written)", (unsigned long long)(n >> 10), (double)(t1 - t0) * 1000.0 / (double)fq.QuadPart,
            one ? "one call" : "two calls: size, then data", (double)(tk() - t1) * 1000.0 / (double)fq.QuadPart);

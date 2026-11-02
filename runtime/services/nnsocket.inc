@@ -130,11 +130,11 @@ static void nifm_GetCurrentProxySetting(Ctx *c) {
 /* ================================================================== nn::socket on Winsock */
 #define SO_MAX_FD 128
 #define SO_O_NONBLOCK 0x800
-typedef struct { SOCKET s; LONG refs; int type; int bound_any; } SoObj;
+typedef struct { SOCKET s; int32_t refs; int type; int bound_any; } SoObj;
 static struct { SoObj *o; int flags; } g_so_fd[SO_MAX_FD];
-static SRWLOCK g_so_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_so_lock = PLAT_RWLOCK_INIT;
 static int g_so_init, g_so_wsa;
-static __declspec(thread) int t_so_herrno;
+static _Thread_local int t_so_herrno;
 
 static int *so_errno_ptr(Ctx *c) {
     uint64_t keep = c->x[0];
@@ -192,31 +192,31 @@ static int so_wsa_errno(int e, int sending) {
 }
 static SoObj *so_get(int fd, int *flags) {
     SoObj *o = NULL;
-    AcquireSRWLockExclusive(&g_so_lock);
+    plat_rw_wlock(&g_so_lock);
     if (fd >= 0 && fd < SO_MAX_FD && g_so_fd[fd].o) { o = g_so_fd[fd].o; o->refs++; if (flags) *flags = g_so_fd[fd].flags; }
-    ReleaseSRWLockExclusive(&g_so_lock);
+    plat_rw_wunlock(&g_so_lock);
     return o;
 }
 static void so_put(SoObj *o) {
     int last;
-    AcquireSRWLockExclusive(&g_so_lock);
+    plat_rw_wlock(&g_so_lock);
     last = --o->refs == 0;
-    ReleaseSRWLockExclusive(&g_so_lock);
+    plat_rw_wunlock(&g_so_lock);
     if (last) { closesocket(o->s); free(o); }
 }
 static int so_install(SoObj *o, int flags) {             /* lowest free descriptor, or -1 */
     int fd = -1;
-    AcquireSRWLockExclusive(&g_so_lock);
+    plat_rw_wlock(&g_so_lock);
     for (int i = 0; i < SO_MAX_FD && fd < 0; i++) if (!g_so_fd[i].o) fd = i;
     if (fd >= 0) { g_so_fd[fd].o = o; g_so_fd[fd].flags = flags; o->refs++; }
-    ReleaseSRWLockExclusive(&g_so_lock);
+    plat_rw_wunlock(&g_so_lock);
     return fd;
 }
 static int so_remove(int fd) {
     SoObj *o = NULL;
-    AcquireSRWLockExclusive(&g_so_lock);
+    plat_rw_wlock(&g_so_lock);
     if (fd >= 0 && fd < SO_MAX_FD) { o = g_so_fd[fd].o; g_so_fd[fd].o = NULL; g_so_fd[fd].flags = 0; }
-    ReleaseSRWLockExclusive(&g_so_lock);
+    plat_rw_wunlock(&g_so_lock);
     if (!o) return 0;
     so_put(o);
     return 1;
@@ -437,9 +437,9 @@ static void socket_Fcntl(Ctx *c) {                        /* (fd, cmd, int) */
     if (cmd == 3) RETI(flags);
     else if (cmd == 4) {
         so_nonblock(o, (arg & SO_O_NONBLOCK) != 0);
-        AcquireSRWLockExclusive(&g_so_lock);
+        plat_rw_wlock(&g_so_lock);
         if (g_so_fd[fd].o == o) g_so_fd[fd].flags = arg;
-        ReleaseSRWLockExclusive(&g_so_lock);
+        plat_rw_wunlock(&g_so_lock);
         RETI(0);
     } else so_fail(c, 22);
     so_put(o);
@@ -467,9 +467,9 @@ static void socket_Poll(Ctx *c) {                         /* (pollfd *, nfds, ti
         hn++;
     }
     if (hn) {
-        r = WSAPoll(h, (ULONG)hn, ready ? 0 : timeout);
+        r = WSAPoll(h, (uint32_t)hn, ready ? 0 : timeout);
         if (r < 0) e = so_wsa_errno(WSAGetLastError(), 0);
-    } else if (!ready && timeout) Sleep(timeout < 0 ? INFINITE : (DWORD)timeout);
+    } else if (!ready && timeout) plat_sleep_ms(timeout < 0 ? PLAT_INFINITE : (uint32_t)timeout);
     hn = 0;
     for (uint64_t i = 0; i < n; i++) {
         if (!objs[i]) continue;
@@ -510,7 +510,7 @@ static void socket_GetSockOpt(Ctx *c) {                   /* (fd, level, name, v
             uint32_t ol = 4;
             if (level == 0xffff && name == 0x1007) { int v = so_wsa_errno(*(int *)tmp, 0); memcpy(out, &v, 4); }
             else if (level == 0xffff && name == 0x80) { LINGER *l = (LINGER *)tmp; int v[2] = {l->l_onoff, l->l_linger}; memcpy(out, v, 8); ol = 8; }
-            else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) { DWORD ms = *(DWORD *)tmp; int64_t tv[2] = {ms / 1000, (ms % 1000) * 1000}; memcpy(out, tv, 16); ol = 16; }
+            else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) { uint32_t ms = *(uint32_t *)tmp; int64_t tv[2] = {ms / 1000, (ms % 1000) * 1000}; memcpy(out, tv, 16); ol = 16; }
             else { int v = tl >= 4 ? *(int *)tmp : (tl >= 1 ? tmp[0] != 0 : 0); memcpy(out, &v, 4); }
             if (ol > cap) ol = cap;
             memcpy((void *)(uintptr_t)val, out, ol);
@@ -533,7 +533,7 @@ static void socket_SetSockOpt(Ctx *c) {                   /* (fd, level, name, c
         if (len < 8) e = 22;
         else { LINGER l; l.l_onoff = (u_short)(M32(val) != 0); l.l_linger = (u_short)M32(val + 4); r = setsockopt(o->s, SOL_SOCKET, SO_LINGER, (char *)&l, sizeof l); }
     } else if (level == 0xffff && (name == 0x1005 || name == 0x1006)) {
-        DWORD ms = len >= 16 ? (DWORD)(M64(val) * 1000 + M64(val + 8) / 1000) : len >= 4 ? M32(val) : 0;
+        uint32_t ms = len >= 16 ? (uint32_t)(M64(val) * 1000 + M64(val + 8) / 1000) : len >= 4 ? M32(val) : 0;
         if (len < 4) e = 22; else r = setsockopt(o->s, SOL_SOCKET, name, (char *)&ms, sizeof ms);
     } else if (level == 0xffff && name == 0x800) r = 0;   /* SO_NOSIGPIPE */
     else if (level == 0xffff || (level == 6 && name == 1)) {
@@ -624,7 +624,7 @@ static void so_freeaddrinfo(Ctx *c, int nn_layout) {
 }
 static void socket_FreeAddrInfo2(Ctx *c) { so_freeaddrinfo(c, 0); }
 static void socket_GetHostByNameWithOptions(Ctx *c) {     /* (const char *name, const ResolverOption *, size_t count) -> hostent * */
-    static __declspec(thread) struct { uint64_t name, aliases; int32_t type, length; uint64_t list; uint64_t alias0; uint64_t addrs[2]; uint32_t addr; char text[64]; } t_he;
+    static _Thread_local struct { uint64_t name, aliases; int32_t type, length; uint64_t list; uint64_t alias0; uint64_t addrs[2]; uint32_t addr; char text[64]; } t_he;
     const char *name = (const char *)(uintptr_t)A0;
     struct in_addr a;
     if (!so_resolver_enabled()) { so_set_errno(c, 22); RET(0); return; }
@@ -649,7 +649,7 @@ static void so_ResolverGetOption(Ctx *c) {                /* (ResolverOption *ou
     if (key == 0x2711) {                                  /* [sdk 0x382d50] CreateRandomId */
         uint32_t id = 0;
         HCRYPTPROV prov = 0;
-        if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 4, (BYTE *)&id); CryptReleaseContext(prov, 0); }
+        if (CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) { CryptGenRandom(prov, 4, (uint8_t *)&id); CryptReleaseContext(prov, 0); }
         M32(opt + 0x10) = id; M64(opt + 8) = 4;
         RETI(0); return;
     }

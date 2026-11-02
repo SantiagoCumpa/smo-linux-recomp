@@ -5,8 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <malloc.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -138,7 +137,7 @@ static void tm_store(uint64_t dst, const int32_t tm[9]) {
     wr64(dst + 48, (uint64_t)(uintptr_t)utc);
 }
 static void c_gmtime(Ctx *c) {
-    static __declspec(thread) uint8_t buf[56];
+    static _Thread_local uint8_t buf[56];
     int32_t tm[9];
     if (!libc2_gmtime((int64_t)rd64(A0), tm)) { RET(0); return; }
     tm_store((uint64_t)(uintptr_t)buf, tm);

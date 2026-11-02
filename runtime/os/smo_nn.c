@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "hostrt.h"
 #include "sdklift.h"
 
@@ -33,7 +33,7 @@
 #define HEAP_RESERVE (16ull << 30)             /* address space reserved for the heap: more than the console has */
 #define RESULT_OUT_OF_MEMORY 0x1003u
 
-static SRWLOCK g_heap_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_heap_lock = PLAT_RWLOCK_INIT;
 static HANDLE g_heap_section;                  /* pagefile-backed section the heap is a view of */
 static uint8_t *g_heap;                        /* base, fixed once reserved */
 static uint64_t g_heap_size;                   /* committed size (the heap size the game set) */
@@ -56,13 +56,13 @@ int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint6
 static void os_SetMemoryHeapSize(Ctx *c) {
     uint64_t size = c->x[0];
     uint32_t r = 0;
-    AcquireSRWLockExclusive(&g_heap_lock);
+    plat_rw_wlock(&g_heap_lock);
     if (size % UNIT || size > HEAP_RESERVE) r = RESULT_OUT_OF_MEMORY;
     else {
         if (!g_heap) {
             g_heap_section = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_RESERVE,
-                                                (DWORD)(HEAP_RESERVE >> 32), (DWORD)HEAP_RESERVE, NULL);
-            if (g_heap_section) g_heap = MapViewOfFile(g_heap_section, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T)HEAP_RESERVE);
+                                                (uint32_t)(HEAP_RESERVE >> 32), (uint32_t)HEAP_RESERVE, NULL);
+            if (g_heap_section) g_heap = MapViewOfFile(g_heap_section, FILE_MAP_ALL_ACCESS, 0, 0, (size_t)HEAP_RESERVE);
             if (!g_heap) printf("nn::os::SetMemoryHeapSize: cannot create the heap section (error %lu)\n", GetLastError());
         }
         if (!g_heap) r = RESULT_OUT_OF_MEMORY;
@@ -75,7 +75,7 @@ static void os_SetMemoryHeapSize(Ctx *c) {
         }
         if (!r) g_heap_size = size;
     }
-    ReleaseSRWLockExclusive(&g_heap_lock);
+    plat_rw_wunlock(&g_heap_lock);
     if (!r && g_heap) { void smo_watch_arm(uint8_t *heap, uint64_t heap_size); smo_watch_arm(g_heap, g_heap_size); }      /* hostrt.c, debug aid SMO_WATCH */
     printf("nn::os::SetMemoryHeapSize(0x%llx): %s, heap at %p\n", (unsigned long long)size, r ? "FAILED" : "ok", (void *)g_heap);
     c->x[0] = r;
@@ -85,7 +85,7 @@ static void os_AllocateMemoryBlock(Ctx *c) {
     uint64_t out = c->x[0], size = c->x[1];
     uint64_t n = (size + UNIT - 1) / UNIT, total = g_heap_size / UNIT, run = 0, at = 0;
     int found = 0;
-    AcquireSRWLockExclusive(&g_heap_lock);
+    plat_rw_wlock(&g_heap_lock);
     g_alloc_calls++;
     if (size && size % UNIT == 0)
         for (uint64_t g = 0; g < total; g++) {
@@ -97,7 +97,7 @@ static void os_AllocateMemoryBlock(Ctx *c) {
         uint64_t top = (at + n) * UNIT;
         if (top > g_peak) g_peak = top;
     } else g_alloc_fail++;
-    ReleaseSRWLockExclusive(&g_heap_lock);
+    plat_rw_wunlock(&g_heap_lock);
     if (found) { wr64(out, (uint64_t)(uintptr_t)(g_heap + at * UNIT)); c->x[0] = 0; }
     else {
         printf("nn::os::AllocateMemoryBlock(0x%llx): out of memory (heap 0x%llx)\n", (unsigned long long)size, (unsigned long long)g_heap_size);
@@ -160,12 +160,12 @@ static void vi_SetLayerScalingMode(Ctx *c) { g_layer_scaling_mode = (uint32_t)c-
  * lent buffer meanwhile; SIMPLIFIED). Results: 0, or 0xca01 (os InvalidHandle, NOT VERIFIED) for an unknown handle. */
 #define TM_MAX 64
 static struct { uint64_t addr, size; int used; } g_tm[TM_MAX];
-static SRWLOCK g_tm_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_tm_lock = PLAT_RWLOCK_INIT;
 static void tm_Create(Ctx *c) {                 /* (u32 *handle, void *addr, size_t size, MemoryPermission) */
     int h = -1;
-    AcquireSRWLockExclusive(&g_tm_lock);
+    plat_rw_wlock(&g_tm_lock);
     for (int i = 1; i < TM_MAX; i++) if (!g_tm[i].used) { g_tm[i].used = 1; g_tm[i].addr = c->x[1]; g_tm[i].size = c->x[2]; h = i; break; }
-    ReleaseSRWLockExclusive(&g_tm_lock);
+    plat_rw_wunlock(&g_tm_lock);
     if (h < 0) guest_trap("transfer memory: too many at once (smo_nn.c TM_MAX)", c->x[30] - 4);
     wr32(c->x[0], 0xf000u + (uint32_t)h);
     c->x[0] = 0;
@@ -224,9 +224,9 @@ static void diag_OnAssertionFailure(Ctx *c) {
     fflush(stdout);
     guest_trap("guest called nn::diag::detail::OnAssertionFailure", c->x[30] - 4);
 }
-static volatile LONG g_diag_log_lines;
+static volatile int32_t g_diag_log_lines;
 static void diag_log_line(const char *s, size_t n) {
-    LONG k = InterlockedIncrement(&g_diag_log_lines);
+    int32_t k = plat_inc(&g_diag_log_lines);
     if (k > 500) { if (k == 501) printf("nn::diag log: more lines are not printed\n"); return; }
     while (n && (s[n - 1] == '\n' || s[n - 1] == '\r')) n--;
     printf("nn::diag log: %.*s\n", (int)n, s);
@@ -294,10 +294,10 @@ static void diag_GetAllModuleInfo(Ctx *c) { if (c->x[0]) wr64(c->x[0], 0); c->x[
 
 /* ---- nn::time library state [doc]: IsInitialized() is true between Initialize() and Finalize() (it used to answer
  * false always; sead::DateTime then initializes again, which was harmless). Replaces nnsdk.c's ret0 handlers. */
-static volatile LONG g_time_init;
-static void time_Initialize(Ctx *c) { InterlockedExchange(&g_time_init, 1); c->x[0] = 0; }
+static volatile int32_t g_time_init;
+static void time_Initialize(Ctx *c) { plat_xchg(&g_time_init, 1); c->x[0] = 0; }
 static void time_IsInitialized(Ctx *c) { c->x[0] = g_time_init != 0; }
-static void time_Finalize(Ctx *c) { InterlockedExchange(&g_time_init, 0); c->x[0] = 0; }
+static void time_Finalize(Ctx *c) { plat_xchg(&g_time_init, 0); c->x[0] = 0; }
 
 /* ---- nn::oe [doc]
  *   SetScreenShotImageOrientation(orientation)  the orientation of screenshots taken from now on (0 normal, 1 rotated
@@ -306,9 +306,9 @@ static void time_Finalize(Ctx *c) { InterlockedExchange(&g_time_init, 0); c->x[0
  *   SetUserInactivityDetectionTimeExtended(on) / IsUserInactivityDetectionTimeExtended()  while on, the console waits
  *     much longer before it dims the screen (SMO turns it on for the ending): here the display is kept on meanwhile
  *     (a power request of its own, apart from the auto-sleep sections of nnmisc.c). */
-static volatile LONG g_shot_orientation;
+static volatile int32_t g_shot_orientation;
 int smo_screenshot_orientation(void) { return (int)g_shot_orientation; }
-static void oe_SetScreenShotImageOrientation(Ctx *c) { InterlockedExchange(&g_shot_orientation, (LONG)(c->x[0] & 3)); }
+static void oe_SetScreenShotImageOrientation(Ctx *c) { plat_xchg(&g_shot_orientation, (int32_t)(c->x[0] & 3)); }
 static HANDLE g_inact_req;
 static int g_inact_ext;
 static void oe_SetUserInactivityDetectionTimeExtended(Ctx *c) {
@@ -351,10 +351,10 @@ static void nifm_HandleNetworkRequestResult(Ctx *c) { c->x[0] = 0x17c6e; }
  * is kept for the session. */
 static void oe_HomeButtonBlocking(Ctx *c) { (void)c; }
 static void oe_EnableRecording(Ctx *c) { (void)c; }
-static volatile LONG g_stereo_restricted;
+static volatile int32_t g_stereo_restricted;
 static void pctl_StereoConfigurable(Ctx *c) { c->x[0] = 0; }
 static void pctl_GetStereoVisionRestriction(Ctx *c) { c->x[0] = g_stereo_restricted != 0; }
-static void pctl_SetStereoVisionRestriction(Ctx *c) { InterlockedExchange(&g_stereo_restricted, (LONG)(c->x[0] & 1)); }
+static void pctl_SetStereoVisionRestriction(Ctx *c) { plat_xchg(&g_stereo_restricted, (int32_t)(c->x[0] & 1)); }
 
 static const ImportDef smo_imports[] = {
     {"_ZN2nn4nifm26HandleNetworkRequestResultEv", nifm_HandleNetworkRequestResult},

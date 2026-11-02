@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 #include "nnpad.h"
@@ -25,21 +25,21 @@ enum { BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_STICK_L, BTN_STICK_R, BTN_L, BTN_R, B
 #define STYLE_FULLKEY 1u
 #define STICK_MAX 32767
 
-static volatile LONG64 g_sampling;
+static volatile int64_t g_sampling;
 /* Test aid: SMO_PRESS=<key>,<first second>,<period seconds> holds that key for 0.15 s at each period,
  * whether or not the game window has the focus (e.g. SMO_PRESS=Z,40,3 presses A every 3 s from second 40). */
 static int scripted(int vk) {
     static int parsed, want, first, period;
-    static ULONGLONG start;
+    static uint64_t start;
     if (!parsed) {
         const char *s = getenv("SMO_PRESS");
         char k = 0;
         parsed = 1;
-        start = GetTickCount64();
+        start = plat_ms();
         if (s && sscanf(s, "%c,%d,%d", &k, &first, &period) == 3 && period > 0) want = k == '!' ? VK_RETURN : k;
     }
     if (!want || vk != want) return 0;
-    long long ms = (long long)(GetTickCount64() - start) - first * 1000LL;
+    long long ms = (long long)(plat_ms() - start) - first * 1000LL;
     return ms >= 0 && ms % (period * 1000LL) < 150;
 }
 
@@ -52,7 +52,7 @@ static int scripted(int vk) {
 #define SCRIPT_MAX 256
 static struct { double at, len; char keys[12]; int said; } g_script[SCRIPT_MAX];
 static int g_script_count = -1;
-static ULONGLONG g_script_start;
+static uint64_t g_script_start;
 
 static int script_vk(char k) {
     switch (k) {
@@ -71,7 +71,7 @@ static int script_key(int vk) {
     if (g_script_count < 0) {
         const char *s = getenv("SMO_SCRIPT");
         g_script_count = 0;
-        g_script_start = GetTickCount64();
+        g_script_start = plat_ms();
         while (s && *s && g_script_count < SCRIPT_MAX) {
             double at = 0, len = 0.15;
             char keys[12] = "";
@@ -84,7 +84,7 @@ static int script_key(int vk) {
         }
         if (g_script_count) printf("input script: %d steps\n", g_script_count);
     }
-    double t = (double)(GetTickCount64() - g_script_start) / 1000.0;
+    double t = (double)(plat_ms() - g_script_start) / 1000.0;
     for (int i = 0; i < g_script_count; i++) {
         if (t < g_script[i].at || t >= g_script[i].at + g_script[i].len) continue;
         if (!g_script[i].said) { g_script[i].said = 1; printf("input script: t=%.1f s keys %s\n", t, g_script[i].keys); }
@@ -136,18 +136,18 @@ static float g_steer_x, g_steer_y;
 static int g_jump_left, g_jump_cool;                      /* SEQ_GOTO stuck rule: A held while g_jump_left > 0 */
 static int g_seq_count = -1, g_seq_index, g_seq_left, g_seq_holding, g_seq_run;
 static char g_marks[MARK_MAX][40];
-static volatile LONG g_mark_count, g_frame_draws_seen = -1;
-static LONG64 g_seq_polls;
+static volatile int32_t g_mark_count, g_frame_draws_seen = -1;
+static int64_t g_seq_polls;
 
 void input_mark(const char *what) {                       /* any thread: something the sequence can wait for has happened */
-    LONG i = InterlockedIncrement(&g_mark_count) - 1;
-    if (i < MARK_MAX) { strncpy(g_marks[i], what, sizeof g_marks[i] - 1); MemoryBarrier(); }
+    int32_t i = plat_inc(&g_mark_count) - 1;
+    if (i < MARK_MAX) { strncpy(g_marks[i], what, sizeof g_marks[i] - 1); plat_fence(); }
 }
 void input_frame_draws(int draws) { g_frame_draws_seen = draws; }       /* nvn_gl.c, once per presented frame */
 
 static int mark_seen(const char *what) {
-    LONG n = g_mark_count;
-    for (LONG i = 0; i < n && i < MARK_MAX; i++) if (!strcmp(g_marks[i], what)) return 1;
+    int32_t n = g_mark_count;
+    for (int32_t i = 0; i < n && i < MARK_MAX; i++) if (!strcmp(g_marks[i], what)) return 1;
     return 0;
 }
 
@@ -389,7 +389,7 @@ static void seq_tick(void) {                              /* once per poll of pl
         return;
     }
     if (g_seq[g_seq_index].kind == SEQ_UNTIL) {
-        LONG d = g_frame_draws_seen;
+        int32_t d = g_frame_draws_seen;
         static int since;                                 /* polls since this step's last press began */
         if (g_seq_run == 0 && !g_seq_holding && g_seq_left == g_seq[g_seq_index].wait) since = g_seq[g_seq_index].wait;      /* step just began: press at once */
         g_seq_left = 0;
@@ -408,7 +408,7 @@ static void seq_tick(void) {                              /* once per poll of pl
         return;
     }
     if (g_seq[g_seq_index].kind == SEQ_DRAWS) {
-        LONG d = g_frame_draws_seen;
+        int32_t d = g_frame_draws_seen;
         g_seq_run = d >= g_seq[g_seq_index].lo && d <= g_seq[g_seq_index].hi ? g_seq_run + 1 : 0;
         if (g_seq_run >= g_seq[g_seq_index].need) {
             printf("input sequence: poll %lld step %d: %d..%d draws per frame for %d polls (now %ld)\n", (long long)g_seq_polls, g_seq_index, g_seq[g_seq_index].lo, g_seq[g_seq_index].hi, g_seq[g_seq_index].need, d);
@@ -441,15 +441,15 @@ static int seq_key(int vk) {
  * is set, so a scripted run is not disturbed by a person at the machine. */
 static int keyboard_ours(void) {
     static int mode = -1;
-    static LONG64 checked_at = -1;
+    static int64_t checked_at = -1;
     static int ours;
     if (mode < 0) mode = (getenv("SMO_SEQ") || getenv("SMO_PLAY")) && !getenv("SMO_SEQ_KEYBOARD") ? 0 : 1;
     if (!mode) return 0;
     if (checked_at != g_sampling) {                       /* once per poll */
-        DWORD pid = 0;
+        uint32_t pid = 0;
         HWND fg = GetForegroundWindow();
         checked_at = g_sampling;
-        ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+        ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid();
     }
     return ours;
 }
@@ -569,14 +569,14 @@ static void record_or_replay(uint64_t *buttons, int *lx, int *ly) {
  * from the service (anything else aborts) and 604 = 0x4b8ca is "no controller of that kind"; handles are
  * style index | npad id << 8 | device index << 16 (GetVibrationDeviceHandles / GetSixAxisSensorHandles run as
  * lifted SDK code). */
-typedef struct { WORD buttons; BYTE lt, rt; SHORT lx, ly, rx, ry; } XGamepad;
-typedef struct { DWORD packet; XGamepad pad; } XState;
-typedef struct { WORD left, right; } XVibration;
-typedef struct { BYTE type, subtype; WORD flags; XGamepad pad; XVibration vib; } XCaps;
-static DWORD (WINAPI *x_get_state)(DWORD, XState *);
-static DWORD (WINAPI *x_set_state)(DWORD, XVibration *);
-static DWORD (WINAPI *x_get_caps)(DWORD, DWORD, XCaps *);
-static struct { int present, wireless; ULONGLONG checked, read; XState st; XVibration sent; } g_x[4];
+typedef struct { uint16_t buttons; uint8_t lt, rt; SHORT lx, ly, rx, ry; } XGamepad;
+typedef struct { uint32_t packet; XGamepad pad; } XState;
+typedef struct { uint16_t left, right; } XVibration;
+typedef struct { uint8_t type, subtype; uint16_t flags; XGamepad pad; XVibration vib; } XCaps;
+static uint32_t (*x_get_state)(uint32_t, XState *);
+static uint32_t (*x_set_state)(uint32_t, XVibration *);
+static uint32_t (*x_get_caps)(uint32_t, uint32_t, XCaps *);
+static struct { int present, wireless; uint64_t checked, read; XState st; XVibration sent; } g_x[4];
 static int g_source[8] = {0, 1, 2, 3, -1, -1, -1, -1};      /* XInput slot of each player, -1 = none */
 static int g_keyboard_player = -1;                           /* 0-based, -1 = nobody */
 static uint32_t g_supported_styles = 0xffffffffu;            /* until SetSupportedNpadStyleSet */
@@ -601,11 +601,11 @@ static const float g_vib_default[4] = {0.0f, 160.0f, 0.0f, 320.0f};
 static int g_x_synth;                                         /* 1 = SMO_XINPUT_SYNTH run, 2 = self-test */
 static int sdl_on(void) { return g_sdl_pad && !g_x_synth; }
 static struct { XState st; int connected, wireless; long long gets, sets; XVibration last, max; } g_xs[4];
-static DWORD WINAPI synth_get_state(DWORD slot, XState *out) {
+static uint32_t synth_get_state(uint32_t slot, XState *out) {
     if (slot > 3) return 1167;
     g_xs[slot].gets++;
     if (g_x_synth == 1 && slot == 0) {
-        static const struct { int vk; WORD x; } m[] = {
+        static const struct { int vk; uint16_t x; } m[] = {
             {'Z', 0x2000}, {'X', 0x1000}, {'C', 0x8000}, {'V', 0x4000}, {'Q', 0x0100}, {'E', 0x0200}, {VK_RETURN, 0x0010}, {VK_BACK, 0x0020},
             {'I', 0x0001}, {'K', 0x0002}, {'J', 0x0004}, {'L', 0x0008},
         };
@@ -623,7 +623,7 @@ static DWORD WINAPI synth_get_state(DWORD slot, XState *out) {
     *out = g_xs[slot].st;
     return 0;
 }
-static DWORD WINAPI synth_set_state(DWORD slot, XVibration *v) {
+static uint32_t synth_set_state(uint32_t slot, XVibration *v) {
     if (slot > 3 || !g_xs[slot].connected) return 1167;
     g_xs[slot].sets++;
     g_xs[slot].last = *v;
@@ -631,12 +631,12 @@ static DWORD WINAPI synth_set_state(DWORD slot, XVibration *v) {
     if (v->right > g_xs[slot].max.right) g_xs[slot].max.right = v->right;
     return 0;
 }
-static DWORD WINAPI synth_get_caps(DWORD slot, DWORD flags, XCaps *out) {
+static uint32_t synth_get_caps(uint32_t slot, uint32_t flags, XCaps *out) {
     (void)flags;
     if (slot > 3 || !g_xs[slot].connected) return 1167;
     memset(out, 0, sizeof *out);
     out->type = 1; out->subtype = 1;                          /* XINPUT_DEVTYPE_GAMEPAD, XINPUT_DEVSUBTYPE_GAMEPAD */
-    out->flags = (WORD)(g_xs[slot].wireless ? 0x0002 : 0);    /* XINPUT_CAPS_WIRELESS */
+    out->flags = (uint16_t)(g_xs[slot].wireless ? 0x0002 : 0);    /* XINPUT_CAPS_WIRELESS */
     return 0;
 }
 void hid_report(FILE *out) {
@@ -667,7 +667,7 @@ static void hid_setup(void) {
     g_keyboard_player = k >= 1 && k <= 8 ? k - 1 : -1;
     g_label_layout = layout && !strcmp(layout, "label");
     /* default backend = SDL3 (nnpad_sdl.c, controllers.ini); SMO_PAD_BACKEND=xinput keeps the older XInput path below, and is the fallback if SDL cannot start */
-    if (!g_x_synth && !(backend && !_stricmp(backend, "xinput"))) {
+    if (!g_x_synth && !(backend && !strcasecmp(backend, "xinput"))) {
         g_sdl_pad = nnpad_init();
         if (g_sdl_pad) { g_keyboard_player = nnpad_keyboard_player(); printf("nn::hid: pads through SDL3; keyboard = player %d\n", g_keyboard_player + 1); return; }
         printf("nn::hid: SDL could not start, falling back to XInput\n");
@@ -681,19 +681,19 @@ static int devices_live(void) { return g_x_synth || g_pad_test || keyboard_ours(
 /* A disconnected XInput slot is expensive to ask, so it is probed once a second; a connected one at most once per ms. */
 static int x_present(int slot) {
     if (slot < 0 || slot > 3 || !x_get_state) return 0;
-    ULONGLONG now = GetTickCount64();
+    uint64_t now = plat_ms();
     if (g_x[slot].present) {
         if (now != g_x[slot].read) {
             g_x[slot].read = now;
-            if (x_get_state((DWORD)slot, &g_x[slot].st) != 0) { g_x[slot].present = 0; g_x[slot].checked = now; printf("nn::hid: pad %d disconnected\n", slot + 1); }
+            if (x_get_state((uint32_t)slot, &g_x[slot].st) != 0) { g_x[slot].present = 0; g_x[slot].checked = now; printf("nn::hid: pad %d disconnected\n", slot + 1); }
         }
     } else if (!g_x[slot].checked || now - g_x[slot].checked >= 1000) {
         g_x[slot].checked = now;
-        if (x_get_state((DWORD)slot, &g_x[slot].st) == 0) {
+        if (x_get_state((uint32_t)slot, &g_x[slot].st) == 0) {
             XCaps caps;
             memset(&caps, 0, sizeof caps);
             g_x[slot].present = 1; g_x[slot].read = now;
-            g_x[slot].wireless = x_get_caps && x_get_caps((DWORD)slot, 0, &caps) == 0 && (caps.flags & 0x0002);
+            g_x[slot].wireless = x_get_caps && x_get_caps((uint32_t)slot, 0, &caps) == 0 && (caps.flags & 0x0002);
             memset(&g_x[slot].sent, 0, sizeof g_x[slot].sent);
             printf("nn::hid: pad %d connected (%s)\n", slot + 1, g_x[slot].wireless ? "wireless" : "wired");
         }
@@ -735,7 +735,7 @@ static const struct { int vk, bit; } g_keymap[] = {
     {VK_RETURN, BTN_PLUS}, {VK_BACK, BTN_MINUS}, {'J', BTN_LEFT}, {'I', BTN_UP}, {'L', BTN_RIGHT}, {'K', BTN_DOWN},
     {0, BTN_STICK_L}, {0, BTN_STICK_R},                      /* no fixed key for the test scripts; bindable keys only */
 };
-static const struct { WORD x; int pos, label; } g_xmap[] = {
+static const struct { uint16_t x; int pos, label; } g_xmap[] = {
     {0x1000, BTN_B, BTN_A}, {0x2000, BTN_A, BTN_B}, {0x4000, BTN_Y, BTN_X}, {0x8000, BTN_X, BTN_Y},
     {0x0100, BTN_L, BTN_L}, {0x0200, BTN_R, BTN_R}, {0x0010, BTN_PLUS, BTN_PLUS}, {0x0020, BTN_MINUS, BTN_MINUS},
     {0x0040, BTN_STICK_L, BTN_STICK_L}, {0x0080, BTN_STICK_R, BTN_STICK_R},
@@ -757,7 +757,7 @@ long nfp_amiibo_reads(void);                                  /* nnapplet.c */
 long long nerve_watch_last(void);                             /* smo_nerve.c */
 static uint64_t g_menu_last[8], g_menu_mask[8];
 static int g_menu_last_stick[8], g_menu_stick[8];
-static volatile LONG64 g_hold_after = -1;                     /* frame the menu closed after putting an amiibo on the reader, -1 = nothing to do */
+static volatile int64_t g_hold_after = -1;                     /* frame the menu closed after putting an amiibo on the reader, -1 = nothing to do */
 static long g_hold_reads;
 static long long g_hold_start, g_hold_read_at;
 static int g_hold_on;
@@ -793,7 +793,7 @@ void hid_amiibo_hold_after(long long frame, long reads) { g_hold_reads = reads; 
 
 static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     memset((void *)(uintptr_t)out, 0, 0x28);
-    wr64(out, (uint64_t)InterlockedIncrement64(&g_sampling));
+    wr64(out, (uint64_t)plat_inc(&g_sampling));
     if (id > 7 || !style_is_fullkey) return;                  /* every controller here is a full-key (Pro) controller */
     if (id == 0) seq_tick();                                  /* the input sequence advances one step per poll of player 1 */
     if (id == 0) { static int was; int on = scripted(VK_AMIIBO_MENU) || script_key(VK_AMIIBO_MENU) || seq_key(VK_AMIIBO_MENU); if (on && !was) amiibo_menu_request(); was = on; }
@@ -906,9 +906,9 @@ void hid_menu_closed(void) { for (int i = 0; i < 8; i++) { g_menu_mask[i] = g_me
  * this process has the foreground window (as keyboard_ours, checked here every call: the game does not poll meanwhile) */
 int hid_menu_key(int which) {
     static int was[2];
-    DWORD pid = 0;
+    uint32_t pid = 0;
     HWND fg = GetForegroundWindow();
-    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId() && !scripted_run();
+    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid() && !scripted_run();
     int on = ours && (GetAsyncKeyState(which ? VK_RETURN : VK_ESCAPE) & 0x8000) != 0, hit = on && !was[which & 1];
     was[which & 1] = on;
     return hit;
@@ -977,7 +977,7 @@ static void hid_GetNpadStates_JoyRight(Ctx *c) { npad_states(c, 4); }
 /* TouchScreenState<1> = sampling number, count, reserved, one TouchState (0x28): 0x38 bytes. Docked: no touches. */
 static void hid_GetTouchScreenState1(Ctx *c) {
     memset((void *)(uintptr_t)A0, 0, 0x38);
-    wr64(A0, (uint64_t)InterlockedIncrement64(&g_sampling));
+    wr64(A0, (uint64_t)plat_inc(&g_sampling));
 }
 /* ShowControllerSupport(ControllerSupportResultInfo *out {int playerCount; NpadIdType selectedId}, const
  * ControllerSupportArg &{u8 playerCountMin, playerCountMax, ...}) -> Result. al::tryCallControllerApplet (main 0x859fd8)
@@ -1037,7 +1037,7 @@ static void hid_InitializeTouchScreen(Ctx *c) { (void)c; g_touch_ready = 1; }
  * acceleration (0, 0, -1), no angular velocity, no angle, identity direction, attribute 1 (connected).
  * StartSixAxisSensor sets the per-controller "sensor enabled" flag; an invalid handle is an error.
  * Hardware limit: XInput delivers no motion, so the record stays the one at rest. */
-static struct { int ever, connected, started; ULONGLONG since; int64_t base, last; } g_six[8];
+static struct { int ever, connected, started; uint64_t since; int64_t base, last; } g_six[8];
 static void hid_GetSixAxisSensorState(Ctx *c) {             /* (SixAxisSensorState *out, const SixAxisSensorHandle &) */
     uint64_t o = A0;
     uint32_t handle = rd32(A1), kind = handle & 0xff, id = (handle >> 8) & 0xff;
@@ -1045,7 +1045,7 @@ static void hid_GetSixAxisSensorState(Ctx *c) {             /* (SixAxisSensorSta
     hid_setup();
     if ((kind != 3 && kind != 8) || id > 7) return;          /* rings that no controller of the runtime ever writes */
     if (player_connected(id)) {
-        ULONGLONG now = GetTickCount64();
+        uint64_t now = plat_ms();
         if (!g_six[id].connected) { g_six[id].connected = 1; g_six[id].since = now; g_six[id].base = g_six[id].last; }
         g_six[id].last = g_six[id].base + 1 + (int64_t)((now - g_six[id].since) / 5);
         g_six[id].ever = 1;
@@ -1146,11 +1146,11 @@ static void vib_apply(uint32_t id) {
     for (int d = 0; d < 2; d++) if (g_vib[id][d].set) { if (g_vib[id][d].v[0] > low) low = g_vib[id][d].v[0]; if (g_vib[id][d].v[2] > high) high = g_vib[id][d].v[2]; }
     if (!devices_live()) low = high = 0;                    /* no rumble for a window in the background */
     XVibration v;
-    v.left = (WORD)(low >= 1.0f ? 65535 : low <= 0 ? 0 : (int)(low * 65535.0f));
-    v.right = (WORD)(high >= 1.0f ? 65535 : high <= 0 ? 0 : (int)(high * 65535.0f));
+    v.left = (uint16_t)(low >= 1.0f ? 65535 : low <= 0 ? 0 : (int)(low * 65535.0f));
+    v.right = (uint16_t)(high >= 1.0f ? 65535 : high <= 0 ? 0 : (int)(high * 65535.0f));
     if (v.left == g_x[slot].sent.left && v.right == g_x[slot].sent.right) return;
     g_x[slot].sent = v;
-    x_set_state((DWORD)slot, &v);
+    x_set_state((uint32_t)slot, &v);
 }
 static void hid_InitializeVibrationDevice(Ctx *c) {         /* (const VibrationDeviceHandle &) */
     uint32_t id, dev;
@@ -1225,9 +1225,9 @@ static void xt_poll(Ctx *c) {
     xt_attr = rd32((uint64_t)(uintptr_t)st + 0x20);
 }
 int nnhid_selftest_xinput(Ctx *c) {
-    DWORD (WINAPI *save_get)(DWORD, XState *) = x_get_state;
-    DWORD (WINAPI *save_set)(DWORD, XVibration *) = x_set_state;
-    DWORD (WINAPI *save_caps)(DWORD, DWORD, XCaps *) = x_get_caps;
+    uint32_t (*save_get)(uint32_t, XState *) = x_get_state;
+    uint32_t (*save_set)(uint32_t, XVibration *) = x_set_state;
+    uint32_t (*save_caps)(uint32_t, uint32_t, XCaps *) = x_get_caps;
     int save_synth = g_x_synth, save_layout = g_label_layout, save_ready = g_hid_ready, save_count = g_supported_id_count, bad = 0, ok;
     uint32_t save_styles = g_supported_styles;
     uint64_t lr = c->x[30];
@@ -1254,7 +1254,7 @@ int nnhid_selftest_xinput(Ctx *c) {
     printf("  hid/XInput: connect (wired: attribute 3), unplug (style 0), reconnect wireless (attribute 1), wired again: %s\n", ok ? "ok" : "FAILED"); bad += !ok;
 
     /* 3. the 14 digital buttons, by position and by label */
-    static const struct { WORD x; int pos, label; const char *name; } t[] = {
+    static const struct { uint16_t x; int pos, label; const char *name; } t[] = {
         {0x1000, BTN_B, BTN_A, "A"}, {0x2000, BTN_A, BTN_B, "B"}, {0x4000, BTN_Y, BTN_X, "X"}, {0x8000, BTN_X, BTN_Y, "Y"},
         {0x0100, BTN_L, BTN_L, "LB"}, {0x0200, BTN_R, BTN_R, "RB"}, {0x0010, BTN_PLUS, BTN_PLUS, "Start"}, {0x0020, BTN_MINUS, BTN_MINUS, "Back"},
         {0x0040, BTN_STICK_L, BTN_STICK_L, "LS"}, {0x0080, BTN_STICK_R, BTN_STICK_R, "RS"},

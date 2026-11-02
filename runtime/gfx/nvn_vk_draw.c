@@ -68,7 +68,7 @@ static const void *vk_vp_next(void) {
     return (m >> 8) == 0 && D.has_dcc ? &dcc : NULL;
 }
 static void vkd_fail(const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt); printf("nvn_vk: FATAL: "); vprintf(fmt, ap); printf("\n"); va_end(ap); fflush(stdout); ExitProcess(6);
+    va_list ap; va_start(ap, fmt); printf("nvn_vk: FATAL: "); vprintf(fmt, ap); printf("\n"); va_end(ap); fflush(stdout); plat_exit(6);
 }
 #define DBG_ASSERT(c, ...) do { if (D.debug && !(c)) vkd_fail(__VA_ARGS__); } while (0)
 /* the pipeline-library mode. SMO_VK_GPL wins (0 = whole pipelines, without libraries; 1 = a library per
@@ -138,7 +138,7 @@ typedef struct { int block; uint64_t off, size; void *map; VkDeviceMemory mem; }
 typedef struct { VkDeviceMemory mem; uint64_t size; void *map; uint32_t type; int cls, nfree, used; struct { uint64_t off, size; } fr[512]; } VBlock;
 static VBlock *g_blk[2048];
 static int g_nblk;
-static LONG64 g_mem_total, g_mem_leak;
+static int64_t g_mem_total, g_mem_leak;
 static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
     VMem m = {-1, 0, 0, NULL, NULL};
     uint32_t type = 32;
@@ -182,7 +182,7 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
         }
         k->nfree = 1; k->fr[0].off = 0; k->fr[0].size = k->size;
         g_blk[b] = k; if (b == g_nblk) g_nblk++;
-        g_mem_total += (LONG64)k->size;
+        g_mem_total += (int64_t)k->size;
         cls = k->cls;
     }
     vkd_fail("allocation of %llu bytes failed in a fresh block", (unsigned long long)rq.size);
@@ -191,12 +191,12 @@ static VMem vmem_alloc(VkMemoryRequirements rq, VkFlags want, int cls) {
 static void vmem_free(VMem m) {
     if (m.block < 0) return;
     VBlock *k = g_blk[m.block];
-    if (--k->used == 0 && k->cls >= 100) { vkFreeMemory(V.device, k->mem, NULL); g_mem_total -= (LONG64)k->size; free(k); g_blk[m.block] = NULL; return; }
+    if (--k->used == 0 && k->cls >= 100) { vkFreeMemory(V.device, k->mem, NULL); g_mem_total -= (int64_t)k->size; free(k); g_blk[m.block] = NULL; return; }
     int i = 0;
     while (i < k->nfree && k->fr[i].off < m.off) i++;
     if (i > 0 && k->fr[i - 1].off + k->fr[i - 1].size == m.off) { k->fr[i - 1].size += m.size; if (i < k->nfree && k->fr[i].off == m.off + m.size) { k->fr[i - 1].size += k->fr[i].size; memmove(&k->fr[i], &k->fr[i + 1], sizeof k->fr[0] * (size_t)(k->nfree - i - 1)); k->nfree--; } return; }
     if (i < k->nfree && k->fr[i].off == m.off + m.size) { k->fr[i].off = m.off; k->fr[i].size += m.size; return; }
-    if (k->nfree == 512) { g_mem_leak += (LONG64)m.size; return; }
+    if (k->nfree == 512) { g_mem_leak += (int64_t)m.size; return; }
     memmove(&k->fr[i + 1], &k->fr[i], sizeof k->fr[0] * (size_t)(k->nfree - i)); k->nfree++;
     k->fr[i].off = m.off; k->fr[i].size = m.size;
 }
@@ -214,7 +214,7 @@ static VkBuffer vbuf_new(uint64_t size, VkFlags usage, VMem *mem) {
 
 /* ---------------------------------------------------------------- command buffers in flight */
 #define NSLOT 8
-typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; LONG64 ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted */
+typedef struct { VkCommandBuffer cmd; VkFence fence; VkDescriptorPool pool[16]; int npool, ipool, pending; uint64_t serial; int64_t ts_frame; uint64_t rlap0, rpos0, rlap1, rpos1; } Slot;      /* rlap/rpos: the stream ring (lap, position) when it was begun and submitted */
 typedef struct VTex VTex;
 static struct {
     Slot slot[NSLOT]; int cur, recording; uint64_t serial, done;      /* serial: number of the last submission; done: every submission up to here has finished */
@@ -244,9 +244,9 @@ static struct {
     int64_t row_stride, image_stride;
     int dyn_dirty, vi_dirty, dyn3_dirty, dyn3_samples;      /* dyn3: the extended-dynamic-state-3 group (blend, masks, polygon mode, multisample) */
     void *pipe_bound;
-    LONG64 frame_draws, frame_skipped, frame_clears, pipelines, modules, uploads, upload_bytes, images, images_live, views, ring_wraps, feedback, flushes, sets;
-    LONG64 sets_reused, tset_collisions, dummy_kind;
-    LONG64 dispatches, cb_bytes, cb_syncs, cb_draws, cb_made, cb_waits, cb_wait_ticks, cb_guest_words, cb_conflict_words, readbacks;
+    int64_t frame_draws, frame_skipped, frame_clears, pipelines, modules, uploads, upload_bytes, images, images_live, views, ring_wraps, feedback, flushes, sets;
+    int64_t sets_reused, tset_collisions, dummy_kind;
+    int64_t dispatches, cb_bytes, cb_syncs, cb_draws, cb_made, cb_waits, cb_wait_ticks, cb_guest_words, cb_conflict_words, readbacks;
 } R;
 
 static void pass_shot(void);
@@ -254,13 +254,13 @@ static int g_dyn_inval = 1;                        /* set_dynamic_state's record
 /* debug aid SMO_VK_FRAMELOG=<first>-<last>: one line per frame of that range: draws, draws left out (and how many of
  * them because rendering was switched off), conditional render switches (and how many switched rendering off), render
  * passes, and a hash of the conditional results in order, to find frames that differ from their neighbours. */
-static LONG64 g_fr_cond, g_fr_condoff, g_fr_offskip, g_fr_passes, g_fr_texbar, g_fr_wraps, g_fr_ring0;
+static int64_t g_fr_cond, g_fr_condoff, g_fr_offskip, g_fr_passes, g_fr_texbar, g_fr_wraps, g_fr_ring0;
 static uint64_t g_fr_condhash = 1469598103934665603ull;
 /* Frames of the test switches: "<frame>" or "<first>-<last>[/<every>]", several separated by commas. Written with p
  * (p90, p1-p200) they count from the first play frame, known once that frame is presented (p1 is the one after it), so
  * that runs whose loading took different times are looked at in the same moment of play. */
-static LONG64 g_first_play;                        /* the first play frame (vk_present2); 0 before it */
-typedef struct { int n; struct { LONG64 lo, hi; int every, rel; } r[32]; } FrameRanges;
+static int64_t g_first_play;                        /* the first play frame (vk_present2); 0 before it */
+typedef struct { int n; struct { int64_t lo, hi; int every, rel; } r[32]; } FrameRanges;
 static void frame_ranges_parse(FrameRanges *fr, const char *p) {
     fr->n = 0;
     while (p && *p && fr->n < 32) {
@@ -281,10 +281,10 @@ static void frame_ranges_parse(FrameRanges *fr, const char *p) {
         if (*p == ',') p++;
     }
 }
-static int frame_ranges_has(const FrameRanges *fr, LONG64 frame) {
+static int frame_ranges_has(const FrameRanges *fr, int64_t frame) {
     for (int i = 0; i < fr->n; i++) {
         if (fr->r[i].rel && !g_first_play) continue;
-        LONG64 lo = fr->r[i].lo + (fr->r[i].rel ? g_first_play : 0), hi = fr->r[i].hi + (fr->r[i].rel ? g_first_play : 0);
+        int64_t lo = fr->r[i].lo + (fr->r[i].rel ? g_first_play : 0), hi = fr->r[i].hi + (fr->r[i].rel ? g_first_play : 0);
         if (frame >= lo && frame <= hi && (frame - lo) % fr->r[i].every == 0) return 1;
     }
     return 0;
@@ -325,7 +325,7 @@ static int passshot_drawlog(void) {
  * as before; SMO_VK_OCC_PRESENT=0 does not wait at the present. */
 #define OCC_MAX 65536
 #define OCC_Q 4096
-typedef struct { uint64_t lo, hi, dst, serial, caller; LONG64 frame; int kind, log; } OccEntry;     /* segments [lo, hi); kind 0 report (to dst), 1 reset (the segments are dropped), 2 fold (added up, nothing written); caller: the game's call site of the report */
+typedef struct { uint64_t lo, hi, dst, serial, caller; int64_t frame; int kind, log; } OccEntry;     /* segments [lo, hi); kind 0 report (to dst), 1 reset (the segments are dropped), 2 fold (added up, nothing written); caller: the game's call site of the report */
 static VkQueryPool g_occ_pool;
 static int g_occ_on, g_occ_open;                   /* counting; a segment is open */
 static uint64_t g_occ_head, g_occ_tail, g_occ_mark, g_occ_seg_serial;   /* next segment; oldest segment in use; first segment of no entry yet; submission of the newest segment */
@@ -333,17 +333,17 @@ static OccEntry g_occ_q[OCC_Q];
 static int g_occ_qh, g_occ_qn;                     /* oldest entry, entries queued */
 static uint64_t g_occ_total;                       /* samples of the count the resolved entries belong to */
 static int g_occ_sync = -1, g_occ_present = -1;
-static LONG64 g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_cond_late, g_occ_present_waits, g_occ_late;
+static int64_t g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_cond_late, g_occ_present_waits, g_occ_late;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
 static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
-static LONG64 g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
-static LONG64 tk(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
+static int64_t g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
+static int64_t tk(void) { plat_counter t; plat_qpc(&t); return t.QuadPart; }
 /* report timestamps, the clock nvn_gl.c's now_ns uses (performance counter in nanoseconds) */
 static uint64_t vk_now_ns(void) {
-    static LARGE_INTEGER f;
-    LARGE_INTEGER t;
-    if (!f.QuadPart) QueryPerformanceFrequency(&f);
-    QueryPerformanceCounter(&t);
+    static plat_counter f;
+    plat_counter t;
+    if (!f.QuadPart) plat_qpf(&f);
+    plat_qpc(&t);
     return (uint64_t)(t.QuadPart / f.QuadPart) * 1000000000ull + (uint64_t)(t.QuadPart % f.QuadPart) * 1000000000ull / (uint64_t)f.QuadPart;
 }
 /* SMO_VK_GPUTIME=1: two timestamp queries per command buffer (written at its first and after its last command),
@@ -352,17 +352,17 @@ static uint64_t vk_now_ns(void) {
 static int g_ts_on = -1;
 static VkQueryPool g_ts_pool;
 static double g_ts_ns;
-static LONG64 g_ts_n;
+static int64_t g_ts_n;
 /* the same per FRAME (the frame a buffer was recorded for), with the time between two presents and whether the frame
  * was a play frame (compute dispatches and more than 120 draws): median / p99 of the play frames at exit ("nvn_vk_gpu_play:"). */
 #define FRSTAT_N 40000
 static float g_fr_gpu[FRSTAT_N], g_fr_wall[FRSTAT_N];
 static uint8_t g_fr_play[FRSTAT_N];
-static LONG64 g_cur_frame, g_play_frames, g_scene_frames, g_frames_counted;      /* frames: play frames, frames with compute dispatches, all ("nvn_vk_frames:") */
+static int64_t g_cur_frame, g_play_frames, g_scene_frames, g_frames_counted;      /* frames: play frames, frames with compute dispatches, all ("nvn_vk_frames:") */
 void nvn_tl(int ev, int arg);                     /* nvn_gl.c: SMO_FRAMETL (13/14: a wait for the GPU begins / ends) */
 static void slot_wait(Slot *s) {
     if (!s->pending) return;
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     nvn_tl(13, (int)(s - R.slot));
     VkResult r = vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, 20000000000ull);
     nvn_tl(14, (int)(s - R.slot));
@@ -381,7 +381,7 @@ static uint32_t g_tset_gen = 1;                   /* texture descriptor sets liv
 static int g_tset_used, g_tset_list_used;
 /* the texture sets kept across command buffers (tc_get): pools, sets allocated, written again for another list, lists it could not take */
 static int g_tc_npool;
-static LONG64 g_tc_made, g_tc_rewritten, g_tc_busy;
+static int64_t g_tc_made, g_tc_rewritten, g_tc_busy;
 static int tc_on(void) { static int on = -1; if (on < 0) on = !(getenv("SMO_VK_TSET_CACHE") && !atoi(getenv("SMO_VK_TSET_CACHE"))); return on; }
 static void cmd_begin(void) {
     if (R.recording) return;
@@ -436,7 +436,7 @@ static void cb_ring_wrap(void);
  * until the copy-back reads them (cb_land, at the next batch at the latest), long before the ring comes round to them
  * again. SMO_VK_RING_DRAIN=1: wait for everything at a wrap, as before. */
 static int g_ring_drain = -1;
-static LONG64 g_ring_waits, g_ring_bytes;
+static int64_t g_ring_waits, g_ring_bytes;
 /* The range caches (the ring's copies of guest ranges, the largest index of an index range) hold for one generation,
  * R.gen: a new batch starts one (the game writes its memory between batches), and so does a ring wrap. The host's own
  * writes into guest memory during a batch (UpdateUniformBuffer, reports and timestamps, occlusion results, buffer copies
@@ -449,7 +449,7 @@ static LONG64 g_ring_waits, g_ring_bytes;
  * 8 write log full). A logged write over the index range of a draw used to start one too (index_max kept its cache by
  * generation only); index_max now checks the log from where it last checked its entry, as ring_put does. */
 enum { GEN_BATCH, GEN_WRAP, GEN_CB, GEN_OCC, GEN_UBO, GEN_REPORT, GEN_BUF, GEN_TEXBUF, GEN_LOGFULL, GEN_N };
-static LONG64 g_gen_why[GEN_N], g_wlog_why[GEN_N];
+static int64_t g_gen_why[GEN_N], g_wlog_why[GEN_N];
 #define WLOG_N 1024
 static struct { uint64_t lo, hi; } g_wlog[WLOG_N];
 static uint32_t g_wlog_n;                          /* host writes logged in this generation */
@@ -464,9 +464,9 @@ static int wlog_overlap(uint32_t from, uint64_t lo, uint64_t hi) {      /* a wri
     for (uint32_t w = from; w < g_wlog_n; w++) if (g_wlog[w].lo < hi && lo < g_wlog[w].hi) return 1;
     return 0;
 }
-static LONG64 g_rput_calls, g_rput_hits, g_rput_again, g_rput_again_bytes;
+static int64_t g_rput_calls, g_rput_hits, g_rput_again, g_rput_again_bytes;
 static int g_rp_kind = 4;                         /* what ring_put copies: 0 uniform, 1 storage, 2 vertex, 3 index, 4 other (the "nvn_vk_ring_kinds:" line) */
-static LONG64 g_rp_kind_bytes[8];      /* ring_put: calls, cache hits, copies of a range already copied in this batch */
+static int64_t g_rp_kind_bytes[8];      /* ring_put: calls, cache hits, copies of a range already copied in this batch */
 static uint32_t g_batch_no;
 static void ring_reuse(uint64_t lo, uint64_t hi) {   /* [lo, hi) of this lap is about to be written: whoever read it in the lap before has finished */
     for (int i = 0; i < NSLOT; i++) {
@@ -489,7 +489,7 @@ static uint64_t ring_raw(const void *p, uint64_t n) {
     if (!g_ring_drain && R.ring_lap) ring_reuse(R.ring_pos, R.ring_pos + n);
     uint64_t off = R.ring_pos;
     if (p) memcpy((uint8_t *)R.ring_mem.map + off, p, (size_t)n);
-    R.ring_pos += n; g_ring_bytes += (LONG64)n;
+    R.ring_pos += n; g_ring_bytes += (int64_t)n;
     return off;
 }
 static uint64_t ring_put(uint64_t addr, uint64_t size) {
@@ -504,9 +504,9 @@ static uint64_t ring_put(uint64_t addr, uint64_t size) {
         if (R.acache[i].gen != R.gen) { h = i; break; }
     }
     h &= 8191;
-    if (R.acache[h].addr == addr && R.acache[h].size == size && R.acache[h].batch == g_batch_no) { g_rput_again++; g_rput_again_bytes += (LONG64)size; }
+    if (R.acache[h].addr == addr && R.acache[h].size == size && R.acache[h].batch == g_batch_no) { g_rput_again++; g_rput_again_bytes += (int64_t)size; }
     uint64_t off = ring_raw(P(addr), size);
-    g_rp_kind_bytes[g_rp_kind & 7] += (LONG64)size;
+    g_rp_kind_bytes[g_rp_kind & 7] += (int64_t)size;
     R.acache[h].addr = addr; R.acache[h].size = size; R.acache[h].off = off; R.acache[h].gen = R.gen; R.acache[h].batch = g_batch_no; R.acache[h].wpos = g_wlog_n;      /* after ring_raw: a wrap starts a generation */
     return off;
 }
@@ -547,12 +547,12 @@ static int g_hs_n;
 static HSpan *g_hs_last;
 static int g_hm_on = -1;
 static uint64_t g_hm_end;                          /* the heap is queued for import up to here */
-static SRWLOCK g_hj_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_hj_lock = PLAT_RWLOCK_INIT;
 static struct { uint64_t lo, hi; HSpan *s; int state; } g_hj[HM_MAX];      /* imports for the import thread; state: 0 queued, 1 being made, 2 made (s; NULL: failed) */
 static int g_hj_n;
 static HANDLE g_hj_ev;
-static LONG64 g_hm_b, g_hm_ring_b, g_hm_waits, g_hm_wait_tk, g_hm_submits;
-static volatile LONG64 g_hm_fail, g_hm_make_tk, g_hm_made;
+static int64_t g_hm_b, g_hm_ring_b, g_hm_waits, g_hm_wait_tk, g_hm_submits;
+static volatile int64_t g_hm_fail, g_hm_make_tk, g_hm_made;
 static PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_;
 int smo_heap_range(uint64_t *base, uint64_t *size);      /* smo_nn.c */
 void os_pin_host_thread(void);
@@ -585,25 +585,25 @@ static HSpan *hm_make(uint64_t lo, uint64_t hi) {      /* the import thread */
     s->lo = lo; s->hi = hi; s->mem = mem; s->buf = buf; s->pg = calloc((size_t)(((hi - lo - 1) >> HM_PG) + 1), sizeof *s->pg);
     return s;
 }
-static DWORD WINAPI hm_thread(void *arg) {
+static uint32_t hm_thread(void *arg) {
     (void)arg;
     os_pin_host_thread();
     for (;;) {
-        WaitForSingleObject(g_hj_ev, INFINITE);
+        WaitForSingleObject(g_hj_ev, PLAT_INFINITE);
         for (;;) {
             int k = -1;
-            AcquireSRWLockExclusive(&g_hj_lock);
+            plat_rw_wlock(&g_hj_lock);
             for (int i = 0; i < g_hj_n && k < 0; i++) if (g_hj[i].state == 0) { g_hj[i].state = 1; k = i; }
             uint64_t lo = k >= 0 ? g_hj[k].lo : 0, hi = k >= 0 ? g_hj[k].hi : 0;
-            ReleaseSRWLockExclusive(&g_hj_lock);
+            plat_rw_wunlock(&g_hj_lock);
             if (k < 0) break;
-            LONG64 t0 = tk();
+            int64_t t0 = tk();
             HSpan *s = hm_make(lo, hi);
-            if (!s) InterlockedIncrement64(&g_hm_fail);
-            InterlockedAdd64(&g_hm_make_tk, tk() - t0); InterlockedIncrement64(&g_hm_made);
-            AcquireSRWLockExclusive(&g_hj_lock);
+            if (!s) plat_inc(&g_hm_fail);
+            plat_add(&g_hm_make_tk, tk() - t0); plat_inc(&g_hm_made);
+            plat_rw_wlock(&g_hj_lock);
             g_hj[k].s = s; g_hj[k].state = 2;      /* entries stay where they are until all are made */
-            ReleaseSRWLockExclusive(&g_hj_lock);
+            plat_rw_wunlock(&g_hj_lock);
         }
     }
     return 0;
@@ -615,7 +615,7 @@ static void hm_init(void) {
     if (!g_hm_on) return;
     vkGetMemoryHostPointerPropertiesEXT_ = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(V.device, "vkGetMemoryHostPointerPropertiesEXT");
     if (!vkGetMemoryHostPointerPropertiesEXT_) { g_hm_on = 0; printf("nvn_vk: no vkGetMemoryHostPointerPropertiesEXT: guest memory is streamed\n"); return; }
-    g_hj_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+    g_hj_ev = plat_event_new(0, 0);
     CloseHandle(CreateThread(NULL, 0, hm_thread, NULL, 0, NULL));
 }
 static void hm_batch_begin(void) {      /* the heap's pieces to import, and those made since */
@@ -623,7 +623,7 @@ static void hm_batch_begin(void) {      /* the heap's pieces to import, and thos
     if (g_hm_on < 0) hm_init();
     if (g_hm_on <= 0) return;
     int queued = 0, added = 0;
-    AcquireSRWLockExclusive(&g_hj_lock);
+    plat_rw_wlock(&g_hj_lock);
     if (smo_heap_range(&base, &size) && base + size > g_hm_end) {      /* the heap was set or grew */
         if (!g_hm_end) g_hm_end = base;
         for (uint64_t lo = g_hm_end > base ? g_hm_end - (HM_PIECE - HM_STEP) : base; lo < base + size && g_hj_n < HM_MAX; lo += HM_STEP) {
@@ -645,8 +645,8 @@ static void hm_batch_begin(void) {      /* the heap's pieces to import, and thos
         memmove(&g_hs[k + 1], &g_hs[k], sizeof g_hs[0] * (size_t)(g_hs_n - k)); g_hs[k] = s; g_hs_n++; added++;
     }
     if (!busy) g_hj_n = 0;
-    ReleaseSRWLockExclusive(&g_hj_lock);
-    if (queued) { SetEvent(g_hj_ev); printf("nvn_vk: vertex and index ranges will be read in place from guest memory: the heap (%llu MB) is imported in %d pieces\n", (unsigned long long)(size >> 20), queued); }
+    plat_rw_wunlock(&g_hj_lock);
+    if (queued) { plat_event_set(g_hj_ev); printf("nvn_vk: vertex and index ranges will be read in place from guest memory: the heap (%llu MB) is imported in %d pieces\n", (unsigned long long)(size >> 20), queued); }
     if (added) g_hs_last = NULL;
 }
 static int hm_first_after(uint64_t addr) {        /* index of the first piece that starts after addr */
@@ -666,10 +666,10 @@ static int hm_ref(uint64_t addr, uint64_t size, uint64_t align, VkBuffer *buf, u
     if (g_hm_on <= 0) return 0;
     HSpan *s = hm_find(addr, size);
     uint64_t o = s ? addr - s->lo : 0, ser = R.serial + 1;
-    if (!s || o % align) { g_hm_ring_b += (LONG64)size; return 0; }
+    if (!s || o % align) { g_hm_ring_b += (int64_t)size; return 0; }
     for (uint64_t p = o >> HM_PG, last = (o + size - 1) >> HM_PG; p <= last; p++) s->pg[p] = ser;
     s->used = ser;
-    *buf = s->buf; *off = o; g_hm_b += (LONG64)size;
+    *buf = s->buf; *off = o; g_hm_b += (int64_t)size;
     return 1;
 }
 /* The render thread is about to write [addr, addr + size) of guest memory: the command buffers that read it in place
@@ -684,7 +684,7 @@ static void hm_guard(uint64_t addr, uint64_t size) {
         for (uint64_t p = a >> HM_PG, last = (b - 1) >> HM_PG; p <= last; p++) if (s->pg[p] > R.done && s->pg[p] > need) need = s->pg[p];
     }
     if (!need) return;
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     if (need > R.serial) { cmd_submit(NULL, NULL); g_hm_submits++; }      /* the command buffer being recorded reads it */
     for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial <= need) slot_wait(&R.slot[i]);
     if (R.done < need) R.done = need;
@@ -695,7 +695,7 @@ static void hm_guard(uint64_t addr, uint64_t size) {
 static VkFormat comp_fmt(int comps, int i) {
     static const int b8[4] = {VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM}, b16[4] = {VK_FORMAT_R16_UNORM, VK_FORMAT_R16G16_UNORM, VK_FORMAT_R16G16B16_UNORM, VK_FORMAT_R16G16B16A16_UNORM},
                      b32[4] = {VK_FORMAT_R32_UINT, VK_FORMAT_R32G32_UINT, VK_FORMAT_R32G32B32_UINT, VK_FORMAT_R32G32B32A32_UINT};
-    static const struct { uint8_t w, o; } m[12] = {{8, 0}, {8, 1}, {8, 4}, {8, 5}, {16, 6}, {16, 0}, {16, 1}, {16, 4}, {16, 5}, {32, 2}, {32, 0}, {32, 1}};      /* offsets: UNORM 0 SNORM 1 USCALED 2 SSCALED 3 UINT 4 SINT 5 SFLOAT 6; 32-bit: UINT 0 SINT 1 SFLOAT 2 */
+    static const struct { uint8_t w, o; } m[12] = {{8, 0}, {8, 1}, {8, 4}, {8, 5}, {16, 6}, {16, 0}, {16, 1}, {16, 4}, {16, 5}, {32, 2}, {32, 0}, {32, 1}};      /* offsets: UNORM 0 SNORM 1 USCALED 2 SSCALED 3 unsigned 4 SINT 5 SFLOAT 6; 32-bit: unsigned 0 SINT 1 SFLOAT 2 */
     return (VkFormat)((m[i].w == 8 ? b8 : m[i].w == 16 ? b16 : b32)[comps - 1] + m[i].o);
 }
 static int fmt_supported(VkFormat f, VkFlags need) { VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(V.gpu, f, &p); return (p.optimalTilingFeatures & need) == need; }
@@ -752,7 +752,7 @@ static VkFormat vertex_vkfmt(int nf) {
 
 /* ---------------------------------------------------------------- images */
 typedef struct VView { EView e; int vtype, attach; VkImageView view; uint64_t id; struct VView *next; } VView;      /* id: never given to another view (vt_view), unlike the handle a driver may give again once the view is destroyed */
-static LONG64 g_storage_tex;                       /* textures whose image has storage use (vt_get2) */
+static int64_t g_storage_tex;                       /* textures whose image has storage use (vt_get2) */
 struct VTex {
     uint32_t magic; Tex *t; VkImage img; VMem mem; VkFormat fmt; VkImageLayout layout; VkFlags aspect;
     int w, h, d, levels, layers, samples, expand, decode, is3d, feedback, bpb, bw, bh;
@@ -769,7 +769,7 @@ struct VTex {
  * reads keep the game's sizes. Fragment stages are translated with MxIn.screen_scale (another hash: ssrc_hb). At 1.0 none
  * of this runs: every branch is behind RS_ON or VTex.rs / R.pass_rs, which are then 0. */
 static float g_rs = -1.0f;
-static LONG64 g_rs_images, g_rs_stages, g_rs_fcs, g_rs_tf, g_rs_up, g_rs_down, g_rs_blits;
+static int64_t g_rs_images, g_rs_stages, g_rs_fcs, g_rs_tf, g_rs_up, g_rs_down, g_rs_blits;
 static float rs_scale(void) {
     if (g_rs < 0) {
         const char *e = getenv("SMO_VK_SCALE");
@@ -793,7 +793,7 @@ static int rs_edge(int v, float s, int max) { int r = (int)floorf((float)v * s +
  * (its last full-screen pass and the 2D interface after it) is drawn at the game's own size (1600 x 900). */
 int nvn_front_tex_is_window(const Tex *t);
 static Tex *g_wintex[8];
-static LONG64 g_rs_mixed;
+static int64_t g_rs_mixed;
 static int wintex_is(const Tex *t) { if (nvn_front_tex_is_window(t)) return 1; for (int i = 0; i < 8; i++) if (g_wintex[i] == t) return 1; return 0; }
 static void wintex_note(Tex *t) { if (!t || wintex_is(t)) return; for (int i = 0; i < 8; i++) if (!g_wintex[i]) { g_wintex[i] = t; return; } }
 static int rs_ui_native(void) { static int on = -1; if (on < 0) on = getenv("SMO_VK_UI_NATIVE") && atoi(getenv("SMO_VK_UI_NATIVE")); return on; }
@@ -831,7 +831,7 @@ static void vt_layout(VTex *vt, VkImageLayout to) {
  * again, its targets loaded). Between passes the layout changes already order what one pass writes and the next reads;
  * the case left is a pass that samples its own target (GENERAL layout), where without a barrier the texture cache may
  * still hold what was there before. SMO_VK_NO_TEXBARRIER=1: as before (no barrier). */
-static LONG64 g_texbar, g_texbar_split, g_texbar_skip;
+static int64_t g_texbar, g_texbar_split, g_texbar_skip;
 /* the vertices a draw really reads. nvnCommandBufferBindVertexBuffer names a range, and some of SMO's draws read
  * past it: the composite passes of its half-size buffers (programs #12026 and #23331 in Cascade Kingdom, and 15 more at
  * the title screen) draw 9 vertices from a range of 36 bytes, 3 vertices of 12; the other 6 follow in the game's memory,
@@ -843,7 +843,7 @@ static LONG64 g_texbar, g_texbar_split, g_texbar_skip;
  * and, for per-instance streams, the highest instance; only inside the game's heap, and by 16 MB at most (else left as
  * bound, counted). SMO_VK_VTXGROW=0: as before; SMO_VK_VTXCHECK=1 logs each kind of draw that reads past its range. */
 static int g_vtxcheck = -1, g_vtxgrow = -1;
-static LONG64 g_vtx_over, g_fr_vtxover, g_vtx_capped, g_imax_scans, g_imax_written;      /* index_max: scans, scans of a cached range a logged host write overlapped */
+static int64_t g_vtx_over, g_fr_vtxover, g_vtx_capped, g_imax_scans, g_imax_written;      /* index_max: scans, scans of a cached range a logged host write overlapped */
 static uint64_t g_vneed[16];                       /* bytes of each vertex stream the next draw reads (0: not known) */
 int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset);      /* smo_nn.c: inside the game's committed heap? */
 static unsigned vattr_size(int nf) {               /* bytes of one vertex attribute of NVN format nf (as vertex_vkfmt maps it) */
@@ -972,10 +972,10 @@ static void vt_destroy(VTex *vt) {
 }
 static void garbage_collect(void) {
     int n = 0;
-    LONG64 t0 = g_ngarbage ? tk() : 0;
+    int64_t t0 = g_ngarbage ? tk() : 0;
     for (int i = 0; i < g_ngarbage; i++) if (g_garbage[i].serial <= R.done) vt_destroy(g_garbage[i].vt); else g_garbage[n++] = g_garbage[i];
     if (t0 && g_ngarbage - n >= 50) {              /* what destroying many images at once costs (the end of a screen) */
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        plat_counter fq; plat_qpf(&fq);
         double ms = (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart;
         static int nl;
         if (ms > 10.0 && nl++ < 40) printf("nvn_vk_tex: frame %lld: %d images destroyed in %.1f ms\n", (long long)nvn_front_frame_next(), g_ngarbage - n, ms);
@@ -1001,7 +1001,7 @@ static void vk_drop(int kind, void *host) {
  * into it is lost then, so none is expected). One still bound as a render target, or a window texture, waits. */
 static Tex **g_rc;                                 /* the textures waiting (each has Tex.reclaim = 1) */
 static int g_rc_n, g_rc_cap;
-static LONG64 g_rc_freed, g_rc_freed_mb, g_rc_again, g_rc_late;
+static int64_t g_rc_freed, g_rc_freed_mb, g_rc_again, g_rc_late;
 static int texfree_frames(void) { static int n = -2; if (n == -2) { const char *e = getenv("SMO_VK_TEXFREE"); n = e ? atoi(e) : 8; } return n; }
 static int texlog_vk(void) { static int on = -1; if (on < 0) on = getenv("SMO_TEXLOG") != NULL; return on; }
 static void rc_take(Tex *t) {
@@ -1009,28 +1009,28 @@ static void rc_take(Tex *t) {
     g_rc[g_rc_n++] = t;
 }
 static void rc_ignore(Tex *t) { (void)t; }        /* SMO_VK_TEXFREE=0: taken and left (Tex.reclaim stays 1, so it is not offered again) */
-static void tex_reclaim(LONG64 frame) {
+static void tex_reclaim(int64_t frame) {
     int idle = texfree_frames(), n = 0;
     nvn_front_take_unref(idle > 0 ? rc_take : rc_ignore);
     for (int i = 0; i < g_rc_n; i++) {
         Tex *t = g_rc[i];
         if (t->dead) continue;                     /* finalized by the object that made it: vk_drop has its image */
         if (t->nslots > 0) {                       /* registered again: offered again when agl lets go of it once more */
-            InterlockedExchange(&t->reclaim, 0);
-            if (t->nslots > 0 || InterlockedCompareExchange(&t->reclaim, 1, 0) != 0) continue;     /* (and if that happened just now, it stays) */
+            plat_xchg(&t->reclaim, 0);
+            if (t->nslots > 0 || plat_cas(&t->reclaim, 1, 0) != 0) continue;     /* (and if that happened just now, it stays) */
         }
         int bound = R.depth.tex == t || wintex_is(t);
         for (int k = 0; k < 8 && !bound; k++) bound = R.col[k].tex == t;
         if (bound || frame - t->last_use < idle || !nvn_front_tex_unref(t)) { g_rc[n++] = t; continue; }
         VTex *vt = t->vk;
         if (vt) {
-            g_rc_freed++; g_rc_freed_mb += (LONG64)(vt->mem.size >> 20);
+            g_rc_freed++; g_rc_freed_mb += (int64_t)(vt->mem.size >> 20);
             if (texlog_vk()) printf("texlog: image freed host %p %dx%d fmt 0x%x (%llu KB) frame %lld, last used in frame %lld\n", (void *)t, t->b.width, t->b.height, t->b.format, (unsigned long long)(vt->mem.size >> 10), (long long)frame, (long long)t->last_use);
             vk_drop(K_TEX, t);
             t->uploaded = 0; t->checked = 0;       /* a texture the CPU wrote is read from its memory again if it is used again */
             t->image_freed = 1;
         } else t->image_freed = 2;
-        InterlockedExchange(&t->reclaim, 0);
+        plat_xchg(&t->reclaim, 0);
     }
     g_rc_n = n;
 }
@@ -1104,7 +1104,7 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
     pass_end(); cmd_begin();
     if (vt->rs) {                                  /* the texture's own memory holds the game's size */
         if (!vt->is3d && (uint32_t)layer < (uint32_t)vt->layers) rs_upload(vt, level, layer, off, row_stride && vt->bpb ? (uint32_t)(row_stride / vt->bpb) : 0, 0, 0, 0, w, h);
-        R.upload_bytes += (LONG64)size;
+        R.upload_bytes += (int64_t)size;
         return;
     }
     vt_layout(vt, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1116,16 +1116,16 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
     c.imageExtent.width = (uint32_t)w; c.imageExtent.height = (uint32_t)h; c.imageExtent.depth = (uint32_t)(vt->is3d ? d : 1);
     if (!vt->is3d && (uint32_t)layer >= (uint32_t)vt->layers) return;
     vkCmdCopyBufferToImage(R.cmd, R.ring, vt->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-    R.upload_bytes += (LONG64)size;
+    R.upload_bytes += (int64_t)size;
 }
 /* The image of a texture: made at first use, and holding what the guest memory holds (unless the GPU wrote it). */
 /* textures made and read AHEAD of their first draw (tex_ahead, below), and what is still made at a draw. */
-static LONG64 g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
+static int64_t g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
-static volatile LONG g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
+static volatile int32_t g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
-    LONG64 tu0 = 0, ub0 = R.upload_bytes;
+    int64_t tu0 = 0, ub0 = R.upload_bytes;
     t->last_use = g_cur_frame;
     if (!vt && t->image_freed) {                   /* tex_reclaim freed it (or let it go before it had an image): it is used after all */
         static int nl;
@@ -1133,7 +1133,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         if (nl++ < 40) printf("nvn_vk_tex: frame %lld: texture %dx%d format 0x%x %s after nothing named it (written by the GPU %d, pool entries %d)\n", (long long)g_cur_frame, t->b.width, t->b.height, t->b.format,
                               t->image_freed == 1 ? "used again: its image is made again (empty if the GPU wrote it)" : "used for the first time", t->gpu_written, t->nslots);
         t->image_freed = 0;
-        if (t->nslots <= 0 && InterlockedCompareExchange(&t->reclaim, 1, 0) == 0) rc_take(t);      /* still nothing names it: it may go again */
+        if (t->nslots <= 0 && plat_cas(&t->reclaim, 1, 0) == 0) rc_take(t);      /* still nothing names it: it may go again */
     }
     if (!vt) {
         tu0 = tk();
@@ -1217,7 +1217,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         R.uploads++;
     }
     if (tu0 && !g_ta_inside) {                     /* made or read again at its use (a draw, a copy, a target): the frame pays */
-        LONG64 d = tk() - tu0;
+        int64_t d = tk() - tu0;
         g_up_fr_tk += d; g_up_fr_n++; g_up_fr_bytes += R.upload_bytes - ub0;
         g_late_n++; g_late_tk += d;
         if (g_in_scene) { g_late_scene_n++; g_late_scene_tk += d; }
@@ -1235,13 +1235,13 @@ static VTex *vt_get(Tex *t) { return vt_get2(t, 1); }
  * (nvn_front_tex_changed) and reads it again, as before. SMO_VK_TEXAHEAD=0 = as before (everything at the first draw). */
 static int scene_recent(void);                     /* nvn_vk_pipelines.c */
 static void present_progress(float frac);          /* the held loading screen presented again with the progress bar (defined above vk_present) */
-static LONG64 g_ovl_presents;                      /* extra presents of a held loading screen */
+static int64_t g_ovl_presents;                      /* extra presents of a held loading screen */
 static int holdlog_on(void);
-static void tex_ahead(LONG64 frame) {
+static void tex_ahead(int64_t frame) {
     static int on = -1;
     static Tex *done_head;
-    static LONG64 fq;
-    if (on < 0) { const char *e = getenv("SMO_VK_TEXAHEAD"); LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; on = !(e && !atoi(e)); }
+    static int64_t fq;
+    if (on < 0) { const char *e = getenv("SMO_VK_TEXAHEAD"); plat_counter f; plat_qpf(&f); fq = f.QuadPart; on = !(e && !atoi(e)); }
     if (!on) return;
     Tex *head = nvn_front_tex_first();
     if (head == done_head) return;
@@ -1254,7 +1254,7 @@ static void tex_ahead(LONG64 frame) {
     if (load_on < 0) { const char *e = getenv("SMO_VK_TEXAHEAD_LOAD"); load_on = !(e && !atoi(e)); }
     int loading = load_on && !g_in_scene && R.frame_draws <= 60;
     if (loading) fr = 0;
-    LONG64 t0 = tk(), budget = fq * (loading ? 8 : fr ? 1 : 4) / 1000;
+    int64_t t0 = tk(), budget = fq * (loading ? 8 : fr ? 1 : 4) / 1000;
     int pending = 0, taken = 0;
     Tex *oldest = NULL;                            /* the oldest texture still pending: the next walk ends after it */
     g_ta_inside = 1;
@@ -1281,13 +1281,13 @@ static void tex_ahead(LONG64 frame) {
             tex_vkfmt(t->b.format, &probe.expand, &probe.decode);
             if (probe.decode) { t->ahead_seen = -1; continue; }
         }
-        LONG64 b0 = R.upload_bytes;
+        int64_t b0 = R.upload_bytes;
         vt_get(t);
         t->ahead_seen = -1; taken++;
         g_ta_n++; g_ta_bytes += R.upload_bytes - b0;
     }
     g_ta_inside = 0;
-    LONG64 d = tk() - t0;
+    int64_t d = tk() - t0;
     g_ta_tk += d; if (d > g_ta_max_tk) g_ta_max_tk = d;
     if (d * 1000 > 6 * fq && holdlog_on()) { static int nl; if (nl++ < 100) printf("nvn_vk_tex: frame %lld (%s): %d textures made ahead after the present in %.1f ms\n", (long long)frame, fr ? "near a scene" : "far from a scene", taken, (double)d * 1000.0 / (double)fq); }
     done_head = pending ? oldest->all_next : head;     /* everything older than the oldest pending texture is done (before: only when nothing was
@@ -1338,7 +1338,7 @@ static VView *vt_vview(VTex *vt, const EView *e, int dim, int attach) {
         if (vt->is3d) {   /* one depth slice of a 3D texture, through a 2D view (image made 2D_ARRAY_COMPATIBLE); the slice is the view's first layer */
             int dl = vt->d >> e->lvl0; if (dl < 1) dl = 1;
             if (e->lay0 >= dl) ci.subresourceRange.baseArrayLayer = (uint32_t)(dl - 1);
-            if (e->nlay > 1) { static LONG64 n; if (n++ < 5) printf("nvn_vk: a 3D texture bound as render target with %d slices: only slice %d is drawn (layered rendering into a 3D texture is not implemented)\n", e->nlay, e->lay0); }
+            if (e->nlay > 1) { static int64_t n; if (n++ < 5) printf("nvn_vk: a 3D texture bound as render target with %d slices: only slice %d is drawn (layered rendering into a 3D texture is not implemented)\n", e->nlay, e->lay0); }
         }
     } else {
         int lay = e->nlay;
@@ -1391,7 +1391,7 @@ static VkSampler sampler_get(const SamplerParams *p) {
     if (ci.maxLod < ci.minLod) ci.maxLod = ci.minLod;
     float aniso = p->aniso;
     {   /* anisotropic_filtering in graphics.ini = at least that on samplers that filter linearly between mip levels (not shadow-compare samplers) */
-        static LONG64 raised;
+        static int64_t raised;
         float want = (float)gfx_options()->aniso;
         if (want > aniso && minf >= 4 && p->cmode != 1) { aniso = want; raised++; if (raised == 1 || raised % 100 == 0) printf("nvn_vk: anisotropic_filtering=%d: %lld samplers raised so far (this one from %.0f)\n", gfx_options()->aniso, (long long)raised, p->aniso); }
     }
@@ -1484,7 +1484,7 @@ static int pass_begin(void) {
              * nothing at all. SMO binds a 2x2 dummy depth texture to full-screen passes with depth test and write off
              * (title screen, boot105 pass 7: Mario's layer stayed empty and the projected shadow became black speckles).
              * The pass runs without depth; the dropped surface could only have held its own few texels. */
-            static LONG64 n; if (n++ < 5) printf("nvn_vk: depth target %dx%d smaller than the colour targets %dx%d: pass without depth (%lld so far)\n", lvl_(vt->w, target_level(&R.depth)), lvl_(vt->h, target_level(&R.depth)), w, h, (long long)n);
+            static int64_t n; if (n++ < 5) printf("nvn_vk: depth target %dx%d smaller than the colour targets %dx%d: pass without depth (%lld so far)\n", lvl_(vt->w, target_level(&R.depth)), lvl_(vt->h, target_level(&R.depth)), w, h, (long long)n);
         }
         else {
             vt_layout(vt, vt->feedback ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
@@ -1885,13 +1885,13 @@ static uint32_t g_cb_epoch;
 /* midbatch: the command being prepared may still name a freed CB's buffer (it is recorded into the next submission), so
  * that buffer is not given out again before that submission has finished. */
 static void cb_land(int midbatch) {                /* the GPU has finished everything that wrote a CB */
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     cb_masks();
     for (int i = 0; i < g_cb_used; i++) {
         CB *c = &g_cb[i];
         if (!c->state) continue;
         if (c->dirty) host_wrote(c->addr, c->size, GEN_CB);      /* guest memory changes: ranges the ring copied from it are copied again */
-        if (c->dirty && !c->snap) { hm_guard(c->addr, c->size); memcpy(P(c->addr), c->mem.map, (size_t)c->size); R.cb_bytes += (LONG64)c->size; }
+        if (c->dirty && !c->snap) { hm_guard(c->addr, c->size); memcpy(P(c->addr), c->mem.map, (size_t)c->size); R.cb_bytes += (int64_t)c->size; }
         else if (c->dirty) {
             /* the copy-back is DEFERRED (up to the next batch), so the guest may have written into the range since
              * the CB was filled. Only what compute changed goes back: a word the guest changed meanwhile (guest != snapshot)
@@ -1900,14 +1900,14 @@ static void cb_land(int midbatch) {                /* the GPU has finished every
             uint64_t *g = P(c->addr);
             const uint64_t *s = (const uint64_t *)c->snap, *m = (const uint64_t *)c->mem.map;
             size_t nw = (size_t)(c->size / 8), tail = (size_t)(c->size & 7);
-            LONG64 gw = 0, cf = 0;
+            int64_t gw = 0, cf = 0;
             for (size_t k = 0; k < nw; k++) {
                 uint64_t sv = s[k], mv = m[k];
                 if (mv == sv) { if (g[k] != sv) gw++; continue; }
                 if (g[k] == sv) g[k] = mv; else { gw++; cf++; }
             }
             if (tail) memcpy((uint8_t *)g + nw * 8, (const uint8_t *)m + nw * 8, tail);
-            R.cb_bytes += (LONG64)c->size; R.cb_guest_words += gw; R.cb_conflict_words += cf;
+            R.cb_bytes += (int64_t)c->size; R.cb_guest_words += gw; R.cb_conflict_words += cf;
             if (gw) { static int n; if (n++ < 10) printf("nvn_vk: copy-back of %llx+%llu: the guest wrote %lld words of the range while it was pending (%lld of them also written by compute); merged\n", (unsigned long long)c->addr, (unsigned long long)c->size, (long long)gw, (long long)cf); }
         }
         c->state = c->dirty = 0;
@@ -1926,7 +1926,7 @@ static void cb_poll(void) {                        /* pending CBs whose submissi
 }
 /* why a copy-back was forced (CB_SYNC), counted per reason: forced in a batch, waits for the GPU and their time */
 static int g_cb_why;
-static LONG64 g_cbw_forced[16], g_cbw_waits[16], g_cbw_tk[16];
+static int64_t g_cbw_forced[16], g_cbw_waits[16], g_cbw_tk[16];
 static const char *const k_cbw_name[16] = {"next batch", "range read", "dispatch list full", "storage range overlap", "texture read to host",
                                            "texel read", "indices", "report value", "timestamp", "conditional render", "buffer copy",
                                            "uniform update", "buffer clear", "indirect draw", "indirect dispatch", "buffer/texture copy"};
@@ -1936,11 +1936,11 @@ static void cb_sync(void) {                        /* guest memory must hold wha
     if (!g_cb_live && !g_cb_pending) return;
     if (g_cb_live) { g_cb_serial = cmd_submit(NULL, NULL); R.cb_syncs++; g_cbw_forced[g_cb_why & 15]++; }
     if (R.done < g_cb_serial) {
-        LARGE_INTEGER t0, t1;
-        QueryPerformanceCounter(&t0);
+        plat_counter t0, t1;
+        plat_qpc(&t0);
         for (int i = 0; i < NSLOT; i++) if (R.slot[i].pending && R.slot[i].serial <= g_cb_serial) slot_wait(&R.slot[i]);
         if (R.done < g_cb_serial) R.done = g_cb_serial;
-        QueryPerformanceCounter(&t1);
+        plat_qpc(&t1);
         R.cb_waits++; R.cb_wait_ticks += t1.QuadPart - t0.QuadPart;
         g_cbw_waits[g_cb_why & 15]++; g_cbw_tk[g_cb_why & 15] += t1.QuadPart - t0.QuadPart;
     }
@@ -2030,7 +2030,7 @@ static void occ_draw(void) {                       /* after draw_prepare, inside
 /* Has submission `serial` finished? With wait it is waited for (submitted first while it is still being recorded). */
 static int occ_done(uint64_t serial, int wait) {
     if (serial <= R.done) return 1;
-    LONG64 t0 = wait ? tk() : 0;
+    int64_t t0 = wait ? tk() : 0;
     if (wait && serial > R.serial) cmd_submit(NULL, NULL);
     for (int i = 0; i < NSLOT; i++) {
         Slot *s = &R.slot[i];
@@ -2058,8 +2058,8 @@ static void occ_take(uint64_t lo, uint64_t hi, uint64_t *sum) {
 /* SMO_VK_OCC_TRACE=<frame ranges> (p for play frames): every count report of those frames is kept when its count is
  * written into guest memory, with the game's call site of the report and the frame the game is building by then, and
  * printed at exit ("nvn_vk_occ_trace:"), so that the run keeps its timing (debug aid: counts read before they arrive). */
-static struct OccTrace { LONG64 frame, written, game; uint64_t dst, count, caller; } *g_occ_tr;
-static LONG64 g_occ_tr_n, g_occ_tr_lost;
+static struct OccTrace { int64_t frame, written, game; uint64_t dst, count, caller; } *g_occ_tr;
+static int64_t g_occ_tr_n, g_occ_tr_lost;
 #define OCC_TR_MAX (1 << 20)
 static void occ_trace_add(const OccEntry *e, uint64_t count) {
     if (!g_occ_tr) g_occ_tr = malloc(sizeof *g_occ_tr * OCC_TR_MAX);
@@ -2069,7 +2069,7 @@ static void occ_trace_add(const OccEntry *e, uint64_t count) {
     t->dst = e->dst; t->count = count; t->caller = e->caller;
 }
 static void occ_trace_print(FILE *out) {
-    for (LONG64 i = 0; i < g_occ_tr_n; i++) {
+    for (int64_t i = 0; i < g_occ_tr_n; i++) {
         const struct OccTrace *t = &g_occ_tr[i];
         fprintf(out, "nvn_vk_occ_trace: frame %lld report %llu samples to %llx by %llx, written in frame %lld, the game building frame %lld\n", (long long)t->frame,
                 (unsigned long long)t->count, (unsigned long long)t->dst, (unsigned long long)t->caller, (long long)t->written, (long long)t->game);
@@ -2124,7 +2124,7 @@ static void occ_reset(void) {
     else occ_push(1, 0);
     g_occ_on = 1;
 }
-static int occ_trace(LONG64 frame) {               /* SMO_VK_OCC_TRACE (occ_trace_add) */
+static int occ_trace(int64_t frame) {               /* SMO_VK_OCC_TRACE (occ_trace_add) */
     static FrameRanges fr;
     static int parsed;
     if (!parsed) { parsed = 1; frame_ranges_parse(&fr, getenv("SMO_VK_OCC_TRACE")); }
@@ -2230,7 +2230,7 @@ static void compute_dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (v->nsmp > 32) { nvn_vk_missing("a compute program with more than 32 samplers"); return; }
     if (!gx || !gy || !gz) return;
     int cp_how = 0;
-    if (v->cp_state != 2) { LONG64 t0 = tk(); cp_how = compute_pipe_ensure(v); if (cp_how) { hold_note(cp_how == 1 ? H_PIPE_DRAW : H_PIPE_WAIT, tk() - t0); g_tm[5] += tk() - t0; } }
+    if (v->cp_state != 2) { int64_t t0 = tk(); cp_how = compute_pipe_ensure(v); if (cp_how) { hold_note(cp_how == 1 ? H_PIPE_DRAW : H_PIPE_WAIT, tk() - t0); g_tm[5] += tk() - t0; } }
     if (!v->cp_recorded) { v->cp_recorded = 1; if (!v->images) piperec_append(NULL, v, NULL, 1); }      /* a stage with images has no record to be made from at start */
     if (cp_how == 1) {
         g_pipe_miss++;
@@ -2243,7 +2243,7 @@ static void compute_dispatch(uint32_t gx, uint32_t gy, uint32_t gz) {
  * one of alComputeShader). The NVN image handle is the texture's index in the texture pool; the texture must have been made with
  * NVN_TEXTURE_FLAGS_IMAGE (its image then has VK_IMAGE_USAGE_STORAGE_BIT, vt_get2). A storage view has one level and the
  * identity swizzle; its format is the one the shader declares (typed accesses, atomics) or the texture view's own. */
-static LONG64 g_img_disp, g_img_views;
+static int64_t g_img_disp, g_img_views;
 static VkFormat gl_image_vkfmt(uint16_t gl) {      /* the image formats of mx_translate.c img_qualifier */
     static const struct { uint16_t gl; VkFormat vk; } m[] = {
         {0x8814, VK_FORMAT_R32G32B32A32_SFLOAT}, {0x881A, VK_FORMAT_R16G16B16A16_SFLOAT}, {0x8230, VK_FORMAT_R32G32_SFLOAT}, {0x822F, VK_FORMAT_R16G16_SFLOAT},
@@ -2335,7 +2335,7 @@ static void compute_pipe_make(VStage *v) {         /* any thread */
         v->cp = cp;
         stage_mod_releasable(v);
         stage_mod_put(v);
-        InterlockedIncrement64(&R.pipelines);
+        plat_inc(&R.pipelines);
     }
 }
 static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uint32_t gy, uint32_t gz) {
@@ -2888,7 +2888,7 @@ static void vk_read_texels(void *arg) {
     CB_SYNC(5);
     read_region(j->tex, j->has_view ? &j->view : NULL, j->region, j->out, j->row_stride, j->image_stride);
 }
-static LONG64 g_blit_same;                         /* copies within one texture (blit_tex) */
+static int64_t g_blit_same;                         /* copies within one texture (blit_tex) */
 static void blit_tex(Tex *s, const View *sv, const int *sr, Tex *d, const View *dv, const int *dr, int linear) {
     VTex *vs = vt_get(s), *vd = vt_get(d);
     VkImageBlit b;
@@ -2955,7 +2955,7 @@ static void replay(uint64_t handle, int depth);
  * game's indices (type t: 0 8-bit, 1 16-bit, 2 32-bit) rearranged. Vertices after the last whole quad are left out, as
  * GL leaves them. Render thread only (the list is a static buffer); call before draw_prepare, like buf_ref: it may wrap
  * the ring. Returns the ring offset of the 32-bit list, its length in *n. */
-static LONG64 g_quad_draws;
+static int64_t g_quad_draws;
 static uint64_t quad_indices(uint64_t src, unsigned t, uint32_t count, uint32_t *n) {
     static uint32_t *buf, cap;
     uint32_t nq = count / 4;
@@ -2975,7 +2975,7 @@ static uint64_t quad_indices(uint64_t src, unsigned t, uint32_t count, uint32_t 
     return ring_raw(buf, (uint64_t)*n * 4);
 }
 /* The two kinds of draw (nvnCommandBufferDrawArrays* / DrawElements*, and each draw of an indirect one). */
-static LONG64 g_indirect_draws, g_indirect_disp;
+static int64_t g_indirect_draws, g_indirect_disp;
 static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_t indices, int32_t base_vertex, uint32_t base_inst, uint32_t inst) {
     unsigned t = type < 3 ? type : 1;
     uint32_t n;
@@ -2985,7 +2985,7 @@ static void vk_draw_quads(uint32_t first, uint32_t count, unsigned type, uint64_
     vtx_switches();
     if (indices) { int64_t mv = (int64_t)index_max(indices, (int)count, t) + base_vertex; vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
     else vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0);
-    { LONG64 t0 = tk(); int ok = draw_prepare(4 /* NVN_DRAW_PRIMITIVE_TRIANGLES */); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
+    { int64_t t0 = tk(); int ok = draw_prepare(4 /* NVN_DRAW_PRIMITIVE_TRIANGLES */); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     vkCmdBindIndexBuffer(R.cmd, R.ring, off, VK_INDEX_TYPE_UINT32);
     occ_draw();
     vkCmdDrawIndexed(R.cmd, n, inst, 0, indices ? base_vertex : (int32_t)first, base_inst);
@@ -2999,7 +2999,7 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
     if (gsr) gs_dbg_read(0);
     vtx_switches();
     if (count) vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0); else memset(g_vneed, 0, sizeof g_vneed);
-    { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
+    { int64_t t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     occ_draw();
     if (R.prog[2]) gsq_begin();
     vkCmdDraw(R.cmd, count, inst, first, base_inst);
@@ -3020,7 +3020,7 @@ static void vk_draw_elements(unsigned prim, unsigned type, int count, uint64_t i
     vtx_switches();
     {   int64_t mv = (int64_t)index_max(indices, count, t) + base_vertex;
         vtx_need(mv > 0 ? (uint64_t)mv : 0, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 1); }
-    { LONG64 t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
+    { int64_t t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
     vkCmdBindIndexBuffer(R.cmd, ib.buf, ib.off, t == 0 ? VK_INDEX_TYPE_UINT8_EXT : t == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     occ_draw();
     vkCmdDrawIndexed(R.cmd, (uint32_t)count, inst, 0, base_vertex, base_inst);
@@ -3182,7 +3182,7 @@ static void exec(const Cmd *m, int depth) {
         if (a[0] & 0x10) nvn_front_barrier_texmem();
         if (a[0] & 6) tex_barrier();
         break;
-    case OP_DISPATCH: { LONG64 t0 = tk(); compute_dispatch((uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]); g_tm[2] += tk() - t0; break; }
+    case OP_DISPATCH: { int64_t t0 = tk(); compute_dispatch((uint32_t)a[0], (uint32_t)a[1], (uint32_t)a[2]); g_tm[2] += tk() - t0; break; }
     case OP_COPY_BUF_BUF: CB_SYNC(10); if (a[0] && a[1]) { hm_guard(a[1], a[2]); memmove(P(a[1]), P(a[0]), (size_t)a[2]); host_wrote(a[1], a[2], GEN_BUF); } break;      /* guest memory is read / written: what compute wrote must be there (as OpenGL's compute_flush) */
     case OP_UPDATE_UBO:                            /* only compute results in the range written must be in guest memory first (it used to be all of them: a wait for the GPU at the first update after a dispatch) */
         if (g_cb_pending || (g_cb_live && cb_overlap(a[0] + a[2], a[3]))) CB_SYNC(11);
@@ -3264,7 +3264,7 @@ static void exec(const Cmd *m, int depth) {
     case OP_DISPATCH_INDIRECT: {                   /* a0 the address of three group counts (read as the OpenGL path does) */
         uint32_t g[3] = {0, 0, 0};
         if (a[0]) { if (g_cb_live && cb_overlap(a[0], 12)) CB_SYNC(14); memcpy(g, P(a[0]), 12); }
-        LONG64 t0 = tk(); compute_dispatch(g[0], g[1], g[2]); g_tm[2] += tk() - t0; g_indirect_disp++;
+        int64_t t0 = tk(); compute_dispatch(g[0], g[1], g[2]); g_tm[2] += tk() - t0; g_indirect_disp++;
         break;
     }
     case OP_COPY_BUF_TEX: CB_SYNC(15); copy_buf_tex(m); break;
@@ -3344,10 +3344,10 @@ static void vk_submit(void *arg) {
     SubmitJob *j = arg;
     if (!V.alive) return;                          /* after the shutdown at exit: the device is gone */
     prewarm_wait();
-    LONG64 t0 = tk();
+    int64_t t0 = tk();
     CB_SYNC(0);                                     /* what the last batch's dispatches wrote is in guest memory before this batch reads it */
     if (g_occ_qn) occ_resolve(0);                  /* occlusion counts whose submissions have finished */
-    LONG64 t1 = tk();
+    int64_t t1 = tk();
     nvn_front_batch_begin();
     passshot_update();
     GEN_BUMP(GEN_BATCH);                           /* guest memory may have changed since the last batch */
@@ -3355,7 +3355,7 @@ static void vk_submit(void *arg) {
     g_batch_no++;
     if (g_scan_on) {                               /* what this batch will need goes to the workers before it is replayed */
         if (mt_on()) scan_async_start(j->handles, j->count);      /* SMO_VK_MT=1: beside the replay, on its own thread */
-        else { LONG64 ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }
+        else { int64_t ts = tk(); Scan s; scan_begin(&s); for (int i = 0; i < j->count; i++) scan_list(j->handles[i], 0, &s); g_tm[9] += tk() - ts; }
     }
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
     scan_async_wait();
@@ -3373,7 +3373,7 @@ static void vk_fence(void *arg) { SyncJob *j = arg; if (j->o->dead || !V.alive) 
 /* A fence the GPU has passed may still cover compute results not yet copied back to guest memory: R.done also moves on
  * through waits that do not land them (the occlusion wait at the present, slot_wait in cmd_begin). The game reads what the
  * fence covers as soon as the wait returns, so what has finished is landed first (cb_poll never waits). */
-static LONG64 g_sync_pending_cb;
+static int64_t g_sync_pending_cb;
 static void vk_sync_wait_(SyncJob *j) {
     uint64_t want = (uint64_t)(uintptr_t)j->o->s;
     if (!want || !V.alive) { j->result = 3; return; }       /* never fenced */
@@ -3625,8 +3625,8 @@ static void overlay_draw(uint32_t index) {
  * nnpad_sdl.c call smo_capture_request). The frame being presented is read back like a SMO_SHOT picture, made 8-bit
  * opaque RGBA, and handed to nnalbum.c, which turns it as the game asked (nn::oe::SetScreenShotImageOrientation: snapshot
  * mode with the camera turned) and saves it in the album folder. */
-static volatile LONG g_capture_req;
-void smo_capture_request(void) { InterlockedExchange(&g_capture_req, 1); }
+static volatile int32_t g_capture_req;
+void smo_capture_request(void) { plat_xchg(&g_capture_req, 1); }
 int album_save_capture(const uint8_t *rgba, int w, int h, char *out_path, size_t out_cap);       /* nnalbum.c */
 static void capture_vk(VTex *vt) {
     int w = vt->rs ? (int)vt->t->b.width : vt->w, h = vt->rs ? (int)vt->t->b.height : vt->h;
@@ -3716,14 +3716,14 @@ static void vk_menu(void *arg) {
 /* Process memory every 300 frames (tools/dev/memmap.py names the allocations): working set (pages in memory; the guest
  * heap's pages count once per address they are mapped at), its private part, private bytes (commit of private memory)
  * and the commit of pagefile-backed sections (the guest memory heap), next to the Vulkan memory this file allocated. */
-typedef struct { DWORD cb, faults; SIZE_T peak_ws, ws, qpp, qp, qpnp, qnp, pagefile, peak_pagefile, priv, priv_ws, shared_commit; } MemCounters;
-static void mem_report(LONG64 frame) {
+typedef struct { uint32_t cb, faults; size_t peak_ws, ws, qpp, qp, qpnp, qnp, pagefile, peak_pagefile, priv, priv_ws, shared_commit; } MemCounters;
+static void mem_report(int64_t frame) {
     MemCounters m;
     memset(&m, 0, sizeof m); m.cb = sizeof m;
-    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) { m.cb = (DWORD)offsetof(MemCounters, priv_ws); K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, m.cb); }
-    LONG64 host = 0;
-    for (int b = 0; b < g_nblk; b++) if (g_blk[b] && g_blk[b]->map) host += (LONG64)g_blk[b]->size;
-    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) { m.cb = (uint32_t)offsetof(MemCounters, priv_ws); K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, m.cb); }
+    int64_t host = 0;
+    for (int b = 0; b < g_nblk; b++) if (g_blk[b] && g_blk[b]->map) host += (int64_t)g_blk[b]->size;
+    plat_counter fq; plat_qpf(&fq);
     printf("nvn_vk_mem: frame %lld: working set %llu MB (private %llu MB, peak %llu MB), private bytes %llu MB, section commit %llu MB | Vulkan memory %lld MB (host-visible %lld MB) | shader modules made %lld, released %lld (%.0f ms in vkDestroyShaderModule), made again %lld\n",
            (long long)frame, (unsigned long long)(m.ws >> 20), (unsigned long long)(m.priv_ws >> 20), (unsigned long long)(m.peak_ws >> 20), (unsigned long long)(m.priv >> 20),
            (unsigned long long)(m.shared_commit >> 20), (long long)(g_mem_total >> 20), (long long)(host >> 20), (long long)R.modules, (long long)g_mod_released,
@@ -3736,12 +3736,12 @@ static void vk_present(void *arg) { vk_present2(arg, 0); }
  * writes the BMP. The game keeps its pace (the synchronous save waits for the GPU and costs about 32 ms a frame). A frame
  * that finds all ASHOT_N buffers busy is left out ("shot: frame <n> left out"). */
 #define ASHOT_N 8
-static struct { VkBuffer buf; VMem mem; uint64_t size, serial; volatile LONG state; int w, h, bgr; char path[300]; } g_ashot[ASHOT_N];
+static struct { VkBuffer buf; VMem mem; uint64_t size, serial; volatile int32_t state; int w, h, bgr; char path[300]; } g_ashot[ASHOT_N];
 static HANDLE g_ashot_ev;
-static DWORD WINAPI ashot_thread(LPVOID arg) {                 /* state 2 (copied) -> BMP file -> state 0 (free) */
+static uint32_t ashot_thread(void * arg) {                 /* state 2 (copied) -> BMP file -> state 0 (free) */
     (void)arg;
     for (;;) {
-        WaitForSingleObject(g_ashot_ev, INFINITE);
+        WaitForSingleObject(g_ashot_ev, PLAT_INFINITE);
         for (int i = 0; i < ASHOT_N; i++) {
             if (g_ashot[i].state != 2) continue;
             int w = g_ashot[i].w, h = g_ashot[i].h, bgr = g_ashot[i].bgr;
@@ -3758,7 +3758,7 @@ static DWORD WINAPI ashot_thread(LPVOID arg) {                 /* state 2 (copie
                 fwrite(head, 1, 54, f); fwrite(img, 1, (size_t)row * h, f); fclose(f);
             }
             free(img);
-            InterlockedExchange(&g_ashot[i].state, 0);
+            plat_xchg(&g_ashot[i].state, 0);
         }
     }
     return 0;
@@ -3769,7 +3769,7 @@ static int ashot_take(VTex *vt, const char *path) {             /* 1: the copy i
     if (vt->bpb != 4 || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
     for (i = 0; i < ASHOT_N && g_ashot[i].state != 0; i++) {}
     if (i == ASHOT_N) return 0;
-    if (!g_ashot_ev) { g_ashot_ev = CreateEventA(NULL, FALSE, FALSE, NULL); CloseHandle(CreateThread(NULL, 0, ashot_thread, NULL, 0, NULL)); }
+    if (!g_ashot_ev) { g_ashot_ev = plat_event_new(0, 0); CloseHandle(CreateThread(NULL, 0, ashot_thread, NULL, 0, NULL)); }
     if (g_ashot[i].size != size) {                              /* CPU-cached memory when there is some: the thread reads it */
         if (g_ashot[i].buf) { vkDestroyBuffer(V.device, g_ashot[i].buf, NULL); vmem_free(g_ashot[i].mem); }
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -3797,18 +3797,18 @@ static int ashot_take(VTex *vt, const char *path) {             /* 1: the copy i
     g_ashot[i].bgr = vt->fmt == VK_FORMAT_B8G8R8A8_UNORM || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB;
     snprintf(g_ashot[i].path, sizeof g_ashot[i].path, "%s", path);
     g_ashot[i].serial = cmd_submit(NULL, NULL);
-    InterlockedExchange(&g_ashot[i].state, 1);
+    plat_xchg(&g_ashot[i].state, 1);
     return 1;
 }
 static void ashot_poll(void) {                                 /* copies the renderer has seen finish -> the thread */
     int any = 0;
-    for (int i = 0; i < ASHOT_N; i++) if (g_ashot[i].state == 1 && R.done >= g_ashot[i].serial) { InterlockedExchange(&g_ashot[i].state, 2); any = 1; }
-    if (any) SetEvent(g_ashot_ev);
+    for (int i = 0; i < ASHOT_N; i++) if (g_ashot[i].state == 1 && R.done >= g_ashot[i].serial) { plat_xchg(&g_ashot[i].state, 2); any = 1; }
+    if (any) plat_event_set(g_ashot_ev);
 }
 /* SMO_SHOT_RANGES=<first>-<last>[/<every>][,...] (tests, e.g. recording a video): frames saved as with SMO_SHOT_EVERY in
  * several ranges, each logged as "shot: frame <n> audio <sample>", the sample of SMO_AUDIO_WAV's capture written by then.
  * A range p<first>-p<last> counts from the first play frame (frame_ranges_has). */
-static int shot_in_ranges(LONG64 frame, int *any) {
+static int shot_in_ranges(int64_t frame, int *any) {
     static FrameRanges fr;
     static int parsed;
     if (!parsed) { parsed = 1; frame_ranges_parse(&fr, getenv("SMO_SHOT_RANGES")); }
@@ -3819,14 +3819,14 @@ static void vk_present2(void *arg, int progress) {
     PresentJob *j = arg;
     static int shot = -2, every, shot_from, shot_to;
     if (!V.alive) return;
-    LONG64 t_present = tk();
+    int64_t t_present = tk();
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
     VTex *vt = t && !t->dead ? t->vk : NULL;
-    LONG64 frame = nvn_front_frame_next();
+    int64_t frame = nvn_front_frame_next();
     {   /* SMO_VK_WD_TEST=<frame>[,<seconds>] holds the render thread at that frame (default 12 s), to see the watchdog's report */
         static int wt = -2, ws = 12;
         if (wt == -2) { const char *e = getenv("SMO_VK_WD_TEST"); wt = e ? atoi(e) : -1; if (e && strchr(e, ',')) ws = atoi(strchr(e, ',') + 1); }
-        if (wt > 0 && frame == wt && !progress) { printf("nvn_vk_watchdog: TEST: the render thread is held %d s at frame %lld (SMO_VK_WD_TEST)\n", ws, (long long)frame); fflush(stdout); wt = -1; Sleep((DWORD)ws * 1000); }
+        if (wt > 0 && frame == wt && !progress) { printf("nvn_vk_watchdog: TEST: the render thread is held %d s at frame %lld (SMO_VK_WD_TEST)\n", ws, (long long)frame); fflush(stdout); wt = -1; plat_sleep_ms((uint32_t)ws * 1000); }
     }
     if (progress) goto swap;
     if (j->win) for (int i = 0; i < j->win->count && i < 8; i++) wintex_note(j->win->tex[i]);
@@ -3836,7 +3836,7 @@ static void vk_present2(void *arg, int progress) {
     g_wd_where = 0;
     g_ovl.bar_arg = NULL;
     g_ovl.thick = 0;
-    g_render_tid = GetCurrentThreadId();
+    g_render_tid = plat_tid();
     if (g_skip_fr_n) { g_skip_frames++; printf("nvn_vk_skipf: frame %lld (%s): %lld draws left out (shader_wait = skip)\n", (long long)frame, g_in_scene ? "scene" : "no scene", (long long)g_skip_fr_n); g_skip_fr_n = 0; }
     if (shot == -2) { shot = getenv("SMO_SHOT") ? atoi(getenv("SMO_SHOT")) : -1; every = getenv("SMO_SHOT_EVERY") ? atoi(getenv("SMO_SHOT_EVERY")) : 0; shot_from = getenv("SMO_SHOT_FROM") ? atoi(getenv("SMO_SHOT_FROM")) : 0; shot_to = getenv("SMO_SHOT_TO") ? atoi(getenv("SMO_SHOT_TO")) : 0x7fffffff; }
     pass_end();
@@ -3867,13 +3867,13 @@ static void vk_present2(void *arg, int progress) {
     {   /* SMO_CAPTURE_GS=<n>: the Capture button pressed at n frames with a draw with a geometry stage (the lightning), at least
          * 60 frames apart (tests) */
         static int left = -1;
-        static LONG64 seen, last = -1000;
+        static int64_t seen, last = -1000;
         if (left < 0) left = getenv("SMO_CAPTURE_GS") ? atoi(getenv("SMO_CAPTURE_GS")) : 0;
         if (left > 0 && g_gs_draws != seen && frame - last >= 60) { left--; last = frame; smo_capture_request(); }
         seen = g_gs_draws;
     }
     gsq_poll();
-    if (vt && g_capture_req && InterlockedExchange(&g_capture_req, 0)) capture_vk(vt);       /* the Capture button */
+    if (vt && g_capture_req && plat_xchg(&g_capture_req, 0)) capture_vk(vt);       /* the Capture button */
     {   /* SMO_SHOT_PLAY=<n>: one picture at the n-th play frame (dispatches and more than 120 draws), i.e. at the
          * same moment of play whatever the loading took: play_<n>.bmp in SMO_SHOT_DIR */
         static int bshot = -2;
@@ -3907,18 +3907,18 @@ swap: ;
     if (V.swapchain) {      /* the window changed size (F11, display.c): a driver need not say so with OUT_OF_DATE / SUBOPTIMAL */
         RECT rc;
         if (GetClientRect(V.hwnd, &rc) && rc.right > 0 && rc.bottom > 0 && ((uint32_t)rc.right != V.extent.width || (uint32_t)rc.bottom != V.extent.height)) {
-            cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated);
+            cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated);
         }
     }
     int ok = V.swapchain || swapchain_create();
-    InterlockedIncrement64(&g_wd_try);
+    plat_inc(&g_wd_try);
     if (ok) {
         g_wd_where = 2;
         r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, acq, NULL, &index);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); ok = swapchain_create(); if (ok) r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, acq, NULL, &index); }
+        if (r == VK_ERROR_OUT_OF_DATE_KHR) { cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated); ok = swapchain_create(); if (ok) r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, acq, NULL, &index); }
         if (ok && r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vk_ok("vkAcquireNextImageKHR", r); ok = 0; }
     }
-    if (!ok) { InterlockedIncrement64(&g_vk_skipped); cmd_submit(NULL, NULL); }
+    if (!ok) { plat_inc(&g_vk_skipped); cmd_submit(NULL, NULL); }
     else {
         int suboptimal = r == VK_SUBOPTIMAL_KHR;
         VkImageSubresourceRange sr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -3955,32 +3955,32 @@ swap: ;
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
         g_wd_where = 4;
         r = vkQueuePresentKHR(V.queue, &pr);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated); }
         else vk_ok("vkQueuePresentKHR", r);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { g_wd_beat = tk(); }      /* the watchdog's heartbeat = a frame reached the window */
-        if (!progress) InterlockedIncrement64(&g_vk_frames);
+        if (!progress) plat_inc(&g_vk_frames);
     }
     g_wd_where = 0;
     if (progress) { g_ovl_presents++; return; }
-    if (g_occ_qn) { LONG64 w0 = g_occ_waits; occ_resolve(g_occ_present ? g_occ_qn : 0); g_occ_present_waits += g_occ_waits > w0; }      /* the frame's occlusion counts (read by the game in the next frame) */
+    if (g_occ_qn) { int64_t w0 = g_occ_waits; occ_resolve(g_occ_present ? g_occ_qn : 0); g_occ_present_waits += g_occ_waits > w0; }      /* the frame's occlusion counts (read by the game in the next frame) */
     g_tm[4] += tk() - t_present;
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
     passshot_update();                             /* the next frame */
-    { static LONG64 disp_prev; g_in_scene = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_scene) { g_scene_last = frame; g_scene_frames++; } g_frames_counted++; }      /* a frame with compute dispatches: the game draws a scene */
+    { static int64_t disp_prev; g_in_scene = R.dispatches != disp_prev; disp_prev = R.dispatches; if (g_in_scene) { g_scene_last = frame; g_scene_frames++; } g_frames_counted++; }      /* a frame with compute dispatches: the game draws a scene */
     {   /* per-frame record for the "nvn_vk_gpu_play:" line */
-        static LONG64 t_prev;
-        LONG64 t_now = tk();
+        static int64_t t_prev;
+        int64_t t_now = tk();
         int play = g_in_scene && R.frame_draws > 120;        /* a play frame: a scene with more than 120 draws (the loading barrier takes a frame of at most 60 for a loading screen) */
         if (play) g_play_frames++;
         {   /* how long the way to the first play frame took (menus are scripted by polls, so two runs differ by their loading) */
-            static LONG64 t_first, t_load; static int said;
-            LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+            static int64_t t_first, t_load; static int said;
+            plat_counter fq; plat_qpf(&fq);
             if (!t_first) t_first = t_now;
             if (!play && R.frame_draws <= 60 && frame > 600) { if (!t_load) t_load = t_now; } else if (!play && R.frame_draws > 60) t_load = 0;      /* t_load: the start of the run of loading-screen frames before the first play frame */
             if (play && !said) { said = 1; g_first_play = frame; printf("nvn_vk: first play frame is frame %lld, %.1f s after the first present; the loading screen before it lasted %.1f s\n", (long long)frame, (double)(t_now - t_first) / (double)fq.QuadPart, t_load ? (double)(t_now - t_load) / (double)fq.QuadPart : 0.0); }
         }
         if (frame >= 0 && frame < FRSTAT_N) {
-            LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+            plat_counter fq; plat_qpf(&fq);
             g_fr_play[frame] = (uint8_t)play;
             g_fr_wall[frame] = t_prev ? (float)((double)(t_now - t_prev) * 1000.0 / (double)fq.QuadPart) : 0.0f;
         }
@@ -3988,30 +3988,30 @@ swap: ;
         g_cur_frame = frame + 1;
     }
     {   /* what this frame paid for textures made or read at their use (hold log), then the textures made ahead */
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        plat_counter fq; plat_qpf(&fq);
         if (holdlog_on() && g_up_fr_tk * 1000 > 3 * fq.QuadPart) { static int nl; if (nl++ < 300) printf("nvn_vk_upl: frame %lld (%s): %d textures made or read at their use, %.1f MB, %.1f ms\n", (long long)frame, g_in_scene ? "scene" : "no scene", g_up_fr_n, (double)g_up_fr_bytes / 1048576.0, (double)g_up_fr_tk * 1000.0 / (double)fq.QuadPart); }
         g_up_fr_tk = g_up_fr_bytes = 0; g_up_fr_n = 0;
         tex_ahead(frame);
     }
     tex_reclaim(frame);
     if (frame % 300 == 0) {                      /* where the render thread's time went, per frame, in the last 300 frames */
-        static LONG64 last[12], last_sets, last_flush, last_reused, last_disp;
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        static int64_t last[12], last_sets, last_flush, last_reused, last_disp;
+        plat_counter fq; plat_qpf(&fq);
         double k = 1000.0 / (double)fq.QuadPart / 300.0;
-        if (g_ts_on > 0) { static double ts_last; static LONG64 n_last; printf("nvn_vk_gpu: frames %lld..%lld: GPU time %.2f ms per frame (first to last command of %lld command buffers finished in the window)\n", (long long)frame - 300, (long long)frame, (g_ts_ns - ts_last) / 1e6 / 300.0, (long long)(g_ts_n - n_last)); ts_last = g_ts_ns; n_last = g_ts_n; }
+        if (g_ts_on > 0) { static double ts_last; static int64_t n_last; printf("nvn_vk_gpu: frames %lld..%lld: GPU time %.2f ms per frame (first to last command of %lld command buffers finished in the window)\n", (long long)frame - 300, (long long)frame, (g_ts_ns - ts_last) / 1e6 / 300.0, (long long)(g_ts_n - n_last)); ts_last = g_ts_ns; n_last = g_ts_n; }
         printf("nvn_vk_perf: frames %lld..%lld ms/frame: batch replay %.2f (of it: dispatch %.2f, draw preparation %.2f, pipelines %.2f, shader modules %.2f), wait for the GPU %.2f, copy-back %.2f (waiting at batch start %.2f), present %.2f | per frame: %.1f dispatches, %.0f descriptor sets allocated, %.0f reused, %.1f submissions | pipelines not made ahead so far: %lld | holds so far: %lld, %.1f ms, longest %.1f ms\n",
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
         if (g_gs_draws) printf("nvn_vk_gs: frames %lld..%lld: draws with a geometry stage so far %lld, their pipelines %lld\n", (long long)frame - 300, (long long)frame, (long long)g_gs_draws, (long long)g_gs_pipes);
-        { static LONG64 sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
-        {   static LONG64 kl[5];
+        { static int64_t sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
+        {   static int64_t kl[5];
             double mb[5];
             for (int i = 0; i < 5; i++) { mb[i] = (double)(g_rp_kind_bytes[i] - kl[i]) / 300.0 / 1048576.0; kl[i] = g_rp_kind_bytes[i]; }
             printf("nvn_vk_ring_kinds: frames %lld..%lld MB copied a frame: uniform %.2f, storage %.2f, vertex %.2f, index %.2f, other %.2f\n", (long long)frame - 300, (long long)frame, mb[0], mb[1], mb[2], mb[3], mb[4]);
             if (g_hm_on > 0) {
-                static LONG64 lb, lr, lw, lwt, lsu;
-                LARGE_INTEGER hq; QueryPerformanceFrequency(&hq);
+                static int64_t lb, lr, lw, lwt, lsu;
+                plat_counter hq; plat_qpf(&hq);
                 printf("nvn_vk_hostmem: frames %lld..%lld MB a frame: vertex and index read in place %.2f, streamed %.2f | heap pieces imported %d (%lld failed, %.1f ms each) | waits before a host write %.2f a frame (%.3f ms), %lld submissions\n",
                        (long long)frame - 300, (long long)frame, (double)(g_hm_b - lb) / 300.0 / 1048576.0, (double)(g_hm_ring_b - lr) / 300.0 / 1048576.0, g_hs_n, (long long)g_hm_fail,
                        g_hm_made ? (double)g_hm_make_tk * 1000.0 / (double)hq.QuadPart / (double)g_hm_made : 0.0,
@@ -4019,8 +4019,8 @@ swap: ;
                 lb = g_hm_b; lr = g_hm_ring_b; lw = g_hm_waits; lwt = g_hm_wait_tk; lsu = g_hm_submits;
             }
         }
-        { static LONG64 vs_last; printf("nvn_vk_vstage: frames %lld..%lld: %.1f stage lookups a frame missed the stage's last variant (%d samplers made)\n", (long long)frame - 300, (long long)frame, (double)(g_vstage_slow - vs_last) / 300.0, g_nsmp); vs_last = g_vstage_slow; }
-        {   static LONG64 lg[GEN_N], lw[GEN_N], lcalls, lhits, lagain, lagain_b, lbytes, limaxw;
+        { static int64_t vs_last; printf("nvn_vk_vstage: frames %lld..%lld: %.1f stage lookups a frame missed the stage's last variant (%d samplers made)\n", (long long)frame - 300, (long long)frame, (double)(g_vstage_slow - vs_last) / 300.0, g_nsmp); vs_last = g_vstage_slow; }
+        {   static int64_t lg[GEN_N], lw[GEN_N], lcalls, lhits, lagain, lagain_b, lbytes, limaxw;
             double g[GEN_N], w[GEN_N];
             for (int i = 0; i < GEN_N; i++) { g[i] = (double)(g_gen_why[i] - lg[i]) / 300.0; w[i] = (double)(g_wlog_why[i] - lw[i]) / 300.0; }
             printf("nvn_vk_ring: frames %lld..%lld per frame: streamed %.2f MB, ring_put %.0f calls (%.1f%% cached), copied again within a batch %.0f ranges %.2f MB | new generations: batch %.1f, wrap %.2f, texture to buffer %.2f, write log full %.2f | index ranges scanned again after a host write into them %.2f | host writes logged: copy-back %.1f, occlusion %.1f, UpdateUniformBuffer %.1f, report %.1f, buffer copy/clear %.1f\n",
@@ -4038,11 +4038,11 @@ swap: ;
                (long long)frame, (long long)R.images, (long long)R.images_live, (long long)R.views, (long long)R.uploads, (long long)(R.upload_bytes >> 20), (long long)R.modules, (long long)R.pipelines, (long long)R.sets,
                (long long)R.flushes, (long long)R.ring_wraps, (long long)R.feedback, (long long)(g_mem_total >> 20), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
     if (frame % 600 == 0 && R.dispatches) {
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        plat_counter fq; plat_qpf(&fq);
         printf("nvn_vk: compute at frame %lld: %lld dispatches, %lld KB copied back to guest memory, draws using a vertex buffer written by compute in the same batch: %lld, copy-backs forced inside a batch: %lld, waits for the GPU before a copy-back: %lld (%.1f ms in all), %lld buffers made; words the guest wrote into a range pending copy-back: %lld (also written by compute: %lld)\n",
                (long long)frame, (long long)R.dispatches, (long long)(R.cb_bytes >> 10), (long long)R.cb_draws, (long long)R.cb_syncs, (long long)R.cb_waits, (double)R.cb_wait_ticks * 1000.0 / (double)fq.QuadPart, (long long)R.cb_made,
                (long long)R.cb_guest_words, (long long)R.cb_conflict_words);
-        {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        {   plat_counter fq; plat_qpf(&fq);
             printf("nvn_vk: copy-backs forced by (reason: forced in a batch / waits for the GPU / ms waited, so far):");
             for (int i = 0; i < 16; i++) if (g_cbw_forced[i] || g_cbw_waits[i])
                 printf(" %s %lld/%lld/%.0f;", k_cbw_name[i], (long long)g_cbw_forced[i], (long long)g_cbw_waits[i], (double)g_cbw_tk[i] * 1000.0 / (double)fq.QuadPart);
@@ -4138,7 +4138,7 @@ static void vkd_init(void) {
         VKC(vkCreateSampler(V.device, &ci, NULL, &g_smp_default));
     }
     cmd_wait_all();
-    CreateDirectoryA("../cache/vk", NULL);
+    plat_mkdir("../cache/vk");
     prewarm_start();
     wd_start();
     printf("nvn_vk: drawing part ready: %d command buffers in flight, stream ring %llu MB, %u memory types; debug checks %s\n", NSLOT, (unsigned long long)(R.ring_size >> 20), (unsigned)D.mp.memoryTypeCount, D.debug ? "on" : "off (SMO_VK_DEBUG=1)");
@@ -4168,7 +4168,7 @@ static void frstat_report(void) {
 static void vkd_shutdown(void) {
     wd_stop();
     if (!R.ring) return;
-    {   LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    {   plat_counter fq; plat_qpf(&fq);
         double k = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_tex: textures made ahead of their first use: %lld (%.0f MB, %.0f ms in all, at most %.1f ms after one present); made or read at their use: %lld times, %.0f ms (of them in scene frames: %lld, %.0f ms)\n",
                (long long)g_ta_n, (double)g_ta_bytes / 1048576.0, (double)g_ta_tk * k, (double)g_ta_max_tk * k, (long long)g_late_n, (double)g_late_tk * k, (long long)g_late_scene_n, (double)g_late_scene_tk * k);
@@ -4214,7 +4214,7 @@ static void vkd_shutdown(void) {
     printf("nvn_vk: textures nothing names (agl gave up their pool slots; SMO_VK_TEXFREE=%d frames unused): %lld images freed (%lld MB), %d waiting at the end, %lld used again after their image went (made again), %lld first used after\n",
            texfree_frames(), (long long)g_rc_freed, (long long)g_rc_freed_mb, g_rc_n, (long long)g_rc_again, (long long)g_rc_late);
     if (g_occ_reports || g_occ_folds) {
-        LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+        plat_counter fq; plat_qpf(&fq);
         printf("nvn_vk: occlusion counts: %lld reports (%lld written after their frame was presented), %lld compared by a conditional render (%lld of them waited for, %lld answered from the last frame's counts: SMO_VK_OCC_LATE); "
                "%lld waits for the GPU, %.0f ms in all (%lld at a present%s); %lld long counts folded%s\n", (long long)g_occ_reports, (long long)g_occ_late, (long long)g_occ_cond,
                (long long)g_occ_cond_waits, (long long)g_occ_cond_late, (long long)g_occ_waits, (double)g_occ_wait_ticks * 1000.0 / (double)fq.QuadPart, (long long)g_occ_present_waits,

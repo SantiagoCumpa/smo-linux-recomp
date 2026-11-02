@@ -2,7 +2,12 @@
  * call dispatch, import dispatch with tracing, and crash reporting. */
 #include <stdio.h>
 #include <stdlib.h>
-#include <windows.h>
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <sys/mman.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -82,18 +87,18 @@ uint64_t guest_function_of(uint64_t rip) {
 /* ---------------------------------------------------------------- host functions handed to the guest
  * Function pointers the guest obtains at run time (for example through nvnBootstrapLoader) are
  * placeholder addresses in their own range; calling one runs the registered host handler. */
-typedef struct { char name[72]; ImportFn fn; volatile LONG64 calls; LONG64 first; } HostFn;
+typedef struct { char name[72]; ImportFn fn; volatile int64_t calls; int64_t first; } HostFn;
 #define MAX_HOSTFN 4096
 static HostFn g_hostfn[MAX_HOSTFN];
-static volatile LONG g_hostfn_count;
-static volatile LONG64 g_hostfn_seq;
-static SRWLOCK g_hostfn_lock = SRWLOCK_INIT;
-static __declspec(thread) int t_hostfn;
+static volatile int32_t g_hostfn_count;
+static volatile int64_t g_hostfn_seq;
+static plat_rwlock_t g_hostfn_lock = PLAT_RWLOCK_INIT;
+static _Thread_local int t_hostfn;
 
 static void audit_hostfn(const char *name, ImportFn fn);
 static void audit_exit_counts(void);
 uint64_t hostfn_address(const char *name, ImportFn fn) {
-    AcquireSRWLockExclusive(&g_hostfn_lock);
+    plat_rw_wlock(&g_hostfn_lock);
     int i, fresh = 0;
     for (i = 0; i < g_hostfn_count; i++) if (strcmp(g_hostfn[i].name, name) == 0) break;
     if (i == g_hostfn_count && i < MAX_HOSTFN) {
@@ -102,7 +107,7 @@ uint64_t hostfn_address(const char *name, ImportFn fn) {
         g_hostfn_count = i + 1;
         fresh = 1;
     }
-    ReleaseSRWLockExclusive(&g_hostfn_lock);
+    plat_rw_wunlock(&g_hostfn_lock);
     if (fresh) audit_hostfn(name, fn);
     return HOSTFN_BASE + (uint64_t)i * 16;
 }
@@ -136,9 +141,9 @@ void stx_diag(Ctx *c, uint64_t a, uint64_t expected, uint64_t seen, uint64_t v, 
  * seen in that window with a count and the first x0..x2; icall_dump() prints them (boot.c, at the time limit). */
 #define ICALL_MAX 16384
 static struct { uint64_t target, lr, ctx, x0, x1, x2; long long n; } g_icall[ICALL_MAX];
-static volatile LONG g_icall_lock;
+static volatile int32_t g_icall_lock;
 static int g_icall_mode = -1;
-static ULONGLONG g_icall_start, g_icall_end;
+static uint64_t g_icall_start, g_icall_end;
 static unsigned long long g_poke_fn, g_poke_off;
 static unsigned g_poke_val;
 static void icall_record(Ctx *c, uint64_t addr) {
@@ -146,8 +151,8 @@ static void icall_record(Ctx *c, uint64_t addr) {
         int s = 0, d = 0;
         const char *e = getenv("SMO_ICALLS");
         g_icall_mode = e && sscanf(e, "%d,%d", &s, &d) == 2 && d > 0;
-        g_icall_start = GetTickCount64() + (ULONGLONG)s * 1000;
-        g_icall_end = g_icall_start + (ULONGLONG)d * 1000;
+        g_icall_start = plat_ms() + (uint64_t)s * 1000;
+        g_icall_end = g_icall_start + (uint64_t)d * 1000;
         /* Experiment only (changes game DATA, never use for normal runs): SMO_EXPERIMENT_POKE=<fn hex>:<off hex>=<byte hex>
          * writes that byte at x0+off each time fn is called indirectly. */
         e = getenv("SMO_EXPERIMENT_POKE");
@@ -160,11 +165,11 @@ static void icall_record(Ctx *c, uint64_t addr) {
         wr8(c->x[0] + g_poke_off, (uint8_t)g_poke_val);
     }
     if (g_icall_mode != 1) return;
-    ULONGLONG now = GetTickCount64();
+    uint64_t now = plat_ms();
     if (now < g_icall_start || now > g_icall_end) return;
     uint64_t lr = c->x[30], key = addr * 31 + lr * 7 + (uint64_t)(uintptr_t)c;
     unsigned h = (unsigned)((key >> 2) * 2654435761u) % ICALL_MAX;
-    while (InterlockedCompareExchange(&g_icall_lock, 1, 0)) YieldProcessor();
+    while (plat_cas(&g_icall_lock, 1, 0)) plat_pause();
     for (int probe = 0; probe < ICALL_MAX; probe++, h = (h + 1) % ICALL_MAX) {
         if (g_icall[h].target == addr && g_icall[h].lr == lr && g_icall[h].ctx == (uint64_t)(uintptr_t)c) { g_icall[h].n++; break; }
         if (!g_icall[h].target) {
@@ -210,7 +215,7 @@ void call_indirect(Ctx *c, uint64_t addr) {
     }
     if (addr >= HOSTFN_BASE && addr < HOSTFN_BASE + (uint64_t)g_hostfn_count * 16) {
         int i = (int)((addr - HOSTFN_BASE) / 16);
-        if (g_hostfn[i].calls++ == 0) g_hostfn[i].first = InterlockedIncrement64(&g_hostfn_seq);      /* not atomic: 3 game threads made every NVN call a locked add on shared lines; the counts are for reports and traces */
+        if (g_hostfn[i].calls++ == 0) g_hostfn[i].first = plat_inc(&g_hostfn_seq);      /* not atomic: 3 game threads made every NVN call a locked add on shared lines; the counts are for reports and traces */
         t_hostfn = i;
         const char *saved_name = c->in_import;
         uint64_t saved_from = c->import_from;
@@ -232,49 +237,63 @@ void call_indirect(Ctx *c, uint64_t addr) {
 }
 
 /* Register context of the guest code running on this host thread, for crash reports. */
-static __declspec(thread) Ctx *t_cur_ctx;
+static _Thread_local Ctx *t_cur_ctx;
 
 /* debug aid SMO_WATCH=<heap offset>[,<bytes>]: every write to that range of the nn::os memory heap is logged
  * (guest function last entered, its x30, host module + offset, the value after the write). The page is made read-only;
  * a write faults, is logged, runs once with the page writable (single step) and the page is protected again. Writes by
  * another thread during that one step are not seen. Armed by smo_nn.c when the heap is made. At most 400 lines. */
 static uint64_t g_watch_lo, g_watch_hi, g_watch_page, g_watch_off;
-static volatile LONG g_watch_lines;
-static __declspec(thread) int t_watch_step, t_watch_hit;
-static void watch_where(const char *what, CONTEXT *cx) {
+static volatile int32_t g_watch_lines;
+static _Thread_local int t_watch_step, t_watch_hit;
+/* "module+0xoffset" of a host code address (dladdr: the executable or a shared library, offset from its load base) */
+static void host_where(uintptr_t pc, char *out, size_t size, uintptr_t *base_out) {
+    Dl_info di;
+    if (dladdr((void *)pc, &di) && di.dli_fname) {
+        const char *bn = strrchr(di.dli_fname, '/');
+        snprintf(out, size, "%s", bn ? bn + 1 : di.dli_fname);
+        if (base_out) *base_out = (uintptr_t)di.dli_fbase;
+    } else {
+        snprintf(out, size, "?");
+        if (base_out) *base_out = 0;
+    }
+}
+
+static void watch_where(const char *what, uintptr_t rip) {
     Ctx *c = t_cur_ctx;
-    HMODULE m = NULL;
-    char mod[MAX_PATH] = "?";
-    if (InterlockedIncrement(&g_watch_lines) > 400) return;
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)(uintptr_t)cx->Rip, &m) && m) GetModuleFileNameA(m, mod, sizeof mod);
-    const char *base = strrchr(mod, '\\');
+    char mod[PATH_MAX];
+    uintptr_t base;
+    if (plat_inc(&g_watch_lines) > 400) return;
+    host_where(rip, mod, sizeof mod, &base);
     printf("watch: %s heap+0x%llx..: %016llx %016llx | guest f_%llx lr %llx | host %s+0x%llx | thread %lu\n", what,
            (unsigned long long)g_watch_off, (unsigned long long)rd64(g_watch_lo), (unsigned long long)rd64(g_watch_lo + 8),
-           (unsigned long long)(c ? c->fn : 0), (unsigned long long)(c ? c->x[30] : 0), base ? base + 1 : mod, (unsigned long long)(cx->Rip - (uintptr_t)m), GetCurrentThreadId());
+           (unsigned long long)(c ? c->fn : 0), (unsigned long long)(c ? c->x[30] : 0), mod, (unsigned long long)(rip - base), (unsigned long)plat_tid());
     fflush(stdout);
 }
-static LONG WINAPI watch_veh(EXCEPTION_POINTERS *ep) {
-    EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    DWORD old;
-    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->ExceptionInformation[0] == 1 && (er->ExceptionInformation[1] & ~0xfffull) == g_watch_page) {
-        uint64_t a = er->ExceptionInformation[1];
+/* SIGSEGV on the watched page: make it writable and single-step the write (the trap flag); SIGTRAP after the step:
+ * log the new value and protect the page again. Returns 1 when the signal was the watch's. */
+static int watch_signal(int sig, siginfo_t *si, ucontext_t *uc) {
+    if (!g_watch_page) return 0;
+    if (sig == SIGSEGV && ((uintptr_t)si->si_addr & ~0xfffull) == g_watch_page) {
+        uint64_t a = (uint64_t)(uintptr_t)si->si_addr;
         t_watch_hit = a >= g_watch_lo && a < g_watch_hi;
-        VirtualProtect((void *)(uintptr_t)g_watch_page, 0x1000, PAGE_READWRITE, &old);
+        mprotect((void *)(uintptr_t)g_watch_page, 0x1000, PROT_READ | PROT_WRITE);
         t_watch_step = 1;
-        ep->ContextRecord->EFlags |= 0x100;
-        return EXCEPTION_CONTINUE_EXECUTION;
+        uc->uc_mcontext.gregs[REG_EFL] |= 0x100;
+        return 1;
     }
-    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && t_watch_step) {
+    if (sig == SIGTRAP && t_watch_step) {
         t_watch_step = 0;
+        uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
         if (t_watch_hit) {                      /* only writes that change the watched bytes (a loop rewriting one value would fill the log) */
             static uint64_t last[2] = {~0ull, ~0ull};
             uint64_t now0 = rd64(g_watch_lo), now1 = rd64(g_watch_lo + 8);
-            if (now0 != last[0] || now1 != last[1]) { last[0] = now0; last[1] = now1; watch_where("write", ep->ContextRecord); }
+            if (now0 != last[0] || now1 != last[1]) { last[0] = now0; last[1] = now1; watch_where("write", (uintptr_t)uc->uc_mcontext.gregs[REG_RIP]); }
         }
-        VirtualProtect((void *)(uintptr_t)g_watch_page, 0x1000, PAGE_READONLY, &old);
-        return EXCEPTION_CONTINUE_EXECUTION;
+        mprotect((void *)(uintptr_t)g_watch_page, 0x1000, PROT_READ);
+        return 1;
     }
-    return EXCEPTION_CONTINUE_SEARCH;
+    return 0;
 }
 void smo_watch_arm(uint8_t *heap, uint64_t heap_size) {
     const char *e = getenv("SMO_WATCH");
@@ -283,9 +302,7 @@ void smo_watch_arm(uint8_t *heap, uint64_t heap_size) {
     uint64_t off = strtoull(e, &end, 0), len = *end == ',' ? strtoull(end + 1, NULL, 0) : 8;
     if (off + len > heap_size || len == 0 || ((off + len - 1) & ~0xfffull) != (off & ~0xfffull)) { printf("watch: SMO_WATCH=%s is not one range inside one page of the heap\n", e); return; }
     g_watch_off = off; g_watch_lo = (uint64_t)(uintptr_t)heap + off; g_watch_hi = g_watch_lo + len; g_watch_page = g_watch_lo & ~0xfffull;
-    AddVectoredExceptionHandler(1, watch_veh);
-    DWORD old;
-    VirtualProtect((void *)(uintptr_t)g_watch_page, 0x1000, PAGE_READONLY, &old);
+    mprotect((void *)(uintptr_t)g_watch_page, 0x1000, PROT_READ);
     printf("watch: armed on heap+0x%llx, %llu bytes\n", (unsigned long long)off, (unsigned long long)len);
 }
 
@@ -375,8 +392,8 @@ static int g_import_count_all = 1;
 /* suspension of the application by the applet manager (nnmisc.c oe_watch, with graphics.ini unfocused = pause; suyu am/applet.cpp
  * UpdateSuspensionStateLocked -> process->Suspend). While g_guest_frozen is set every guest thread stops at its next call of, or return from, an SDK function and
  * waits here (the console's kernel stops the threads wherever they are; a thread inside a kernel call finishes it there too). */
-volatile LONG g_guest_frozen;
-void guest_freeze_wait(void) { while (g_guest_frozen) Sleep(5); }
+volatile int32_t g_guest_frozen;
+void guest_freeze_wait(void) { while (g_guest_frozen) plat_sleep_ms(5); }
 /* SMO_IMPORT_WATCH=<part of an import's name>: the calls of that one import are timed, and for every
  * frame in which they took more than 2 ms a line says how many there were, what they cost, the slowest one (with the text
  * its third argument points at when it is a printable string: the format of a formatting function) and how many different
@@ -394,22 +411,22 @@ void host_import(Ctx *c, int sym) {
     if (sym != g_watch_sym) { host_import_real(c, sym); return; }
     extern long long nvn_front_frame_next(void);
     static long long cur_frame, n, tks, max_tk, n_all; static char max_txt[72]; static uint64_t max_ra, ras[64]; static int nras; static uint64_t max_x1;
-    static volatile LONG lock;
-    LARGE_INTEGER q0, q1, fq;
+    static volatile int32_t lock;
+    plat_counter q0, q1, fq;
     uint64_t ra = c->x[30], x1 = c->x[1], x2 = c->x[2];
     char txt[72]; txt[0] = 0;
-    {   MEMORY_BASIC_INFORMATION mi;               /* the third argument as text, when it is one (read BEFORE the call: the registers change) */
-        if (x2 > 0x10000 && VirtualQuery((const void *)(uintptr_t)x2, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize > x2 + 80) {
+    {   /* the third argument as text, when it is one (read BEFORE the call: the registers change) */
+        if (x2 > 0x10000 && plat_readable((const void *)(uintptr_t)x2, 81)) {
             const unsigned char *s = (const unsigned char *)(uintptr_t)x2; int k = 0;
             for (; k < 70 && s[k] >= 32 && s[k] < 127; k++) txt[k] = (char)s[k];
             txt[k] = 0;
         }
     }
-    QueryPerformanceCounter(&q0);
+    plat_qpc(&q0);
     host_import_real(c, sym);
-    QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&fq);
+    plat_qpc(&q1); plat_qpf(&fq);
     long long d = q1.QuadPart - q0.QuadPart, fr = nvn_front_frame_next();
-    while (InterlockedExchange(&lock, 1)) YieldProcessor();
+    while (plat_xchg(&lock, 1)) plat_pause();
     if (fr != cur_frame) {
         if (tks * 500 > fq.QuadPart) printf("import_watch: frame %lld: %lld calls, %.2f ms; slowest %.3f ms (argument 1 = %llu, argument 2 as text \"%s\", called from %llx); %d%s different return addresses, the first: %llx %llx %llx %llx; %lld calls since the start\n", cur_frame, n, (double)tks * 1000.0 / (double)fq.QuadPart,
                                              (double)max_tk * 1000.0 / (double)fq.QuadPart, (unsigned long long)max_x1, max_txt, (unsigned long long)max_ra, nras, nras == 64 ? "+" : "", (unsigned long long)ras[0], (unsigned long long)ras[1], (unsigned long long)ras[2], (unsigned long long)ras[3], n_all);
@@ -418,10 +435,10 @@ void host_import(Ctx *c, int sym) {
     n++; n_all++; tks += d;
     if (d > max_tk) { max_tk = d; max_ra = ra; max_x1 = x1; memcpy(max_txt, txt, sizeof max_txt); }
     { int k = 0; for (; k < nras; k++) if (ras[k] == ra) break; if (k == nras && nras < 64) ras[nras++] = ra; }
-    InterlockedExchange(&lock, 0);
+    plat_xchg(&lock, 0);
 }
 static void host_import_real(Ctx *c, int sym) {
-    static volatile LONG order_count;
+    static volatile int32_t order_count;
     if (g_guest_frozen) guest_freeze_wait();
     if (!g_import_count_all && g_import_calls[sym] >= 3 && g_handlers[sym]) {
         const char *saved_name = c->in_import;
@@ -434,10 +451,10 @@ static void host_import_real(Ctx *c, int sym) {
         if (g_guest_frozen) guest_freeze_wait();
         return;
     }
-    unsigned long long n = (unsigned long long)InterlockedIncrement64((volatile LONG64 *)&g_import_calls[sym]);
-    if (n == 1) { g_import_order[InterlockedIncrement(&order_count) - 1] = sym; g_import_order_count = order_count; }
+    unsigned long long n = (unsigned long long)plat_inc((volatile int64_t *)&g_import_calls[sym]);
+    if (n == 1) { g_import_order[plat_inc(&order_count) - 1] = sym; g_import_order_count = order_count; }
     ImportFn fn = g_handlers[sym];
-    InterlockedIncrement64((volatile LONG64 *)&g_trace_seq);
+    plat_inc((volatile int64_t *)&g_trace_seq);
     if (n <= 3) {
         trace_printf("%8llu %s %s  x0=%llx x1=%llx x2=%llx x3=%llx  from=%llx\n", g_trace_seq,
                      fn ? "call " : "STUB ", dyn_syms[sym].name,
@@ -522,53 +539,58 @@ void report_and_exit(int code) {
     { void fontll_report(FILE *out); fontll_report(stdout); }   /* nnfontll.c */
     if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); }
     fflush(stdout);
-    ExitProcess((UINT)code);
+    plat_exit((unsigned)code);
 }
 
+static void crash_report(int code, siginfo_t *si, ucontext_t *uc);
 void guest_trap(const char *what, uint64_t addr) {
-    const char *guest_thread_name_of(DWORD tid);      /* os_threads.c */
-    const char *tn = guest_thread_name_of(GetCurrentThreadId());
+    const char *guest_thread_name_of(uint32_t tid);      /* os_threads.c */
+    const char *tn = guest_thread_name_of(plat_tid());
     printf("\nGUEST TRAP: %s (0x%llx), on thread %s\n", what, (unsigned long long)addr, tn ? tn : "main (or a host thread)");
     trace_printf("GUEST TRAP: %s (0x%llx)\n", what, (unsigned long long)addr);
-    RaiseException(0xE0000001, 0, 0, NULL);
+    crash_report(0xE0000001, NULL, NULL);
     report_and_exit(2);
 }
 void guest_unimpl(uint64_t pc, uint32_t insn, const char *what) {
     printf("\nUNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
     trace_printf("UNTRANSLATED INSTRUCTION at 0x%llx: %08x (%s)\n", (unsigned long long)pc, insn, what);
-    RaiseException(0xE0000002, 0, 0, NULL);
+    crash_report(0xE0000002, NULL, NULL);
     report_and_exit(3);
 }
 void guest_svc(Ctx *c, uint32_t number) { (void)c; guest_trap("svc (direct kernel call)", number); }
 
-static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
-    EXCEPTION_RECORD *er = ep->ExceptionRecord;
-    printf("\nHOST EXCEPTION 0x%08lx at host address %p\n", er->ExceptionCode, er->ExceptionAddress);
-    {   /* name the module and its offset, so the address can be looked up in the linker map (build_exe.py writes
-         * <exe>.map next to the exe) even with address-space randomisation */
-        HMODULE m = NULL;
-        char mod[MAX_PATH] = "?";
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                               (LPCSTR)er->ExceptionAddress, &m) && m) GetModuleFileNameA(m, mod, sizeof mod);
-        printf("  in %s at offset 0x%llx\n", mod, (unsigned long long)((uintptr_t)er->ExceptionAddress - (uintptr_t)m));
+/* The crash report: what faulted (a signal, or code 0xE0000001 guest trap / 0xE0000002 untranslated instruction with
+ * no signal), the guest registers, the host frames (module + offset: tools/lifter/mapaddr.py names them) and the
+ * guest functions among them, then report_and_exit(4). Runs on the thread that crashed, on its signal stack. */
+static void crash_report(int code, siginfo_t *si, ucontext_t *uc) {
+    uintptr_t pc = uc ? (uintptr_t)uc->uc_mcontext.gregs[REG_RIP] : 0;
+    void *frames[64];
+    int nf = backtrace(frames, 64);
+    if (si) {
+        printf("\nHOST EXCEPTION signal %d (%s) code %d at host address %p\n", code, strsignal(code), si->si_code, (void *)pc);
+        char mod[PATH_MAX];
+        uintptr_t base;
+        host_where(pc, mod, sizeof mod, &base);
+        printf("  in %s at offset 0x%llx\n", mod, (unsigned long long)(pc - base));
+        if (code == SIGSEGV || code == SIGBUS)
+            printf("  %s address 0x%llx\n", uc && (uc->uc_mcontext.gregs[REG_ERR] & 2) ? "writing" : "reading",
+                   (unsigned long long)(uintptr_t)si->si_addr);
+    } else {
+        printf("\nHOST EXCEPTION 0x%08x (%s)\n", code, code == 0xE0000001 ? "guest trap" : "untranslated instruction");
     }
-    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
-        printf("  %s address 0x%llx\n", er->ExceptionInformation[0] == 1 ? "writing" : "reading",
-               (unsigned long long)er->ExceptionInformation[1]);
     dump_guest_registers();
     if (getenv("SMO_CRASH_DUMP") && t_cur_ctx) {   /* debug aid: what the guest registers point to (SMO_CRASH_DUMP=<bytes>, 1 = 0x60) */
         int dlen = (int)strtol(getenv("SMO_CRASH_DUMP"), NULL, 0);
         if (dlen < 0x60) dlen = 0x60;
         if (dlen > 0x1000) dlen = 0x1000;
+#define READABLE(a, n) ((a) > 0x10000 && plat_readable((const void *)(uintptr_t)(a), (size_t)(n)))
         for (int r = 0; r < 31; r++) {
             uint64_t v = t_cur_ctx->x[r];
-            MEMORY_BASIC_INFORMATION mi;
-            if (v < 0x10000 || !VirtualQuery((void *)(uintptr_t)v, &mi, sizeof mi) || mi.State != MEM_COMMIT || (mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))
-                || (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize < v + (uint64_t)dlen) continue;
+            if (!READABLE(v, dlen)) continue;
             printf("  [x%d = %llx]", r, (unsigned long long)v);
             for (int k = 0; k < dlen; k += 8) printf("%s%016llx", k % 0x20 ? " " : "\n     ", (unsigned long long)rd64(v + (uint64_t)k));
             uint64_t s = rd64(v + 0x20);
-            if (s > 0x10000 && VirtualQuery((void *)(uintptr_t)s, &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) {
+            if (READABLE(s, 61)) {
                 const unsigned char *p = (const unsigned char *)(uintptr_t)s; int n = 0;
                 while (n < 60 && p[n] >= 32 && p[n] < 127) n++;
                 if (n >= 3 && p[n] == 0) printf("\n     [+0x20] -> \"%.*s\"", n, (const char *)p);
@@ -577,8 +599,6 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
         }
         {   /* debug aid: registers that point at a C string, and the guest frame-pointer chain (x29 -> {fp, lr}):
              * the game is built with frame pointers, so this is the guest call stack even when the host stack has no unwind info */
-            MEMORY_BASIC_INFORMATION mi;
-#define READABLE(a, n) ((a) > 0x10000 && VirtualQuery((void *)(uintptr_t)(a), &mi, sizeof mi) && mi.State == MEM_COMMIT && !(mi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) && (uint64_t)(uintptr_t)mi.BaseAddress + mi.RegionSize >= (a) + (n))
             for (int r = 0; r < 31; r++) {
                 uint64_t v = t_cur_ctx->x[r];
                 if (!READABLE(v, 64)) continue;
@@ -596,42 +616,53 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *ep) {
                 fp = nfp;
             }
             printf("\n");
+        }
 #undef READABLE
-        }
     }
-    {   /* the host frames too (module + offset; tools/lifter/mapaddr.py names them from the exe's map) */
-        CONTEXT hc = *ep->ContextRecord;
-        printf("host call stack (innermost first):\n");
-        for (int depth = 0; depth < 16 && hc.Rip; depth++) {
-            HMODULE m = NULL;
-            char mod[MAX_PATH] = "?";
-            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                   (LPCSTR)(uintptr_t)hc.Rip, &m) && m) GetModuleFileNameA(m, mod, sizeof mod);
-            const char *bn = strrchr(mod, '\\');
-            printf("  %s+0x%llx\n", bn ? bn + 1 : mod, (unsigned long long)(hc.Rip - (uintptr_t)m));
-            DWORD64 image_base;
-            RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(hc.Rip, &image_base, NULL);
-            if (!rf) break;
-            void *hd; DWORD64 est;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, hc.Rip, rf, &hc, &hd, &est, NULL);
-        }
+    /* the host frames (module + offset; tools/lifter/mapaddr.py names them from the binary's symbols). backtrace() walks
+     * from this handler through the signal frame (glibc's unwinder knows it) into the code that faulted. */
+    printf("host call stack (innermost first):\n");
+    int start = 0;
+    if (pc) for (int i = 0; i < nf; i++) if ((uintptr_t)frames[i] == pc) { start = i; break; }
+    if (pc && (uintptr_t)frames[start] != pc) {
+        char mod[PATH_MAX]; uintptr_t base;
+        host_where(pc, mod, sizeof mod, &base);
+        printf("  %s+0x%llx\n", mod, (unsigned long long)(pc - base));
+    }
+    for (int i = start; i < nf && i < start + 24; i++) {
+        char mod[PATH_MAX]; uintptr_t base;
+        host_where((uintptr_t)frames[i], mod, sizeof mod, &base);
+        printf("  %s+0x%llx\n", mod, (unsigned long long)((uintptr_t)frames[i] - base));
     }
     printf("guest call stack (innermost first):\n");
-    CONTEXT ctx = *ep->ContextRecord;
     uint64_t last = 0;
-    for (int depth = 0, shown = 0; depth < 400 && shown < 40; depth++) {
-        uint64_t g = guest_function_of(ctx.Rip);
+    {   uint64_t g = pc ? guest_function_of(pc) : 0;
+        if (g) { printf("  f_%llx\n", (unsigned long long)g); last = g; } }
+    for (int i = start, shown = 0; i < nf && shown < 40; i++) {
+        uint64_t g = guest_function_of((uintptr_t)frames[i]);
         if (g && g != last) { printf("  f_%llx\n", (unsigned long long)g); shown++; last = g; }
-        DWORD64 image_base;
-        RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &image_base, NULL);
-        if (!rf) break;
-        void *handler_data;
-        DWORD64 establisher;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, rf, &ctx, &handler_data, &establisher, NULL);
-        if (!ctx.Rip) break;
     }
-    report_and_exit(4);
-    return EXCEPTION_EXECUTE_HANDLER;
+    fflush(stdout);
+    if (si) report_and_exit(4);
+}
+
+static volatile int32_t g_crashing;
+static void crash_signal(int sig, siginfo_t *si, void *ucv) {
+    ucontext_t *uc = ucv;
+    if (watch_signal(sig, si, uc)) return;
+    if (plat_xchg(&g_crashing, 1)) { for (;;) pause(); }   /* a second thread crashing waits for the first report */
+    crash_report(sig, si, uc);
+}
+
+static void install_crash_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = crash_signal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP};
+    for (unsigned i = 0; i < sizeof sigs / sizeof sigs[0]; i++) sigaction(sigs[i], &sa, NULL);
+    plat_thread_altstack();
 }
 
 /* ---------------------------------------------------------------- loader */
@@ -652,12 +683,12 @@ void runtime_init(const char *elf, const char *trace_path) {
                (void *)g_by_host[0].fn, (void *)g_by_host[fn_table_count - 1].fn);
     }
     g_trace = fopen(trace_path, "w");
-    SetUnhandledExceptionFilter(crash_filter);
+    install_crash_handlers();
 
-    void *mem = VirtualAlloc((void *)GUEST_BASE, IMAGE_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void *mem = plat_alloc((void *)GUEST_BASE, IMAGE_SIZE, PLAT_RW);
     if (mem != (void *)GUEST_BASE) { fprintf(stderr, "cannot map guest image at 0x%llx\n", GUEST_BASE); exit(1); }
     /* data symbols provided by other modules: zero-filled placeholders, IMPORT_SLOT bytes each */
-    void *imp = VirtualAlloc((void *)IMPORT_BASE, (SIZE_T)dyn_sym_count * IMPORT_SLOT, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    void *imp = plat_alloc((void *)IMPORT_BASE, (size_t)dyn_sym_count * IMPORT_SLOT, PLAT_RW);
     if (imp != (void *)IMPORT_BASE) { fprintf(stderr, "cannot map import area\n"); exit(1); }
     FILE *f = fopen(elf, "rb");
     if (!f) { fprintf(stderr, "cannot open %s\n", elf); exit(1); }
@@ -693,8 +724,7 @@ void runtime_init(const char *elf, const char *trace_path) {
      * relocations are applied (all of them land in the data segment: the image would not load on the console otherwise), so a
      * wild write into code or constants faults instead of corrupting silently. SMO_NO_PROTECT=1 leaves the old mapping. */
     if (!getenv("SMO_NO_PROTECT")) {
-        DWORD oldp;
-        if (!VirtualProtect((void *)GUEST_BASE, GUEST_RO_END, PAGE_READONLY, &oldp)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
+        if (!plat_protect((void *)GUEST_BASE, GUEST_RO_END, PLAT_R)) { fprintf(stderr, "cannot protect the image's text and read-only data\n"); exit(1); }
         printf("image protection: 0x%llx..0x%llx read-only (text, read-only data), data and bss read-write\n", GUEST_BASE, GUEST_BASE + GUEST_RO_END);
     }
 }
@@ -719,28 +749,29 @@ int audit_trivial(ImportFn fn, long long *x0, int *sets_x0) {
     long long rax = 0;
     *x0 = 0; *sets_x0 = 0;
     if (!p) return 0;
+    if (p[0] == 0xF3 && p[1] == 0x0F && p[2] == 0x1E && p[3] == 0xFA) p += 4;                  /* endbr64 */
     for (int hop = 0; hop < 4 && p[0] == 0xE9; hop++) p = p + 5 + *(const int *)(p + 1);      /* linker thunk / tail jump */
     for (int step = 0; step < 12; step++) {
         const unsigned char *q = p;
         int w = 0;
         if (q[0] == 0xC3) return stores ? 2 : 1;
         if (q[0] == 0x48) { w = 1; q++; }
-        if (q[0] == 0xC7 && (q[1] == 0x01 || q[1] == 0x41 || q[1] == 0x81)) {                   /* mov [rcx+d], imm32 */
+        if (q[0] == 0xC7 && (q[1] == 0x07 || q[1] == 0x47 || q[1] == 0x87)) {                   /* mov [rdi+d], imm32 (SysV: Ctx * in rdi) */
             long long disp = 0;
             int modrm = q[1];
             q += 2;
-            if (modrm == 0x41) { disp = (signed char)q[0]; q += 1; } else if (modrm == 0x81) { disp = *(const int *)q; q += 4; }
+            if (modrm == 0x47) { disp = (signed char)q[0]; q += 1; } else if (modrm == 0x87) { disp = *(const int *)q; q += 4; }
             if (disp == 0) { *x0 = w ? (long long)*(const int *)q : (long long)*(const unsigned *)q; *sets_x0 = 1; }
             q += 4; stores++; p = q; continue;
         }
-        if (w && q[0] == 0x83 && q[1] == 0x21 && q[2] == 0x00) { *x0 = 0; *sets_x0 = 1; stores++; p = q + 3; continue; }   /* and qword [rcx], 0 */
+        if (w && q[0] == 0x83 && q[1] == 0x27 && q[2] == 0x00) { *x0 = 0; *sets_x0 = 1; stores++; p = q + 3; continue; }   /* and qword [rdi], 0 */
         if (w && q[0] == 0xB8) { rax = *(const long long *)(q + 1); p = q + 9; continue; }      /* movabs rax, imm64 */
         if (!w && q[0] == 0xB8) { rax = *(const unsigned *)(q + 1); p = q + 5; continue; }      /* mov eax, imm32 */
         if (!w && q[0] == 0x31 && q[1] == 0xC0) { rax = 0; p = q + 2; continue; }               /* xor eax, eax */
-        if (w && q[0] == 0x89 && q[1] == 0x01) { *x0 = rax; *sets_x0 = 1; stores++; p = q + 2; continue; }   /* mov [rcx], rax */
+        if (w && q[0] == 0x89 && q[1] == 0x07) { *x0 = rax; *sets_x0 = 1; stores++; p = q + 2; continue; }   /* mov [rdi], rax */
         if (!w && q[0] == 0x0F && q[1] == 0x57 && q[2] == 0xC0) { p = q + 3; continue; }        /* xorps xmm0, xmm0 */
-        if (!w && q[0] == 0x0F && (q[1] == 0x11 || q[1] == 0x29) && (q[2] == 0x41 || q[2] == 0x81)) {   /* movups/movaps [rcx+d], xmm0 */
-            p = q + (q[2] == 0x41 ? 4 : 7); stores++; continue;
+        if (!w && q[0] == 0x0F && (q[1] == 0x11 || q[1] == 0x29) && (q[2] == 0x47 || q[2] == 0x87)) {   /* movups/movaps [rdi+d], xmm0 */
+            p = q + (q[2] == 0x47 ? 4 : 7); stores++; continue;
         }
         return 0;
     }
@@ -775,12 +806,13 @@ static void audit_hostfn(const char *name, ImportFn fn) {
     printf("STRICT: run-time host function \"%s\" is bound to a do-nothing handler (%s)\n", name, what);
     trace_printf("STRICT: run-time host function \"%s\": %s\n", name, what);
     g_audit_hostfn_bad++;
-    if (g_strict == 1 && g_audit_started) { printf("STRICT: stopping (SMO_STRICT=report lists everything without stopping)\n"); fflush(stdout); ExitProcess(5); }
+    if (g_strict == 1 && g_audit_started) { printf("STRICT: stopping (SMO_STRICT=report lists everything without stopping)\n"); fflush(stdout); plat_exit(5); }
 }
 
 static void audit_write(const char *path, int with_counts) {
     FILE *f = fopen(path, "w");
-    uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+    uintptr_t base = 0;
+    {   Dl_info di; if (dladdr((void *)audit_write, &di)) base = (uintptr_t)di.dli_fbase; }
     if (!f) { printf("audit: cannot write %s\n", path); return; }
     fprintf(f, "# list\tname\tcalls\thandler_rva\tkind\tx0\tdata_redirect\n");
     for (int i = 0; i < dyn_sym_count; i++) {
@@ -834,12 +866,12 @@ void audit_startup(void) {
     }
     printf("strict check: %d imports bound to do-nothing handlers, %d without handler or data%s\n",
            trivial, unbound, audit_mode() ? "" : " (SMO_STRICT=1 lists them and stops)");
-    if (dump && dump[0]) { audit_write(dump, 0); fflush(stdout); ExitProcess(0); }
+    if (dump && dump[0]) { audit_write(dump, 0); fflush(stdout); plat_exit(0); }
     g_audit_started = 1;
     bad += g_audit_hostfn_bad;
     if (bad && audit_mode() == 1) {
         printf("STRICT: %d binding(s) do nothing or have no handler: stopping (SMO_STRICT=report lists them without stopping)\n", bad);
         fflush(stdout);
-        ExitProcess(5);
+        plat_exit(5);
     }
 }

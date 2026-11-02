@@ -6,7 +6,7 @@
  * Environment switches of the test scripts (SMO_RENDERER, SMO_VK_DEVICE, SMO_VK_PRESENT) win over the file.
  * The controllers.ini reader of nnpad_sdl.c is built around its device sections and is not reusable here: this file has
  * its own 30-line reader (key = value, ';' or '#' comments, section headers ignored). */
-#include <windows.h>
+#include "plat.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,22 +98,22 @@ static void trim(char *s) {
 }
 static void opt_path(char *out) {
     const char *e = getenv("SMO_GRAPHICS_CONFIG"), *c = getenv("SMO_CONFIG");
-    char tmp[MAX_PATH], exe[MAX_PATH];
-    if (e && e[0]) { snprintf(out, MAX_PATH, "%s", e); return; }
+    char tmp[PATH_MAX], exe[PATH_MAX];
+    if (e && e[0]) { snprintf(out, PATH_MAX, "%s", e); return; }
     if (c && c[0]) {
         snprintf(tmp, sizeof tmp, "%s", c);
         char *s = strrchr(tmp, '\\'), *s2 = strrchr(tmp, '/');
         if (s2 > s) s = s2;
-        if (s) { *s = 0; snprintf(out, MAX_PATH, "%s\\graphics.ini", tmp); } else snprintf(out, MAX_PATH, "graphics.ini");
+        if (s) { *s = 0; snprintf(out, PATH_MAX, "%s\\graphics.ini", tmp); } else snprintf(out, PATH_MAX, "graphics.ini");
         return;
     }
-    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    snprintf(exe, sizeof exe, "%s", plat_exe_path());
     char *s = strrchr(exe, '\\');
     if (s) *s = 0;
     snprintf(tmp, sizeof tmp, "%s\\..\\config\\graphics.ini", exe);
-    if (!_fullpath(out, tmp, MAX_PATH)) snprintf(out, MAX_PATH, "%s", tmp);
+    if (!_fullpath(out, tmp, PATH_MAX)) snprintf(out, PATH_MAX, "%s", tmp);
 }
-static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
+static int opt_load(PINIT_ONCE once, void * arg, void * *ctx) {
     (void)once; (void)arg; (void)ctx;
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
@@ -122,9 +122,9 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
-        char b[MAX_PATH];
+        char b[PATH_MAX];
         snprintf(b, sizeof b, "%s", o->path);
-        for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; CreateDirectoryA(b, NULL); *p = '\\'; }
+        for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; plat_mkdir(b); *p = '\\'; }
         if ((f = fopen(o->path, "wb")) != NULL) { fwrite(k_default_ini, 1, strlen(k_default_ini), f); fclose(f); written = 1; }
         f = fopen(o->path, "rb");
     }
@@ -135,19 +135,19 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
         if (!line[0] || line[0] == ';' || line[0] == '#' || line[0] == '[' || !(eq = strchr(line, '='))) continue;
         *eq = 0; val = eq + 1;
         trim(key); trim(val);
-        if (!_stricmp(key, "renderer")) o->renderer = !_stricmp(val, "opengl") || !_stricmp(val, "gl");
-        else if (!_stricmp(key, "window")) o->window_mode = !_stricmp(val, "borderless_fullscreen") || !_stricmp(val, "borderless") ? 1 : !_stricmp(val, "fullscreen") ? 2 : !_stricmp(val, "windowed") ? 0 : 3;
-        else if (!_stricmp(key, "width")) { int v = atoi(val); if (v >= 320 && v <= 16384) o->width = v; }
-        else if (!_stricmp(key, "height")) { int v = atoi(val); if (v >= 180 && v <= 16384) o->height = v; }
-        else if (!_stricmp(key, "vsync")) o->present = !_stricmp(val, "on") ? 1 : !_stricmp(val, "off") ? 2 : !_stricmp(val, "mailbox") ? 3 : 0;
-        else if (!_stricmp(key, "gpu")) { if (_stricmp(val, "auto")) snprintf(o->gpu, sizeof o->gpu, "%s", val); }
-        else if (!_stricmp(key, "console_mode")) o->handheld = !_stricmp(val, "handheld");
-        else if (!_stricmp(key, "resolution_scale")) { float v = (float)atof(val); if (v > 0) o->scale = v; }
-        else if (!_stricmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
-        else if (!_stricmp(key, "frame_time_overlay")) o->overlay = !_stricmp(val, "on") || !strcmp(val, "1");
-        else if (!_stricmp(key, "profile")) o->profile = !_stricmp(val, "low");
-        else if (!_stricmp(key, "shader_wait")) o->shader_skip = !_stricmp(val, "skip");
-        else if (!_stricmp(key, "unfocused")) o->pause_unfocused = !_stricmp(val, "pause");
+        if (!strcasecmp(key, "renderer")) o->renderer = !strcasecmp(val, "opengl") || !strcasecmp(val, "gl");
+        else if (!strcasecmp(key, "window")) o->window_mode = !strcasecmp(val, "borderless_fullscreen") || !strcasecmp(val, "borderless") ? 1 : !strcasecmp(val, "fullscreen") ? 2 : !strcasecmp(val, "windowed") ? 0 : 3;
+        else if (!strcasecmp(key, "width")) { int v = atoi(val); if (v >= 320 && v <= 16384) o->width = v; }
+        else if (!strcasecmp(key, "height")) { int v = atoi(val); if (v >= 180 && v <= 16384) o->height = v; }
+        else if (!strcasecmp(key, "vsync")) o->present = !strcasecmp(val, "on") ? 1 : !strcasecmp(val, "off") ? 2 : !strcasecmp(val, "mailbox") ? 3 : 0;
+        else if (!strcasecmp(key, "gpu")) { if (strcasecmp(val, "auto")) snprintf(o->gpu, sizeof o->gpu, "%s", val); }
+        else if (!strcasecmp(key, "console_mode")) o->handheld = !strcasecmp(val, "handheld");
+        else if (!strcasecmp(key, "resolution_scale")) { float v = (float)atof(val); if (v > 0) o->scale = v; }
+        else if (!strcasecmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
+        else if (!strcasecmp(key, "frame_time_overlay")) o->overlay = !strcasecmp(val, "on") || !strcmp(val, "1");
+        else if (!strcasecmp(key, "profile")) o->profile = !strcasecmp(val, "low");
+        else if (!strcasecmp(key, "shader_wait")) o->shader_skip = !strcasecmp(val, "skip");
+        else if (!strcasecmp(key, "unfocused")) o->pause_unfocused = !strcasecmp(val, "pause");
         else unknown++;
     }
     if (f) fclose(f);
@@ -164,7 +164,7 @@ static BOOL CALLBACK opt_load(PINIT_ONCE once, PVOID arg, PVOID *ctx) {
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
     fflush(stdout);
-    return TRUE;
+    return 1;
 }
 const GfxOptions *gfx_options(void) {
     InitOnceExecuteOnce(&g_once, opt_load, NULL, NULL);

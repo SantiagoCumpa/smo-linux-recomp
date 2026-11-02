@@ -30,7 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include <GL/gl.h>
 #include "nvn_misc.h"
 
@@ -93,7 +93,7 @@ int nvn_misc_draw_texture_gl(unsigned tex, unsigned smp, const NvnDrawTexture *w
     if (!p_DrawTextureNV || !p_GetTextureParameteriv || !p_GetTextureLevelParameteriv) {
         printf("nvn: stopping: nvnCommandBufferDrawTexture needs GL_NV_draw_texture and OpenGL 4.5, which this driver lacks\n");
         fflush(stdout);
-        ExitProcess(6);
+        plat_exit(6);
     }
     p_GetTextureParameteriv(tex, 0x1006 /* TEXTURE_TARGET */, &target);
     if (target != GL_TEXTURE_2D && target != 0x84F5 /* TEXTURE_RECTANGLE */) return 0;
@@ -212,7 +212,7 @@ void nvn_misc_gl_selftest_hook(void) {
     p_FramebufferTexture = (void *)wglGetProcAddress("glFramebufferTexture"); p_CheckFramebufferStatus = (void *)wglGetProcAddress("glCheckFramebufferStatus");
     p_TexStorage2D = (void *)wglGetProcAddress("glTexStorage2D"); p_GenSamplers = (void *)wglGetProcAddress("glGenSamplers"); p_SamplerParameteri = (void *)wglGetProcAddress("glSamplerParameteri");
     printf("NVN OpenGL self-test: GL_NV_draw_texture %s\n", p_DrawTextureNV ? "present" : "MISSING");
-    if (!p_DrawTextureNV) { fflush(stdout); ExitProcess(1); }
+    if (!p_DrawTextureNV) { fflush(stdout); plat_exit(1); }
     glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex); p_TexStorage2D(GL_TEXTURE_2D, 1, 0x8058 /* RGBA8 */, 4, 2);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1); glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 4, 2, GL_RGBA, GL_UNSIGNED_BYTE, texels);
@@ -224,7 +224,7 @@ void nvn_misc_gl_selftest_hook(void) {
     p_SamplerParameteri(smp, GL_TEXTURE_WRAP_S, 0x812F /* CLAMP_TO_EDGE */); p_SamplerParameteri(smp, GL_TEXTURE_WRAP_T, 0x812F);
     p_GenFramebuffers(1, &fbo); p_BindFramebuffer(0x8D40, fbo);
     p_FramebufferTexture(0x8D40, 0x8CE0 /* COLOR_ATTACHMENT0 */, target, 0); p_FramebufferTexture(0x8D40, 0x821A /* DEPTH_STENCIL_ATTACHMENT */, depth, 0);
-    if (p_CheckFramebufferStatus(0x8D40) != 0x8CD5) { printf("  FAIL framebuffer incomplete\n"); fflush(stdout); ExitProcess(1); }
+    if (p_CheckFramebufferStatus(0x8D40) != 0x8CD5) { printf("  FAIL framebuffer incomplete\n"); fflush(stdout); plat_exit(1); }
     glViewport(0, 0, 16, 16);
     n++; bad += gltest_case("each texel -> 2x2 pixels, destination (4,2)-(12,6), row 0 of the texture at the lower window y", tex, smp, dst, src, texels, 0, 0);
     n++; bad += gltest_case("source x reversed", tex, smp, dst, src_fx, texels, 1, 0);
@@ -260,5 +260,5 @@ void nvn_misc_gl_selftest_hook(void) {
     n++; if (err) { bad++; printf("  FAIL OpenGL error 0x%x\n", err); }
     printf("NVN OpenGL self-test: %d cases, %d failure(s)\n", n, bad);
     fflush(stdout);
-    ExitProcess((UINT)bad);
+    plat_exit((unsigned)bad);
 }

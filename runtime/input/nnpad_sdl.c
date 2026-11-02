@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include <windows.h>
+#include "plat.h"
 #include <SDL3/SDL.h>
 #include "nnpad.h"
 
@@ -28,7 +28,7 @@ typedef struct {
     Src map[16][4]; int nmap[16];       /* -1 = unset: the default for this device */
 } DevCfg;
 typedef struct {
-    char path[MAX_PATH]; ULONGLONG mtime;
+    char path[PATH_MAX]; uint64_t mtime;
     DevCfg def; DevCfg dev[MAXCFG]; int ndev;
     char pguid[8][40]; int pnone[8];    /* [players]: a GUID reserves the slot for that device, none = nobody */
     char ignore[16][40]; int nignore;   /* [general] ignore = <GUID>: devices that are never used */
@@ -42,7 +42,7 @@ typedef struct {
     SDL_JoystickID id; SDL_Gamepad *gp; SDL_Joystick *js;
     int slot, wireless, nbtn, naxes, nhats, gtype, has_accel, has_gyro, virt;
     char guid[40], name[80];
-    Uint16 rl, rh; ULONGLONG rsent;
+    Uint16 rl, rh; uint64_t rsent;
 } Dev;
 
 static const char *const g_pro[16] = {"A", "B", "X", "Y", "STICK_L", "STICK_R", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "LEFT", "UP", "RIGHT", "DOWN"};
@@ -55,20 +55,20 @@ static const char *const g_kbn[24] = {"A", "B", "X", "Y", "STICK_L", "STICK_R", 
 static const int g_kb_default[24] = {'Z', 'X', 'C', 'V', 0, 0, 'Q', 'E', 'A', 'S', VK_RETURN, VK_BACK, 'J', 'I', 'L', 'K',
     VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN, 0, 0, 0, 0};
 
-static CRITICAL_SECTION g_cs;
-static volatile LONG g_cs_ready;
+static plat_lock_t g_cs;
+static volatile int32_t g_cs_ready;
 static int g_sdl_ok, g_inited, g_only_virtual, g_quiet;
 static Cfg g_cfg;
 static Dev g_dev[MAXDEV];
 static struct { char guid[40]; int slot; } g_mem[32];
 static int g_mem_n;
 static int g_kb_slot = -3;                  /* resolved lazily */
-static ULONGLONG g_init_ms;
-static LARGE_INTEGER g_qpf, g_last_poll;
-static ULONGLONG g_last_cfg_check;
+static uint64_t g_init_ms;
+static plat_counter g_qpf, g_last_poll;
+static uint64_t g_last_cfg_check;
 
-static void lock(void) { if (!g_cs_ready) { if (InterlockedCompareExchange(&g_cs_ready, 2, 0) == 0) { InitializeCriticalSection(&g_cs); g_cs_ready = 1; } while (g_cs_ready != 1) Sleep(0); } EnterCriticalSection(&g_cs); }
-static void unlock(void) { LeaveCriticalSection(&g_cs); }
+static void lock(void) { if (!g_cs_ready) { if (plat_cas(&g_cs_ready, 2, 0) == 0) { plat_lock_init(&g_cs); g_cs_ready = 1; } while (g_cs_ready != 1) plat_sleep_ms(0); } plat_lock(&g_cs); }
+static void unlock(void) { plat_unlock(&g_cs); }
 #define say(...) do { if (!g_quiet) printf(__VA_ARGS__); } while (0)
 
 /* ================================================================ sources
@@ -94,25 +94,25 @@ static int src_parse(const char *t, Src *s) {
     snprintf(b, sizeof b, "%s", t);
     n = strlen(b);
     while (n && (b[n - 1] == ' ' || b[n - 1] == '\t' || b[n - 1] == '\r' || b[n - 1] == '\n')) b[--n] = 0;
-    if (!_stricmp(b, "none") || !b[0]) return 1;
-    for (int i = 0; i < (int)(sizeof g_gpbtn / sizeof g_gpbtn[0]); i++) if (!_stricmp(b, g_gpbtn[i])) { s->kind = SK_BTN; s->idx = (short)i; return 1; }
+    if (!strcasecmp(b, "none") || !b[0]) return 1;
+    for (int i = 0; i < (int)(sizeof g_gpbtn / sizeof g_gpbtn[0]); i++) if (!strcasecmp(b, g_gpbtn[i])) { s->kind = SK_BTN; s->idx = (short)i; return 1; }
     for (int i = 0; i < 6; i++) {
         size_t l = strlen(g_gpax[i]);
-        if (_strnicmp(b, g_gpax[i], l)) continue;
+        if (strncasecmp(b, g_gpax[i], l)) continue;
         if (!b[l]) { s->kind = i >= 4 ? SK_AXP : SK_AXF; s->idx = (short)i; return 1; }
         if (!b[l + 1] && (b[l] == '+' || b[l] == '-')) { s->kind = b[l] == '+' ? SK_AXP : SK_AXN; s->idx = (short)i; return 1; }
     }
     s->raw = 1;
-    if (!_strnicmp(b, "button", 6) && b[6] >= '0' && b[6] <= '9') { s->kind = SK_BTN; s->idx = (short)atoi(b + 6); return 1; }
-    if (!_strnicmp(b, "axis", 4) && b[4] >= '0' && b[4] <= '9') {
+    if (!strncasecmp(b, "button", 6) && b[6] >= '0' && b[6] <= '9') { s->kind = SK_BTN; s->idx = (short)atoi(b + 6); return 1; }
+    if (!strncasecmp(b, "axis", 4) && b[4] >= '0' && b[4] <= '9') {
         char *e; int i = (int)strtol(b + 4, &e, 10);
         s->idx = (short)i; s->kind = *e == '+' ? SK_AXP : *e == '-' ? SK_AXN : SK_AXF;
         return !*e || ((*e == '+' || *e == '-') && !e[1]);
     }
-    if (!_strnicmp(b, "hat", 3) && b[3] >= '0' && b[3] <= '9') {
+    if (!strncasecmp(b, "hat", 3) && b[3] >= '0' && b[3] <= '9') {
         char *e; int h = (int)strtol(b + 3, &e, 10);
         static const char *const dir[4] = {"up", "right", "down", "left"};
-        for (int d = 0; d < 4; d++) if (!_stricmp(e, dir[d])) { s->kind = SK_HAT; s->idx = (short)(h << 4 | 1 << d); return 1; }
+        for (int d = 0; d < 4; d++) if (!strcasecmp(e, dir[d])) { s->kind = SK_HAT; s->idx = (short)(h << 4 | 1 << d); return 1; }
     }
     memset(s, 0, sizeof *s);
     return 0;
@@ -207,7 +207,7 @@ static unsigned parse_combo(char *v) {                    /* "STICK_L+STICK_R" -
         while (*tok == ' ' || *tok == '\t') tok++;
         for (char *p = tok + strlen(tok); p > tok && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
         int found = 0;
-        for (int b = 0; b < 16; b++) if (!_stricmp(tok, g_pro[b])) { bits |= 1u << b; found = 1; }
+        for (int b = 0; b < 16; b++) if (!strcasecmp(tok, g_pro[b])) { bits |= 1u << b; found = 1; }
         if (!found) return 0;
         tok = plus ? plus + 1 : NULL;
     }
@@ -217,40 +217,40 @@ static int parse_vk(const char *t) {
     char b[24];
     snprintf(b, sizeof b, "%s", t);
     for (char *p = b + strlen(b); p > b && (p[-1] == ' ' || p[-1] == '\t' || p[-1] == '\r' || p[-1] == '\n'); ) *--p = 0;
-    if (!b[0] || !_stricmp(b, "none")) return 0;
+    if (!b[0] || !strcasecmp(b, "none")) return 0;
     if (b[1] == 0) { char ch = b[0]; if (ch >= 'a' && ch <= 'z') ch -= 32; return ch; }
-    if (!_stricmp(b, "LEFT")) return VK_LEFT; if (!_stricmp(b, "UP")) return VK_UP;
-    if (!_stricmp(b, "RIGHT")) return VK_RIGHT; if (!_stricmp(b, "DOWN")) return VK_DOWN;
-    if (!_stricmp(b, "ENTER")) return VK_RETURN; if (!_stricmp(b, "BACKSPACE")) return VK_BACK;
-    if (!_stricmp(b, "SPACE")) return VK_SPACE; if (!_stricmp(b, "TAB")) return VK_TAB; if (!_stricmp(b, "ESC")) return VK_ESCAPE;
-    if (!_stricmp(b, "SHIFT")) return VK_SHIFT; if (!_stricmp(b, "CTRL")) return VK_CONTROL; if (!_stricmp(b, "ALT")) return VK_MENU;
+    if (!strcasecmp(b, "LEFT")) return VK_LEFT; if (!strcasecmp(b, "UP")) return VK_UP;
+    if (!strcasecmp(b, "RIGHT")) return VK_RIGHT; if (!strcasecmp(b, "DOWN")) return VK_DOWN;
+    if (!strcasecmp(b, "ENTER")) return VK_RETURN; if (!strcasecmp(b, "BACKSPACE")) return VK_BACK;
+    if (!strcasecmp(b, "SPACE")) return VK_SPACE; if (!strcasecmp(b, "TAB")) return VK_TAB; if (!strcasecmp(b, "ESC")) return VK_ESCAPE;
+    if (!strcasecmp(b, "SHIFT")) return VK_SHIFT; if (!strcasecmp(b, "CTRL")) return VK_CONTROL; if (!strcasecmp(b, "ALT")) return VK_MENU;
     if ((b[0] == 'F' || b[0] == 'f') && atoi(b + 1) >= 1 && atoi(b + 1) <= 12) return VK_F1 + atoi(b + 1) - 1;
-    if (!_strnicmp(b, "NUM", 3) && b[3] >= '0' && b[3] <= '9') return VK_NUMPAD0 + b[3] - '0';
+    if (!strncasecmp(b, "NUM", 3) && b[3] >= '0' && b[3] <= '9') return VK_NUMPAD0 + b[3] - '0';
     if (b[0] == '0' && (b[1] == 'x' || b[1] == 'X')) return (int)strtol(b, NULL, 16);
     return 0;
 }
-static int parse_bool(const char *v) { return !(_stricmp(v, "off") && _stricmp(v, "0") && _stricmp(v, "no") && _stricmp(v, "false")) ? 0 : 1; }
+static int parse_bool(const char *v) { return !(strcasecmp(v, "off") && strcasecmp(v, "0") && strcasecmp(v, "no") && strcasecmp(v, "false")) ? 0 : 1; }
 
 static DevCfg *cfg_find(Cfg *c, const char *guid, int create) {
-    for (int i = 0; i < c->ndev; i++) if (!_stricmp(c->dev[i].guid, guid)) return &c->dev[i];
+    for (int i = 0; i < c->ndev; i++) if (!strcasecmp(c->dev[i].guid, guid)) return &c->dev[i];
     if (!create || c->ndev >= MAXCFG) return NULL;
     cfg_init_dev(&c->dev[c->ndev]);
     snprintf(c->dev[c->ndev].guid, sizeof c->dev[0].guid, "%s", guid);
     return &c->dev[c->ndev++];
 }
 static void cfg_set(Cfg *c, DevCfg *d, int in_dev, const char *key, char *val) {
-    if (!_stricmp(key, "layout")) d->layout = !_stricmp(val, "labels") || !_stricmp(val, "label") ? 1 : !_stricmp(val, "auto") ? 2 : 0;
-    else if (!_stricmp(key, "deadzone")) d->dz = (float)atof(val);
-    else if (!_stricmp(key, "outer_zone")) d->outer = (float)atof(val);
-    else if (!_stricmp(key, "trigger_threshold")) d->trig = (float)atof(val);
-    else if (!_stricmp(key, "rumble")) d->rumble = parse_bool(val);
-    else if (!_stricmp(key, "rumble_strength")) d->rstr = (float)atof(val);
-    else if (in_dev && !_stricmp(key, "name")) snprintf(d->name, sizeof d->name, "%s", val);
-    else if (in_dev && !_strnicmp(key, "invert.", 7)) { for (int i = 0; i < 4; i++) if (!_stricmp(key + 7, g_stk[i])) d->inv[i] = parse_bool(val); }
-    else if (in_dev && !_strnicmp(key, "axis.", 5)) { for (int i = 0; i < 4; i++) if (!_stricmp(key + 5, g_stk[i]) && src_parse(val, &d->axis[i])) d->has_axis[i] = d->axis[i].kind != SK_NONE; }
-    else if (in_dev && !_strnicmp(key, "map.", 4)) {
+    if (!strcasecmp(key, "layout")) d->layout = !strcasecmp(val, "labels") || !strcasecmp(val, "label") ? 1 : !strcasecmp(val, "auto") ? 2 : 0;
+    else if (!strcasecmp(key, "deadzone")) d->dz = (float)atof(val);
+    else if (!strcasecmp(key, "outer_zone")) d->outer = (float)atof(val);
+    else if (!strcasecmp(key, "trigger_threshold")) d->trig = (float)atof(val);
+    else if (!strcasecmp(key, "rumble")) d->rumble = parse_bool(val);
+    else if (!strcasecmp(key, "rumble_strength")) d->rstr = (float)atof(val);
+    else if (in_dev && !strcasecmp(key, "name")) snprintf(d->name, sizeof d->name, "%s", val);
+    else if (in_dev && !strncasecmp(key, "invert.", 7)) { for (int i = 0; i < 4; i++) if (!strcasecmp(key + 7, g_stk[i])) d->inv[i] = parse_bool(val); }
+    else if (in_dev && !strncasecmp(key, "axis.", 5)) { for (int i = 0; i < 4; i++) if (!strcasecmp(key + 5, g_stk[i]) && src_parse(val, &d->axis[i])) d->has_axis[i] = d->axis[i].kind != SK_NONE; }
+    else if (in_dev && !strncasecmp(key, "map.", 4)) {
         for (int b = 0; b < 16; b++) {
-            if (_stricmp(key + 4, g_pro[b])) continue;
+            if (strcasecmp(key + 4, g_pro[b])) continue;
             d->nmap[b] = 0;
             for (char *tok = val; tok && d->nmap[b] < 4; ) {            /* not strtok: cfg_parse is using it */
                 char *comma = strchr(tok, ',');
@@ -274,10 +274,10 @@ static void cfg_parse(Cfg *c, char *text) {
         if (*line == '[') {
             char *e = strchr(line, ']');
             if (e) *e = 0;
-            if (!_stricmp(line + 1, "general")) sect = 1; else if (!_stricmp(line + 1, "players")) sect = 2;
-            else if (!_stricmp(line + 1, "keyboard")) sect = 3;
-            else if (!_stricmp(line + 1, "hotkeys")) sect = 5;
-            else if (!_strnicmp(line + 1, "device ", 7)) { char *g = line + 8; while (*g == ' ') g++; cur = cfg_find(c, g, 1); sect = cur ? 4 : 0; }
+            if (!strcasecmp(line + 1, "general")) sect = 1; else if (!strcasecmp(line + 1, "players")) sect = 2;
+            else if (!strcasecmp(line + 1, "keyboard")) sect = 3;
+            else if (!strcasecmp(line + 1, "hotkeys")) sect = 5;
+            else if (!strncasecmp(line + 1, "device ", 7)) { char *g = line + 8; while (*g == ' ') g++; cur = cfg_find(c, g, 1); sect = cur ? 4 : 0; }
             else sect = 0;
             continue;
         }
@@ -287,21 +287,21 @@ static void cfg_parse(Cfg *c, char *text) {
         char *key = line, *val = eq + 1;
         for (char *p = key + strlen(key); p > key && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
         while (*val == ' ' || *val == '\t') val++;
-        if (_stricmp(key, "name")) for (char *p = val; *p; p++) if ((*p == ';' || *p == '#') && p > val && (p[-1] == ' ' || p[-1] == '\t')) { *p = 0; break; }
+        if (strcasecmp(key, "name")) for (char *p = val; *p; p++) if ((*p == ';' || *p == '#') && p > val && (p[-1] == ' ' || p[-1] == '\t')) { *p = 0; break; }
         for (char *p = val + strlen(val); p > val && (p[-1] == ' ' || p[-1] == '\t'); ) *--p = 0;
-        if (sect == 1 && !_stricmp(key, "ignore")) { if (c->nignore < 16) snprintf(c->ignore[c->nignore++], sizeof c->ignore[0], "%s", val); }
+        if (sect == 1 && !strcasecmp(key, "ignore")) { if (c->nignore < 16) snprintf(c->ignore[c->nignore++], sizeof c->ignore[0], "%s", val); }
         else if (sect == 1) cfg_set(c, &c->def, 0, key, val);
         else if (sect == 4 && cur) cfg_set(c, cur, 1, key, val);
-        else if (sect == 2 && !_strnicmp(key, "player", 6) && key[6] >= '1' && key[6] <= '8' && !key[7]) {
+        else if (sect == 2 && !strncasecmp(key, "player", 6) && key[6] >= '1' && key[6] <= '8' && !key[7]) {
             int p = key[6] - '1';
             c->pguid[p][0] = 0; c->pnone[p] = 0;
-            if (!_stricmp(val, "none")) c->pnone[p] = 1; else if (_stricmp(val, "auto")) snprintf(c->pguid[p], sizeof c->pguid[0], "%s", val);
+            if (!strcasecmp(val, "none")) c->pnone[p] = 1; else if (strcasecmp(val, "auto")) snprintf(c->pguid[p], sizeof c->pguid[0], "%s", val);
         } else if (sect == 3) {
-            if (!_stricmp(key, "player")) c->kb_player = !_stricmp(val, "auto") ? -2 : !_stricmp(val, "none") ? -1 : atoi(val) >= 1 && atoi(val) <= 8 ? atoi(val) - 1 : -2;
-            else for (int i = 0; i < 24; i++) if (!_stricmp(key, g_kbn[i])) c->kb_vk[i] = parse_vk(val);
+            if (!strcasecmp(key, "player")) c->kb_player = !strcasecmp(val, "auto") ? -2 : !strcasecmp(val, "none") ? -1 : atoi(val) >= 1 && atoi(val) <= 8 ? atoi(val) - 1 : -2;
+            else for (int i = 0; i < 24; i++) if (!strcasecmp(key, g_kbn[i])) c->kb_vk[i] = parse_vk(val);
         } else if (sect == 5) {
-            if (!_stricmp(key, "amiibo_menu")) c->hk_vk = parse_vk(val);
-            else if (!_stricmp(key, "amiibo_menu_pad")) c->hk_combo = _stricmp(val, "none") ? parse_combo(val) : 0;
+            if (!strcasecmp(key, "amiibo_menu")) c->hk_vk = parse_vk(val);
+            else if (!strcasecmp(key, "amiibo_menu_pad")) c->hk_combo = strcasecmp(val, "none") ? parse_combo(val) : 0;
         }
     }
 }
@@ -316,25 +316,25 @@ static char *read_file(const char *path, size_t *len) {
     b[got] = 0; if (len) *len = got;
     return b;
 }
-static ULONGLONG file_mtime(const char *path) {
+static uint64_t file_mtime(const char *path) {
     WIN32_FILE_ATTRIBUTE_DATA a;
     if (!GetFileAttributesExA(path, GetFileExInfoStandard, &a)) return 0;
-    return ((ULONGLONG)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
+    return ((uint64_t)a.ftLastWriteTime.dwHighDateTime << 32) | a.ftLastWriteTime.dwLowDateTime;
 }
 static void cfg_path(char *out) {
     const char *e = getenv("SMO_CONFIG");
-    if (e && e[0]) { snprintf(out, MAX_PATH, "%s", e); return; }
-    char exe[MAX_PATH], tmp[MAX_PATH];
-    GetModuleFileNameA(NULL, exe, MAX_PATH);
+    if (e && e[0]) { snprintf(out, PATH_MAX, "%s", e); return; }
+    char exe[PATH_MAX], tmp[PATH_MAX];
+    snprintf(exe, sizeof exe, "%s", plat_exe_path());
     char *s = strrchr(exe, '\\');
     if (s) *s = 0;
     snprintf(tmp, sizeof tmp, "%s\\..\\config\\controllers.ini", exe);
-    if (!_fullpath(out, tmp, MAX_PATH)) snprintf(out, MAX_PATH, "%s", tmp);
+    if (!_fullpath(out, tmp, PATH_MAX)) snprintf(out, PATH_MAX, "%s", tmp);
 }
 static void make_dirs(const char *file) {
-    char b[MAX_PATH];
+    char b[PATH_MAX];
     snprintf(b, sizeof b, "%s", file);
-    for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; CreateDirectoryA(b, NULL); *p = '\\'; }
+    for (char *p = b + 3; *p; p++) if (*p == '\\' || *p == '/') { *p = 0; plat_mkdir(b); *p = '\\'; }
 }
 static void cfg_load(int first) {                 /* lock held */
     static Cfg n;
@@ -348,17 +348,17 @@ static void cfg_load(int first) {                 /* lock held */
     }
     cfg_defaults(&n);
     text = read_file(g_cfg.path, NULL);
-    ULONGLONG mt = file_mtime(g_cfg.path);
+    uint64_t mt = file_mtime(g_cfg.path);
     if (text) { cfg_parse(&n, text); free(text); }
     strcpy(n.path, g_cfg.path);
     n.mtime = mt;
     {   const char *l = getenv("SMO_PAD_LAYOUT");
-        if (l && l[0]) n.def.layout = !_stricmp(l, "label") || !_stricmp(l, "labels") ? 1 : 0; }
+        if (l && l[0]) n.def.layout = !strcasecmp(l, "label") || !strcasecmp(l, "labels") ? 1 : 0; }
     g_cfg = n;
 }
 
 /* ================================================================ devices */
-static const DevCfg *dev_cfg(const Dev *d) { for (int i = 0; i < g_cfg.ndev; i++) if (!_stricmp(g_cfg.dev[i].guid, d->guid)) return &g_cfg.dev[i]; return NULL; }
+static const DevCfg *dev_cfg(const Dev *d) { for (int i = 0; i < g_cfg.ndev; i++) if (!strcasecmp(g_cfg.dev[i].guid, d->guid)) return &g_cfg.dev[i]; return NULL; }
 static float eff_f(const Dev *d, size_t off, float def) {
     const DevCfg *c = dev_cfg(d);
     float v = c ? *(const float *)((const char *)c + off) : -1.0f;
@@ -376,22 +376,22 @@ static int eff_rumble(const Dev *d) { const DevCfg *c = dev_cfg(d); return c && 
 
 static int slot_usable(int p, const char *guid) {            /* configured reservations */
     if (g_cfg.pnone[p]) return 0;
-    if (g_cfg.pguid[p][0] && _stricmp(g_cfg.pguid[p], guid)) return 0;
+    if (g_cfg.pguid[p][0] && strcasecmp(g_cfg.pguid[p], guid)) return 0;
     return 1;
 }
 static int slot_taken(int p) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot == p) return 1; return 0; }
 static int assign_slot(const Dev *d) {
-    for (int p = 0; p < 8; p++) if (g_cfg.pguid[p][0] && !_stricmp(g_cfg.pguid[p], d->guid) && !slot_taken(p)) return p;
+    for (int p = 0; p < 8; p++) if (g_cfg.pguid[p][0] && !strcasecmp(g_cfg.pguid[p], d->guid) && !slot_taken(p)) return p;
     for (int i = 0; i < g_mem_n; i++) {
         int p = g_mem[i].slot;
-        if (!_stricmp(g_mem[i].guid, d->guid) && !slot_taken(p) && slot_usable(p, d->guid) && p != g_kb_slot) return p;
+        if (!strcasecmp(g_mem[i].guid, d->guid) && !slot_taken(p) && slot_usable(p, d->guid) && p != g_kb_slot) return p;
     }
     for (int p = 0; p < 8; p++) if (!slot_taken(p) && slot_usable(p, d->guid) && !g_cfg.pguid[p][0] && p != g_kb_slot) return p;
     return -1;
 }
 static void remember(const char *guid, int slot) {
     int i;
-    for (i = 0; i < g_mem_n; i++) if (!_stricmp(g_mem[i].guid, guid)) break;
+    for (i = 0; i < g_mem_n; i++) if (!strcasecmp(g_mem[i].guid, guid)) break;
     if (i == g_mem_n) { if (g_mem_n == 32) return; g_mem_n++; snprintf(g_mem[i].guid, sizeof g_mem[0].guid, "%s", guid); }
     g_mem[i].slot = slot;
 }
@@ -419,7 +419,7 @@ static void dev_add(SDL_JoystickID id) {
     else d->js = SDL_OpenJoystick(id);
     if (!d->js) { d->ignored = 1; return; }
     d->nbtn = SDL_GetNumJoystickButtons(d->js); d->naxes = SDL_GetNumJoystickAxes(d->js); d->nhats = SDL_GetNumJoystickHats(d->js);
-    for (int i = 0; i < g_cfg.nignore; i++) if (!_stricmp(g_cfg.ignore[i], d->guid)) { d->ignored = 1; say("nn::pad: ignored \"%s\" %s (ignore = in controllers.ini)\n", d->name, d->guid); SDL_CloseJoystick(d->js); if (d->gp) SDL_CloseGamepad(d->gp); d->js = NULL; d->gp = NULL; return; }
+    for (int i = 0; i < g_cfg.nignore; i++) if (!strcasecmp(g_cfg.ignore[i], d->guid)) { d->ignored = 1; say("nn::pad: ignored \"%s\" %s (ignore = in controllers.ini)\n", d->name, d->guid); SDL_CloseJoystick(d->js); if (d->gp) SDL_CloseGamepad(d->gp); d->js = NULL; d->gp = NULL; return; }
     if (!d->gp && (!strncmp(d->name, "0x", 2) || d->naxes < 2 || d->nbtn < 4)) {       /* "0xVID/0xPID" is SDL's name for a HID device without a product string: not a pad */ d->ignored = 1; say("nn::pad: ignored \"%s\" %s: no mapping and only %d axes / %d buttons\n", d->name, d->guid, d->naxes, d->nbtn); SDL_CloseJoystick(d->js); d->js = NULL; return; }
     if (d->gp) {
         d->gtype = SDL_GetGamepadType(d->gp);
@@ -472,10 +472,10 @@ static void poll_devices(void) {                  /* lock held */
     }
 }
 static void check_config(int force) {             /* lock held */
-    ULONGLONG now = GetTickCount64();
+    uint64_t now = plat_ms();
     if (!force && now - g_last_cfg_check < 1000) return;
     g_last_cfg_check = now;
-    ULONGLONG mt = file_mtime(g_cfg.path);
+    uint64_t mt = file_mtime(g_cfg.path);
     if (!mt || mt == g_cfg.mtime) return;
     char before[8][40]; int bn[8];
     memcpy(before, g_cfg.pguid, sizeof before); memcpy(bn, g_cfg.pnone, sizeof bn);
@@ -488,8 +488,8 @@ int nnpad_init(void) {
     lock();
     if (g_inited) { unlock(); return g_sdl_ok; }
     g_inited = 1;
-    g_init_ms = GetTickCount64();
-    QueryPerformanceFrequency(&g_qpf);
+    g_init_ms = plat_ms();
+    plat_qpf(&g_qpf);
     cfg_load(1);
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");     /* the game's own focus rule decides (nnhid.c devices_live) */
     SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
@@ -502,9 +502,9 @@ int nnpad_init(void) {
     return 1;
 }
 void nnpad_poll(int force) {
-    LARGE_INTEGER t;
+    plat_counter t;
     if (!g_sdl_ok) return;
-    QueryPerformanceCounter(&t);
+    plat_qpc(&t);
     if (!force && (t.QuadPart - g_last_poll.QuadPart) * 1000 < g_qpf.QuadPart) return;
     lock();
     g_last_poll = t;
@@ -650,7 +650,7 @@ void nnpad_rumble(int player, float low, float high) {
         float s = eff_rumble(d) ? EFF(d, rstr) : 0.0f;
         float l = low * s, h = high * s;
         Uint16 rl = (Uint16)(l >= 1 ? 65535 : l <= 0 ? 0 : (int)(l * 65535.0f)), rh = (Uint16)(h >= 1 ? 65535 : h <= 0 ? 0 : (int)(h * 65535.0f));
-        ULONGLONG now = GetTickCount64();
+        uint64_t now = plat_ms();
         if (rl != d->rl || rh != d->rh || ((rl || rh) && now - d->rsent > 20000)) {
             d->rl = rl; d->rh = rh; d->rsent = now;
             if (d->gp) SDL_RumbleGamepad(d->gp, rl, rh, rl || rh ? 30000 : 0); else SDL_RumbleJoystick(d->js, rl, rh, rl || rh ? 30000 : 0);
@@ -665,8 +665,8 @@ int nnpad_keyboard_player(void) {
     int r;
     if (g_kb_slot == -3 && g_sdl_ok && !getenv("SMO_SEQ") && !getenv("SMO_PLAY") && !getenv("SMO_SCRIPT") && !getenv("SMO_PRESS") && env_kb() < 0 && g_cfg.kb_player == -2) {
         /* pads on Windows can show up a moment after SDL starts: give them up to 1.5 s before the keyboard takes a slot */
-        ULONGLONG el = GetTickCount64() - g_init_ms;
-        if (el < 1500) Sleep((DWORD)(1500 - el));
+        uint64_t el = plat_ms() - g_init_ms;
+        if (el < 1500) plat_sleep_ms((uint32_t)(1500 - el));
         nnpad_poll(1);
     }
     lock();
@@ -728,7 +728,7 @@ static void print_devices(void) {
 }
 static int tool_init(void) {
     if (!nnpad_init()) return 0;
-    Sleep(800); nnpad_poll(1);                             /* pads that appear a moment after SDL starts */
+    plat_sleep_ms(800); nnpad_poll(1);                             /* pads that appear a moment after SDL starts */
     return 1;
 }
 static int pad_test(int seconds) {
@@ -739,8 +739,8 @@ static int pad_test(int seconds) {
     printf("pad-test: devices SDL sees (config %s):\n", g_cfg.path);
     print_devices();
     printf("pad-test: press buttons / move sticks; plug and unplug pads. %s\n", seconds ? "Stops by itself." : "Ctrl+C to stop.");
-    ULONGLONG t0 = GetTickCount64();
-    while (!seconds || GetTickCount64() - t0 < (ULONGLONG)seconds * 1000) {
+    uint64_t t0 = plat_ms();
+    while (!seconds || plat_ms() - t0 < (uint64_t)seconds * 1000) {
         nnpad_poll(1);
         lock();
         int cnt = 0;
@@ -765,7 +765,7 @@ static int pad_test(int seconds) {
             }
         }
         unlock();
-        Sleep(8);
+        plat_sleep_ms(8);
     }
     return 0;
 }
@@ -779,7 +779,7 @@ static void ini_replace_section(const char *path, const char *header, const char
     if (old) for (char *p = old; *p; ) {
         char *e = strchr(p, '\n');
         size_t l = e ? (size_t)(e - p) + 1 : strlen(p);
-        if (*p == '[') skipping = !_strnicmp(p, header, strlen(header));
+        if (*p == '[') skipping = !strncasecmp(p, header, strlen(header));
         if (!skipping) { memcpy(out + o, p, l); o += l; }
         p += l;
     }
@@ -808,15 +808,15 @@ static void write_device(const Dev *d, const DevCfg *c) {  /* [device GUID] with
 }
 static int wait_press(Dev *d, int seconds, Src *out) {     /* waits for release of everything, then for a new source; 1 = got one */
     char cur[8][24];
-    ULONGLONG t0 = GetTickCount64();
-    while (GetTickCount64() - t0 < (ULONGLONG)seconds * 1000) { nnpad_poll(1); lock(); int n = active_sources(d, cur, 8); unlock(); if (!n) break; Sleep(20); }
-    while (GetTickCount64() - t0 < (ULONGLONG)seconds * 1000) {
+    uint64_t t0 = plat_ms();
+    while (plat_ms() - t0 < (uint64_t)seconds * 1000) { nnpad_poll(1); lock(); int n = active_sources(d, cur, 8); unlock(); if (!n) break; plat_sleep_ms(20); }
+    while (plat_ms() - t0 < (uint64_t)seconds * 1000) {
         nnpad_poll(1);
         lock();
         int n = active_sources(d, cur, 8);
         unlock();
         if (n) { Src s; if (src_parse(cur[0], &s)) { *out = s; return 1; } }
-        Sleep(10);
+        plat_sleep_ms(10);
     }
     return 0;
 }
@@ -828,7 +828,7 @@ static int pad_map(int player) {
     cfg_init_dev(&c);
     if (!tool_init()) return 1;
     if (player < 1 || player > 8) { printf("pad-map: player must be 1..8\n"); return 2; }
-    for (int w = 0; w < 100 && !d; w++) { nnpad_poll(1); lock(); d = dev_of(player - 1); unlock(); if (!d) { if (w == 0) printf("pad-map: waiting for a pad on player %d (10 s)...\n", player); Sleep(100); } }
+    for (int w = 0; w < 100 && !d; w++) { nnpad_poll(1); lock(); d = dev_of(player - 1); unlock(); if (!d) { if (w == 0) printf("pad-map: waiting for a pad on player %d (10 s)...\n", player); plat_sleep_ms(100); } }
     if (!d) { printf("pad-map: no device on player %d. Devices:\n", player); print_devices(); return 1; }
     printf("pad-map: \"%s\" GUID %s (%s). Press the button named; it is skipped (default kept) after 8 s.\n", d->name, d->guid, d->gp ? "SDL gamepad: names like south/east" : "raw joystick");
     for (int k = 0; k < 16; k++) {
@@ -888,19 +888,19 @@ static SDL_JoystickID vj_make(int idx, int pid, int gamepad, int sensors_on) {
     if (sensors_on) { d.nsensors = 2; d.sensors = sd; }
     return SDL_AttachVirtualJoystick(&d);
 }
-static void settle(void) { Sleep(3); nnpad_poll(1); }
+static void settle(void) { plat_sleep_ms(3); nnpad_poll(1); }
 static void vj_clear(SDL_Joystick *j, int n_btn, int n_ax) { for (int i = 0; i < n_btn; i++) SDL_SetJoystickVirtualButton(j, i, false); for (int i = 0; i < n_ax; i++) SDL_SetJoystickVirtualAxis(j, i, n_ax == 6 && (i == 4 || i == 5) ? -32768 : 0); }   /* a virtual trigger rests at the bottom of its raw range */
 static void write_text(const char *path, const char *text) { FILE *f = fopen(path, "wb"); if (f) { fputs(text, f); fclose(f); } }
 static int near_(int a, int b, int tol) { return abs(a - b) <= tol; }
 
 int nnpad_selftest(const NnHidHooks *h) {
-    char path[MAX_PATH], guid0[40];
+    char path[PATH_MAX], guid0[40];
     SDL_JoystickID id[10];
     SDL_Joystick *js[10];
     uint64_t btn; int32_t st[4]; uint32_t attr;
-    GetTempPathA(MAX_PATH, path); strcat(path, "smo_pad_selftest\\controllers.ini");
+    GetTempPathA(PATH_MAX, path); strcat(path, "smo_pad_selftest\\controllers.ini");
     make_dirs(path);
-    DeleteFileA(path);
+    !unlink(path);
     _putenv_s("SMO_CONFIG", path);
     _putenv_s("SMO_KEYBOARD_PLAYER", "0");
     _putenv_s("SMO_PAD_LAYOUT", "");
@@ -1073,9 +1073,9 @@ int nnpad_selftest(const NnHidHooks *h) {
         snprintf(text, sizeof text,
                  "[general]\r\nlayout = positional\r\ndeadzone = 0.10\r\n[keyboard]\r\nplayer = none\r\n"
                  "[device %s]\r\nlayout = labels\r\nmap.PLUS = north, button14\r\nmap.MINUS = none\r\nmap.Y = none\r\naxis.RX = leftx\r\ninvert.LY = on\r\nrumble = off\r\n", g5);
-        Sleep(1100);
+        plat_sleep_ms(1100);
         write_text(path, text);
-        Sleep(1100); nnpad_poll(1);
+        plat_sleep_ms(1100); nnpad_poll(1);
         h->state(0, &btn, st, &attr);
         check(before && btn == 1ull << 0, "ini edited while running: reloaded within ~1 s; layout=labels turns south (printed A on this pad) into Pro A");
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
@@ -1100,9 +1100,9 @@ int nnpad_selftest(const NnHidHooks *h) {
             cfg_init_dev(&c);
             c.map[3][0] = mk(SK_BTN, SDL_GAMEPAD_BUTTON_EAST, 0); c.map[3][1] = mk(SK_AXP, 3, 1); c.nmap[3] = 2; c.nmap[0] = 0;      /* Y <- east, axis3+ */
             c.axis[0] = mk(SK_AXF, SDL_GAMEPAD_AXIS_RIGHTX, 0); c.has_axis[0] = 1; c.inv[0] = 1;
-            Sleep(1100);
+            plat_sleep_ms(1100);
             write_device(&dd, &c);
-            Sleep(1100); nnpad_poll(1);
+            plat_sleep_ms(1100); nnpad_poll(1);
             vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
             SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_EAST, true);
             SDL_SetJoystickVirtualAxis(js[0], SDL_GAMEPAD_AXIS_RIGHTX, 32767); settle(); h->state(0, &btn, st, &attr);
@@ -1122,7 +1122,7 @@ int nnpad_selftest(const NnHidHooks *h) {
             char g3[40];
             SDL_GUIDToString(SDL_GetJoystickGUIDForID(id[3]), g3, sizeof g3);
             snprintf(text, sizeof text, "[keyboard]\r\nplayer = none\r\n[players]\r\nplayer1 = %s\r\nplayer2 = none\r\n", g3);
-            Sleep(1100); write_text(path, text); Sleep(1100); nnpad_poll(1);
+            plat_sleep_ms(1100); write_text(path, text); plat_sleep_ms(1100); nnpad_poll(1);
             vj_clear(js[3], SDL_GAMEPAD_BUTTON_COUNT, 6);
             SDL_SetJoystickVirtualButton(js[3], SDL_GAMEPAD_BUTTON_EAST, true); settle(); h->state(0, &btn, st, &attr);
             check((btn & 1) == 1 && h->style(1) == 0, "[players]: player1 = <GUID of pad 4> puts that pad on player 1; player2 = none leaves slot 2 empty");
@@ -1135,7 +1135,7 @@ int nnpad_selftest(const NnHidHooks *h) {
         SDL_JoystickID fill = vj_make(12, 0x600, 1, 0), rid;
         SDL_Joystick *rj, *fj;
         int p = -1, raw_has = 0;
-        Sleep(1100); write_text(path, "[keyboard]\r\nplayer = none\r\n"); Sleep(1100); nnpad_poll(1);       /* back to the default player assignment */
+        plat_sleep_ms(1100); write_text(path, "[keyboard]\r\nplayer = none\r\n"); plat_sleep_ms(1100); nnpad_poll(1);       /* back to the default player assignment */
         settle();
         fj = SDL_OpenJoystick(fill);                         /* fills the last free slot: 8 pads */
         rid = vj_make(10, 0x400, 0, 0);

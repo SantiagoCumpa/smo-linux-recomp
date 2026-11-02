@@ -34,8 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-#include <psapi.h>
+#include "plat.h"
 #include "hostrt.h"
 
 long long nvn_front_frame_next(void);                     /* nvn_gl.c: the number the frame being made will get */
@@ -43,12 +42,12 @@ long long nvn_front_frame_next(void);                     /* nvn_gl.c: the numbe
 #define NRV_MAX 16384
 #define NRV_HASH 32768
 #define KEEP_HASH 65536
-static struct { uint64_t addr; char *volatile name; volatile LONG64 last_frame; char log_ok, pos_ok, host; } g_nrv[NRV_MAX];   /* host: see host_name */
+static struct { uint64_t addr; char *volatile name; volatile int64_t last_frame; char log_ok, pos_ok, host; } g_nrv[NRV_MAX];   /* host: see host_name */
 static int g_nrv_count;
 static int g_nrv_hash[NRV_HASH];                          /* index + 1 into g_nrv, 0 = empty */
 static struct { uint64_t keeper; int nrv; long long pos_frame, last_frame; } g_keep[KEEP_HASH];
 static int g_keep_used, g_keep_clears;
-static volatile LONG g_nerve_lock;
+static volatile int32_t g_nerve_lock;
 static char g_filter[512], g_pos_prefix[512] = "PlayerActorHakoniwaNrv";
 static int g_filter_all, g_pos_every;
 static long long g_transitions, g_logged;
@@ -117,7 +116,7 @@ static int nrv_index(uint64_t addr);
 static void nerve_add(uint64_t a, const char *nm) {
     if (g_nrv_count >= NRV_MAX) return;
     g_nrv[g_nrv_count].addr = a;
-    g_nrv[g_nrv_count].name = _strdup(nm);
+    g_nrv[g_nrv_count].name = strdup(nm);
     g_nrv[g_nrv_count].last_frame = -10;
     g_nrv[g_nrv_count].log_ok = (char)filter_match(nm);             /* the filters are set before the list is loaded */
     g_nrv[g_nrv_count].pos_ok = (char)(g_pos_every > 0 && pos_match(nm));
@@ -165,7 +164,7 @@ static void nerve_load(void) {
             if (nerve_name(col[6], nm, sizeof nm)) {
                 if (strncmp(nm, "HostTypeNrv", 11)) { nerve_add(a, nm); from_rtti++; continue; }
                 if (nhost == chost) { chost = chost ? chost * 2 : 1024; host = realloc(host, (size_t)chost * sizeof *host); }
-                host[nhost].addr = a; host[nhost].name = _strdup(nm); nhost++;
+                host[nhost].addr = a; host[nhost].name = strdup(nm); nhost++;
             } else rtti_other = 1;
         }
         if (!mangled[0] && !rtti_other && e > a && e - a <= 0x80) {
@@ -173,7 +172,7 @@ static void nerve_load(void) {
             cand[ncand][0] = a; cand[ncand][1] = e; ncand++;
         } else if (exe_name(mangled, nm, sizeof nm)) {
             if (nexe == cexe) { cexe = cexe ? cexe * 2 : 4096; exe = realloc(exe, (size_t)cexe * sizeof *exe); }
-            exe[nexe].addr = a; exe[nexe].name = _strdup(nm); nexe++;
+            exe[nexe].addr = a; exe[nexe].name = strdup(nm); nexe++;
         }
     }
     fclose(f);
@@ -232,8 +231,8 @@ static void nerve_load(void) {
 static void start_stage_init(void);
 static void stage_list_init(void);
 static void nerve_init(void) {                           /* first indirect call (any thread); the others wait for it */
-    static volatile LONG once;
-    if (InterlockedCompareExchange(&once, 1, 0)) { while (*(volatile int *)&g_nerve_mode < 0) YieldProcessor(); return; }
+    static volatile int32_t once;
+    if (plat_cas(&once, 1, 0)) { while (*(volatile int *)&g_nerve_mode < 0) plat_pause(); return; }
     start_stage_init();
     const char *log = getenv("SMO_NERVELOG"), *pos = getenv("SMO_ACTORPOS"), *seq = getenv("SMO_SEQ");
     int want = (log && *log) || (pos && atoi(pos) > 0) || (seq && (strstr(seq, "@nerve:") || strstr(seq, "@until-nerve:") || strstr(seq, "@goto:") ||
@@ -244,7 +243,7 @@ static void nerve_init(void) {                           /* first indirect call 
     if (pos && strchr(pos, ':')) snprintf(g_pos_prefix, sizeof g_pos_prefix, "%s", strchr(pos, ':') + 1);
     if (want) nerve_load();
     stage_list_init();
-    MemoryBarrier();
+    plat_fence();
     g_nerve_mode = want && g_nrv_count > 0;
 }
 
@@ -307,7 +306,7 @@ static void host_name(int i, uint64_t keeper) {
     snprintf(nm, sizeof nm, "%sNrv%s", cls, g_nrv[i].name + 11);
     g_nrv[i].log_ok = (char)filter_match(nm);
     g_nrv[i].pos_ok = (char)(g_pos_every > 0 && pos_match(nm));
-    g_nrv[i].name = _strdup(nm);                          /* the old name stays allocated: another thread may be reading it */
+    g_nrv[i].name = strdup(nm);                          /* the old name stays allocated: another thread may be reading it */
     g_nrv[i].host = 2;
 }
 
@@ -324,12 +323,12 @@ static int filter_match(const char *name) {
  * al::updatePoseTrans (as PlayerPuppet::setTrans moves a player another actor controls) and al::setVelocityZero, called
  * when his state machine next runs (nerve_call, on that thread, with its registers put back after). A shortcut for a
  * test to reach a place whose way there is not scripted; it writes game state. */
-static volatile LONG g_warp_state;                        /* 0 none, 1 asked, 2 done, 3 cannot (not in this build) */
-static __declspec(align(16)) float g_warp_to[4];
-void nerve_warp(float x, float y, float z) { g_warp_to[0] = x; g_warp_to[1] = y; g_warp_to[2] = z; InterlockedExchange(&g_warp_state, 1); }
+static volatile int32_t g_warp_state;                        /* 0 none, 1 asked, 2 done, 3 cannot (not in this build) */
+static __attribute__((aligned(16))) float g_warp_to[4];
+void nerve_warp(float x, float y, float z) { g_warp_to[0] = x; g_warp_to[1] = y; g_warp_to[2] = z; plat_xchg(&g_warp_state, 1); }
 int nerve_warp_state(void) { return g_warp_state; }
 static void player_warp(Ctx *c, uint64_t actor) {
-    if (!GAME_FN_updatePoseTrans || !GAME_FN_setVelocityZero) { InterlockedExchange(&g_warp_state, 3); return; }
+    if (!GAME_FN_updatePoseTrans || !GAME_FN_setVelocityZero) { plat_xchg(&g_warp_state, 3); return; }
     Ctx saved = *c;
     c->x[0] = actor;
     c->x[1] = (uint64_t)(uintptr_t)g_warp_to;
@@ -340,7 +339,7 @@ static void player_warp(Ctx *c, uint64_t actor) {
     printf("nerve: frame %lld: player moved from %.1f %.1f %.1f to %.1f %.1f %.1f (@warp: al::updatePoseTrans)\n", nvn_front_frame_next(),
            g_player_pos[0], g_player_pos[1], g_player_pos[2], g_warp_to[0], g_warp_to[1], g_warp_to[2]);
     fflush(stdout);
-    InterlockedExchange(&g_warp_state, 2);
+    plat_xchg(&g_warp_state, 2);
 }
 
 void nerve_call(Ctx *c, uint64_t addr) {
@@ -351,7 +350,7 @@ void nerve_call(Ctx *c, uint64_t addr) {
     long long frame = nvn_front_frame_next();
     uint64_t keeper = c->x[1];
     g_nrv[i].last_frame = frame;
-    while (InterlockedCompareExchange(&g_nerve_lock, 1, 0)) YieldProcessor();
+    while (plat_cas(&g_nerve_lock, 1, 0)) plat_pause();
     if (g_keep_used > KEEP_HASH * 3 / 4) { memset(g_keep, 0, sizeof g_keep); g_keep_used = 0; g_keep_clears++; }
     unsigned h = hash_addr(keeper, KEEP_HASH);
     while (g_keep[h].keeper && g_keep[h].keeper != keeper) h = (h + 1) % KEEP_HASH;
@@ -388,7 +387,7 @@ void nerve_call(Ctx *c, uint64_t addr) {
  * compares each indirect call with their execute functions (two compares while a watch is set, none before) and the frame
  * either last ran is kept. The names are resolved with the tracker's list (loaded here once if the tracker is off). */
 volatile uint64_t g_nerve_watch[2];
-static volatile LONG64 g_watch_frame = -1;
+static volatile int64_t g_watch_frame = -1;
 void nerve_watch_hit(void) { g_watch_frame = nvn_front_frame_next(); }
 long long nerve_watch_last(void) { return g_watch_frame; }
 int nerve_watch_set(const char *a, const char *b) {
@@ -442,13 +441,13 @@ static int g_stage_inits;                                 /* StageScene::init ca
 #define LIST_MAX 64
 static struct { char stage[96], start[160]; int scenario; } g_list[LIST_MAX];
 static int g_list_n;                                      /* entries; 0 = no stage list */
-static volatile LONG g_list_cur;                          /* the entry being played, 0-based */
+static volatile int32_t g_list_cur;                          /* the entry being played, 0-based */
 enum { LIST_PLAY, LIST_ASKED, LIST_CHANGING, LIST_BEGUN };
-static volatile LONG g_list_state;                        /* LIST_ASKED: waits for StageSceneNrvPlay; LIST_CHANGING: for the next StageScene::init */
+static volatile int32_t g_list_state;                        /* LIST_ASKED: waits for StageSceneNrvPlay; LIST_CHANGING: for the next StageScene::init */
 static uint64_t g_holder;                                 /* the game's GameDataHolder */
 static uint64_t g_play_exec;                              /* StageSceneNrvPlay's execute */
 volatile uint64_t g_stage_play;                           /* hostrt.c call_indirect: g_play_exec while a change waits for it, else 0 */
-static volatile ULONGLONG g_list_tick;                    /* see stage_list_started */
+static volatile uint64_t g_list_tick;                    /* see stage_list_started */
 
 static void start_stage_init(void) {                      /* nerve_init: before the first indirect call goes on */
     const char *e = getenv("SMO_START_STAGE"), *l = getenv("SMO_STAGE_LIST");
@@ -511,7 +510,7 @@ static void stage_totals(char *out, size_t n) {
     FILETIME made, ex, k, u, now;                         /* the run's time: since the process was made */
     GetProcessTimes(GetCurrentProcess(), &made, &ex, &k, &u);
     GetSystemTimeAsFileTime(&now);
-    double run_s = (double)((((ULONGLONG)now.dwHighDateTime << 32) | now.dwLowDateTime) - (((ULONGLONG)made.dwHighDateTime << 32) | made.dwLowDateTime)) / 1e7;
+    double run_s = (double)((((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime) - (((uint64_t)made.dwHighDateTime << 32) | made.dwLowDateTime)) / 1e7;
     snprintf(out, n, "%lld frames presented, %lld Vulkan call failures, %lld calls of operations that are not implemented, imports reached %d "
              "(still stubs %d), audio device sink %lld frames, %lld samples dropped, %lld underruns, loading-screen holds %lld (%lld ms), "
              "samplers given a dummy %lld, process memory %llu MB, run time %.1f s", display_frames(), fail, miss, imports, stubs, af, drop, under,
@@ -534,8 +533,8 @@ void stage_list_seq_done(long long poll) {
     if (k + 1 < g_list_n && !g_holder) printf("stage list: no stage scene was seen, so no GameDataHolder to change stage with: no stage after this\n");
     if (!stage_list_has_next()) { fflush(stdout); return; }
     unsigned nvn_gl_held_ms(void);                        /* nvn_gl.c: held presents are not run time (boot.c) */
-    g_list_tick = GetTickCount64() - nvn_gl_held_ms();
-    InterlockedExchange(&g_list_state, LIST_ASKED);
+    g_list_tick = plat_ms() - nvn_gl_held_ms();
+    plat_xchg(&g_list_state, LIST_ASKED);
     g_stage_play = g_play_exec;
     printf("stage list: stage %d of %d, %s, scenario %d%s%s: the game is asked to change stage at its next StageSceneNrvPlay (frame %lld)\n", k + 2, g_list_n,
            g_list[k + 1].stage, g_list[k + 1].scenario, g_list[k + 1].start[0] ? ", start " : "", g_list[k + 1].start, frame);
@@ -553,7 +552,7 @@ unsigned long long stage_list_started(void) { return g_list_n ? g_list_tick : 0;
  * ChangeStageInfo's constructor then takes GameDataHolder::findUseScenarioNo (1 for a kingdom's challenge rooms, say);
  * -1 when the stage has none (it plays in the kingdom's scenario). Made with the calling thread's registers, put back. */
 static int use_scenario(Ctx *c, uint64_t holder, const char *stage) {
-    static __declspec(align(16)) unsigned char csi[0x1000];      /* a ChangeStageInfo: 0x278 bytes */
+    static __attribute__((aligned(16))) unsigned char csi[0x1000];      /* a ChangeStageInfo: 0x278 bytes */
     if (!GAME_FN_ChangeStageInfo_ctor || !holder) return -1;
     Ctx saved = *c;
     memset(csi, 0, sizeof csi);
@@ -582,7 +581,7 @@ void stage_play_hit(Ctx *c) {
     g_stage_play = 0;
     if (g_list_state != LIST_ASKED) return;
     int k = g_list_cur + 1;
-    static __declspec(align(16)) unsigned char info[0x1000];     /* ChangeStageInfo: 0x278 bytes */
+    static __attribute__((aligned(16))) unsigned char info[0x1000];     /* ChangeStageInfo: 0x278 bytes */
     Ctx saved = *c;
     memset(info, 0, sizeof info);
     c->x[0] = (uint64_t)(uintptr_t)info;
@@ -599,7 +598,7 @@ void stage_play_hit(Ctx *c) {
     call_guest(c, GAME_FN_tryChangeNextStage);
     int ok = (int)(c->x[0] & 1);
     *c = saved;
-    InterlockedExchange(&g_list_state, ok ? LIST_CHANGING : LIST_PLAY);
+    plat_xchg(&g_list_state, ok ? LIST_CHANGING : LIST_PLAY);
     char from[96];
     if (scen >= 0) snprintf(from, sizeof from, "scenario %d (%s)", scen, g_list[k].scenario >= 0 ? "asked for" : "the stage's own, as through its door");
     else snprintf(from, sizeof from, "the kingdom's scenario");
@@ -625,10 +624,10 @@ static void stage_list_init_seen(uint64_t info, const char *stage, int scen) {
         printf("stage list: frame %lld: the game starts %s, scenario %d itself (no change of the list: a restart after a miss?)\n", frame, stage, scen);
         return;
     }
-    int k = InterlockedIncrement(&g_list_cur);
+    int k = plat_inc(&g_list_cur);
     printf("stage list: frame %lld: stage %d of %d begins: the game starts %s, scenario %d%s%s\n", frame, k + 1, g_list_n, stage, scen,
            strcmp(stage, g_list[k].stage) ? "; NOT the stage asked for, " : "", strcmp(stage, g_list[k].stage) ? g_list[k].stage : "");
-    InterlockedExchange(&g_list_state, LIST_BEGUN);
+    plat_xchg(&g_list_state, LIST_BEGUN);
 }
 
 /* nnhid.c, each poll: an entry of the list began since the last call: the game-state tracker starts afresh (the old
@@ -637,9 +636,9 @@ static void stage_list_init_seen(uint64_t info, const char *stage, int scen) {
 static long long g_released;
 const char *stage_list_begun(void) {
     if (g_list_state != LIST_BEGUN) return NULL;
-    InterlockedExchange(&g_list_state, LIST_PLAY);
+    plat_xchg(&g_list_state, LIST_PLAY);
     for (int i = 0; i < g_nrv_count; i++) g_nrv[i].last_frame = -10;
-    while (InterlockedCompareExchange(&g_nerve_lock, 1, 0)) YieldProcessor();
+    while (plat_cas(&g_nerve_lock, 1, 0)) plat_pause();
     memset(g_keep, 0, sizeof g_keep);
     g_keep_used = 0;
     g_player_actor = 0;
@@ -740,7 +739,7 @@ int nerve_actor_pos(const char *prefix, float pos[3]) {
     static char cached_prefix[96];
     size_t n = strlen(prefix);
     int found = 0;
-    while (InterlockedCompareExchange(&g_nerve_lock, 1, 0)) YieldProcessor();
+    while (plat_cas(&g_nerve_lock, 1, 0)) plat_pause();
     if (strcmp(cached_prefix, prefix)) { snprintf(cached_prefix, sizeof cached_prefix, "%s", prefix); cached = 0; }
     long long recent = nvn_front_frame_next() - 2;
     if (cached) {                                         /* the keeper found last: its slot by hash */

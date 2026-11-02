@@ -70,7 +70,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "sdklift.h"
 
 #define A0 (c->x[0])
@@ -219,13 +219,13 @@ static void url_append(char *url, size_t cap, const char *s) {      /* a path as
  * folder (its pictures, scripts and styles load from there), and a forwarding page, because a file URL with a query cannot
  * be opened by name. SMO_WEB_NOOPEN (self-test): both written, nothing opened. */
 static int web_open_in_browser(const char *doc, const char *full, const char *q) {
-    char tmp[MAX_PATH], dir[MAX_PATH], copy[MAX_PATH], fwd[MAX_PATH], base[4096] = "file:///", url[4096] = "file:///", page[8192];
+    char tmp[PATH_MAX], dir[PATH_MAX], copy[PATH_MAX], fwd[PATH_MAX], base[4096] = "file:///", url[4096] = "file:///", page[8192];
     const char *name = strrchr(full, '\\') ? strrchr(full, '\\') + 1 : full;
     if (!GetTempPathA(sizeof tmp, tmp)) return 0;
     snprintf(dir, sizeof dir, "%ssmo-recomp-help", tmp);
     snprintf(copy, sizeof copy, "%s\\%s", dir, name);
     snprintf(fwd, sizeof fwd, "%ssmo-recomp-help.html", tmp);
-    CreateDirectoryA(dir, NULL);
+    plat_mkdir(dir);
     FILE *f = fopen(full, "rb");
     if (!f) return 0;
     fseek(f, 0, SEEK_END);
@@ -239,7 +239,7 @@ static int web_open_in_browser(const char *doc, const char *full, const char *q)
     fclose(f);
     src[size] = 0;
     char *head = NULL;
-    for (char *p = src; *p && !head; p++) if (!_strnicmp(p, "<head", 5)) head = strchr(p, '>');
+    for (char *p = src; *p && !head; p++) if (!strncasecmp(p, "<head", 5)) head = strchr(p, '>');
     size_t at = head ? (size_t)(head + 1 - src) : 0;
     memcpy(out, src, at);
     n = at + (size_t)snprintf(out + at, extra, "<base href=\"%s\"><script>%s</script>", base, g_nx_pc_js);
@@ -255,13 +255,13 @@ static int web_open_in_browser(const char *doc, const char *full, const char *q)
     if (pn <= 0 || !write_if_differs(fwd, page, (size_t)pn)) return 0;
     if (getenv("SMO_WEB_NOOPEN")) { printf("nn::web::ShowOfflineHtmlPage: \"%s\" ready as %s (not opened: SMO_WEB_NOOPEN)\n", doc, url); return 1; }
     HINSTANCE r = ShellExecuteA(NULL, "open", fwd, NULL, NULL, SW_SHOWNORMAL);
-    printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (INT_PTR)r > 32 ? "" : ": FAILED");
-    return (INT_PTR)r > 32;
+    printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (intptr_t)r > 32 ? "" : ": FAILED");
+    return (intptr_t)r > 32;
 }
 /* 0: the document is not there or could not be shown; 1: shown and closed by the player (or opened in a web browser); 2: the
  * page went to a callback address, copied to callback. */
 static int web_open_offline(const char *doc, char *callback, size_t cap) {
-    char root[MAX_PATH], path[MAX_PATH], full[MAX_PATH], url[4096] = "file:///";
+    char root[PATH_MAX], path[PATH_MAX], full[PATH_MAX], url[4096] = "file:///";
     const char *env = getenv("SMO_MANUAL"), *q = strpbrk(doc, "?#");
     size_t plen = q ? (size_t)(q - doc) : strlen(doc);
     snprintf(root, sizeof root, "%s", env && env[0] ? env : "..\\manual");
@@ -332,12 +332,12 @@ typedef struct {
 
 #define IDC_EDIT 1001
 #define IDC_INFO 1002
-static INT_PTR CALLBACK kbd_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+static intptr_t kbd_proc(HWND dlg, unsigned msg, WPARAM wp, LPARAM lp) {
     KbdDialog *k = (KbdDialog *)GetWindowLongPtrW(dlg, GWLP_USERDATA);
     switch (msg) {
     case WM_INITDIALOG: {
         k = (KbdDialog *)lp;
-        SetWindowLongPtrW(dlg, GWLP_USERDATA, (LONG_PTR)k);
+        SetWindowLongPtrW(dlg, GWLP_USERDATA, (intptr_t)k);
         wchar_t info[600];
         _snwprintf(info, 599, L"%ls%ls%ls%ls%ls", k->header, k->header[0] && k->sub[0] ? L"\r\n" : L"", k->sub,
                    (k->header[0] || k->sub[0]) && k->guide[0] ? L"\r\n" : L"", k->guide);
@@ -349,28 +349,28 @@ static INT_PTR CALLBACK kbd_proc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
         SendDlgItemMessageW(dlg, IDC_EDIT, EM_SETSEL, 0, -1);
         SetForegroundWindow(dlg);
         SetFocus(GetDlgItem(dlg, IDC_EDIT));
-        return FALSE;
+        return 0;
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK) {
             GetDlgItemTextW(dlg, IDC_EDIT, k->text, SWKBD_MAX_CHARS + 1);
-            if ((int)wcslen(k->text) < k->min_len) { MessageBeep(MB_ICONWARNING); return TRUE; }
+            if ((int)wcslen(k->text) < k->min_len) { MessageBeep(MB_ICONWARNING); return 1; }
             EndDialog(dlg, 1);
-            return TRUE;
+            return 1;
         }
-        if (LOWORD(wp) == IDCANCEL) { EndDialog(dlg, 0); return TRUE; }
+        if (LOWORD(wp) == IDCANCEL) { EndDialog(dlg, 0); return 1; }
         break;
-    case WM_CLOSE: EndDialog(dlg, 0); return TRUE;
+    case WM_CLOSE: EndDialog(dlg, 0); return 1;
     }
-    return FALSE;
+    return 0;
 }
 static uint8_t *tmpl_align(uint8_t *p, int a) { while ((uintptr_t)p & (uintptr_t)(a - 1)) *p++ = 0; return p; }
 static uint8_t *tmpl_wstr(uint8_t *p, const wchar_t *s) { size_t n = (wcslen(s) + 1) * sizeof(wchar_t); memcpy(p, s, n); return p + n; }
-static uint8_t *tmpl_item(uint8_t *p, DWORD style, int x, int y, int w, int h, int id, WORD cls, const wchar_t *text) {
+static uint8_t *tmpl_item(uint8_t *p, uint32_t style, int x, int y, int w, int h, int id, uint16_t cls, const wchar_t *text) {
     p = tmpl_align(p, 4);
-    DLGITEMTEMPLATE it = {style | WS_CHILD | WS_VISIBLE, 0, (short)x, (short)y, (short)w, (short)h, (WORD)id};
+    DLGITEMTEMPLATE it = {style | WS_CHILD | WS_VISIBLE, 0, (short)x, (short)y, (short)w, (short)h, (uint16_t)id};
     memcpy(p, &it, sizeof it); p += sizeof it;
-    WORD cl[2] = {0xffff, cls};
+    uint16_t cl[2] = {0xffff, cls};
     memcpy(p, cl, 4); p += 4;
     p = tmpl_wstr(p, text);
     *p++ = 0; *p++ = 0;                                   /* no creation data */
@@ -389,7 +389,7 @@ static int kbd_run_dialog(KbdDialog *k) {
     p = tmpl_item(p, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 8, 44, 244, 14, IDC_EDIT, 0x0081, L"");
     p = tmpl_item(p, BS_DEFPUSHBUTTON | WS_TABSTOP, 144, 72, 50, 16, IDOK, 0x0080, L"OK");
     p = tmpl_item(p, BS_PUSHBUTTON | WS_TABSTOP, 202, 72, 50, 16, IDCANCEL, 0x0080, L"Cancel");
-    INT_PTR r = DialogBoxIndirectParamW(GetModuleHandleW(NULL), (DLGTEMPLATE *)buf, NULL, kbd_proc, (LPARAM)k);
+    intptr_t r = DialogBoxIndirectParamW(GetModuleHandleW(NULL), (DLGTEMPLATE *)buf, NULL, kbd_proc, (LPARAM)k);
     if (r == -1) { printf("nn::swkbd: the text dialog could not be created (error %lu); answered as cancelled\n", GetLastError()); return 0; }
     return (int)r;
 }
@@ -430,9 +430,9 @@ static uint64_t kbd_store(uint64_t string, const wchar_t *text, int utf8) {
 static void swkbd_ShowKeyboard(Ctx *c) {
     uint64_t string = A0, arg = A1;
     static KbdDialog k;                                    /* one keyboard at a time, as on the console */
-    static volatile LONG busy;
+    static volatile int32_t busy;
     static wchar_t header[70], sub[140], guide[260], initial[SWKBD_MAX_CHARS + 2], fixed[SWKBD_MAX_CHARS + 2];
-    if (InterlockedExchange(&busy, 1)) { RET(SWKBD_RESULT_CANCELED); return; }
+    if (plat_xchg(&busy, 1)) { RET(SWKBD_RESULT_CANCELED); return; }
     copy_w(header, arg + KC_HEADER, 64);
     copy_w(sub, arg + KC_SUB, 128);
     copy_w(guide, arg + KC_GUIDE, 256);
@@ -485,7 +485,7 @@ static void swkbd_ShowKeyboard(Ctx *c) {
     }
     if (result) trace_printf("     nn::swkbd::ShowKeyboard -> cancelled\n");
     else trace_printf("     nn::swkbd::ShowKeyboard -> \"%ls\"\n", k.text);
-    InterlockedExchange(&busy, 0);
+    plat_xchg(&busy, 0);
     RET(result);
 }
 
@@ -496,13 +496,13 @@ static void swkbd_ShowKeyboard(Ctx *c) {
 #define NFP_TAG_REMOVED NFP_RESULT(97)
 enum { NFP_INITIALIZED, NFP_SEARCHING, NFP_FOUND, NFP_REMOVED, NFP_MOUNTED, NFP_UNAVAILABLE };
 /* The reader. Its calls come from the game's NFC thread, the amiibo from the amiibo menu on the game's main thread. */
-static SRWLOCK g_nfp_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_nfp_lock = PLAT_RWLOCK_INIT;
 static int g_nfp_init, g_nfp_state = NFP_UNAVAILABLE;
 static uint64_t g_nfp_ev_on, g_nfp_ev_off;                 /* the game's activate / deactivate SystemEventType, 0 = not attached */
 static struct { int held, read; uint8_t id[8], uid[7]; } g_tag;   /* the amiibo held to the reader; read = the game has its model information */
-static volatile LONG g_nfp_reads;                          /* amiibo the game has read (smo_amiibo.c shows it) */
-static void nfp_lock(void) { AcquireSRWLockExclusive(&g_nfp_lock); }
-static void nfp_unlock(void) { ReleaseSRWLockExclusive(&g_nfp_lock); }
+static volatile int32_t g_nfp_reads;                          /* amiibo the game has read (smo_amiibo.c shows it) */
+static void nfp_lock(void) { plat_rw_wlock(&g_nfp_lock); }
+static void nfp_unlock(void) { plat_rw_wunlock(&g_nfp_lock); }
 static void nfp_tag_arrives(void) {                       /* lock held, state SearchingForTag, an amiibo held */
     g_nfp_state = NFP_FOUND;
     if (g_nfp_ev_off) os_clear_event(g_nfp_ev_off);
@@ -622,7 +622,7 @@ static void nfp_GetModelInfo(Ctx *c) {                     /* (ModelInfo *out, h
         m[0] = g_tag.id[0]; m[1] = g_tag.id[1]; m[2] = g_tag.id[2]; m[3] = g_tag.id[3];
         m[4] = g_tag.id[5]; m[5] = g_tag.id[4];            /* the model number, big-endian on the tag */
         m[6] = g_tag.id[6];
-        if (!g_tag.read) { g_tag.read = 1; InterlockedIncrement(&g_nfp_reads); printf("nfp: the game read the amiibo's model information\n"); }
+        if (!g_tag.read) { g_tag.read = 1; plat_inc(&g_nfp_reads); printf("nfp: the game read the amiibo's model information\n"); }
         RET(0);
     }
     nfp_unlock();
@@ -663,13 +663,13 @@ static ImportFn h(const char *name) {
 }
 static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (size_t i = from; i < to; i++) if (p[i] != v) return 0; return 1; }
 static volatile int g_kbd_test_initial_seen;
-static DWORD WINAPI kbd_test_driver(LPVOID arg) {
+static uint32_t kbd_test_driver(void * arg) {
     (void)arg;
     for (int round = 0; round < 2; round++) {
         HWND w = NULL;
-        for (int i = 0; i < 500 && !w; i++) { Sleep(10); w = FindWindowW(NULL, L"Software keyboard (smo-recomp)"); }
+        for (int i = 0; i < 500 && !w; i++) { plat_sleep_ms(10); w = FindWindowW(NULL, L"Software keyboard (smo-recomp)"); }
         if (!w) return 1;
-        Sleep(100);
+        plat_sleep_ms(100);
         if (round == 0) {
             wchar_t now[64] = L"";
             GetDlgItemTextW(w, IDC_EDIT, now, 63);
@@ -678,7 +678,7 @@ static DWORD WINAPI kbd_test_driver(LPVOID arg) {
             SetDlgItemTextW(w, IDC_EDIT, typed);
             PostMessageW(w, WM_COMMAND, IDOK, 0);
         } else PostMessageW(w, WM_COMMAND, IDCANCEL, 0);
-        for (int i = 0; i < 500 && IsWindow(w); i++) Sleep(10);
+        for (int i = 0; i < 500 && IsWindow(w); i++) plat_sleep_ms(10);
     }
     return 0;
 }

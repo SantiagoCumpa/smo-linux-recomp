@@ -24,7 +24,7 @@
  *   - Frames of the main executable are walked like any other but cannot be resumed: main is lifted without resume
  *     entries. A clean-up pad there is skipped with a warning; a handler there stops with a report.
  * Environment: SMO_UNWIND_LOG=1 prints every frame of every throw (the first 3 throws are always summarised). */
-#include <windows.h>
+#include "plat.h"
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +36,7 @@
 int cxxrt_readable(uint64_t p, size_t n);               /* nncxxrt.c */
 
 static int g_log;
-static volatile LONG g_throws, g_cleanups, g_skipped;
+static volatile int32_t g_throws, g_cleanups, g_skipped;
 
 /* ---------------------------------------------------------------- DWARF readers */
 static uint64_t uleb(const uint8_t **p) { uint64_t r = 0; int s = 0; uint8_t b; do { b = *(*p)++; r |= (uint64_t)(b & 0x7f) << s; s += 7; } while (b & 0x80); return r; }
@@ -173,11 +173,11 @@ static int step(const Fde *f, Regs *r, uint64_t *cfa_out) {
 typedef struct { uint64_t cfa; jmp_buf *jb; } CatchSlot;
 #define CATCH_SLOTS 8192
 static CatchSlot g_catch[CATCH_SLOTS];
-static SRWLOCK g_catch_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_catch_lock = PLAT_RWLOCK_INIT;
 
 static void catch_put(uint64_t cfa, jmp_buf *jb) {
     unsigned h = (unsigned)((cfa >> 4) * 2654435761u) & (CATCH_SLOTS - 1), first_free = CATCH_SLOTS;
-    AcquireSRWLockExclusive(&g_catch_lock);
+    plat_rw_wlock(&g_catch_lock);
     for (unsigned n = 0; n < 64; n++) {
         unsigned i = (h + n) & (CATCH_SLOTS - 1);
         if (g_catch[i].cfa == cfa) { first_free = i; break; }                 /* a frame at the same guest stack address replaces a stale one */
@@ -186,18 +186,18 @@ static void catch_put(uint64_t cfa, jmp_buf *jb) {
     }
     if (first_free == CATCH_SLOTS) first_free = h;                            /* crowded by records of abandoned stacks: reuse */
     g_catch[first_free].cfa = cfa; g_catch[first_free].jb = jb;
-    ReleaseSRWLockExclusive(&g_catch_lock);
+    plat_rw_wunlock(&g_catch_lock);
 }
 static jmp_buf *catch_take(uint64_t cfa, jmp_buf *only) {                     /* removes the record; only != NULL: remove if it is that one */
     unsigned h = (unsigned)((cfa >> 4) * 2654435761u) & (CATCH_SLOTS - 1);
     jmp_buf *jb = NULL;
-    AcquireSRWLockExclusive(&g_catch_lock);
+    plat_rw_wlock(&g_catch_lock);
     for (unsigned n = 0; n < 64; n++) {
         unsigned i = (h + n) & (CATCH_SLOTS - 1);
         if (g_catch[i].cfa == cfa) { if (!only || g_catch[i].jb == only) { jb = g_catch[i].jb; g_catch[i].cfa = 1; g_catch[i].jb = NULL; } break; }
         if (g_catch[i].cfa == 0) break;
     }
-    ReleaseSRWLockExclusive(&g_catch_lock);
+    plat_rw_wunlock(&g_catch_lock);
     return jb;
 }
 
@@ -255,7 +255,7 @@ static void eh_raise(Ctx *c, int reason) {
     const char *stop = "frame limit";
     const char *owner = "?";
     if (reason == EH_RAISE_THROW) {                       /* phase 1: is there a handler at all? (the console terminates without unwinding if not) */
-        LONG seq = InterlockedIncrement(&g_throws);
+        int32_t seq = plat_inc(&g_throws);
         int found = 0, depth = 0;
         regs_from(c, &cur);
         for (; depth < 4096; depth++) {
@@ -284,7 +284,7 @@ static void eh_raise(Ctx *c, int reason) {
         void (*fn)(Ctx *, uint64_t) = resume_entry(pad.landing_pad, &owner);
         if (!fn) {
             if (pad.kind == EH_HANDLER) eh_terminate(c, "the handler is in code without resume entries");
-            if (InterlockedIncrement(&g_skipped) <= 8) printf("unwind: clean-up pad %llx in %s skipped (no resume entry)\n", (unsigned long long)pad.landing_pad, owner);
+            if (plat_inc(&g_skipped) <= 8) printf("unwind: clean-up pad %llx in %s skipped (no resume entry)\n", (unsigned long long)pad.landing_pad, owner);
             continue;
         }
         for (int i = 19; i <= 29; i++) c->x[i] = at.x[i];
@@ -292,7 +292,7 @@ static void eh_raise(Ctx *c, int reason) {
         for (int i = 0; i < 8; i++) { c->v[8 + i].d[0] = at.d[i]; c->v[8 + i].d[1] = 0; }
         eh_enter_pad(c, &pad);                            /* x0, x1; the exception is no longer "in flight" */
         c->in_import = NULL;
-        if (pad.kind == EH_CLEANUP) InterlockedIncrement(&g_cleanups);
+        if (pad.kind == EH_CLEANUP) plat_inc(&g_cleanups);
         fn(c, pad.landing_pad);
         /* A clean-up pad does not come back (it ends in _Unwind_Resume, which re-enters raise()). Coming back means a
          * handler ran and the function that contains it returned to ITS caller: cut the host stack back to the frame

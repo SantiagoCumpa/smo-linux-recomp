@@ -16,7 +16,7 @@
  *               plat_aligned_alloc / plat_aligned_free, plat_rss_bytes (/proc/self/statm)
  *   files       plat_exe_path / plat_exe_dir (/proc/self/exe), plat_mkdir, plat_mkdirs, plat_is_dir, plat_is_file,
  *               plat_file_size, plat_rename_replace, plat_fsync_path, plat_fsync_dir
- *   process     plat_exit (flushes stdio, then _exit: no atexit handlers, like ExitProcess from a worker thread)
+ *   process     plat_argc / plat_argv (set before main, for files that read the command line), plat_exit (flushes stdio, then _exit: no atexit handlers, like ExitProcess from a worker thread)
  */
 #ifndef SMO_PLAT_H
 #define SMO_PLAT_H
@@ -25,6 +25,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <sched.h>
 #include <semaphore.h>
@@ -124,8 +125,17 @@ void plat_thread_detach(plat_thread *t);
 pid_t plat_thread_tid(plat_thread *t);                    /* its kernel thread id (waits until the thread runs) */
 static inline pid_t plat_tid(void) { return gettid(); }
 void plat_set_thread_name(const char *name);
+void plat_thread_altstack(void);
+/* the host stack of another thread of this process right now (a signal is sent to it; it records its own backtrace):
+ * pcs[0] is where it was interrupted. Returns the count, 0 when the thread did not answer within 200 ms. */
+int plat_thread_backtrace(pid_t tid, uintptr_t *pcs, int max);                          /* a signal stack for this thread (crash reports); idempotent */
 int plat_set_affinity(pid_t tid, const uint64_t *mask, int ncpu);   /* tid 0: this thread */
 int plat_cpu(void);
+uint64_t plat_thread_cpu_ns(pid_t tid);                     /* CPU time a thread of this process used (schedstat) */
+/* system-wide CPU time (all CPUs, in clock ticks of /proc/stat): busy and idle */
+void plat_system_cpu(uint64_t *busy, uint64_t *idle);
+/* this process: CPU time in clock ticks (user + system) and page faults (minor + major) */
+void plat_process_cpu(uint64_t *ticks, uint64_t *faults);
 int plat_cpu_count(void);
 
 /* ---- memory ---- */
@@ -145,6 +155,7 @@ static inline void *plat_aligned_alloc(size_t size, size_t align) {
     return posix_memalign(&p, align, size ? size : 1) ? NULL : p;
 }
 static inline void plat_aligned_free(void *p) { free(p); }
+int plat_readable(const void *addr, size_t n);              /* n bytes can be read without a fault */
 uint64_t plat_rss_bytes(void);
 uint64_t plat_total_memory(void);
 
@@ -161,6 +172,9 @@ int plat_rename_replace(const char *from, const char *to);/* 1 on success */
 int plat_fsync_path(const char *path);
 int plat_fsync_dir(const char *path_in_dir);              /* the folder holding the file (a rename's durability) */
 void plat_exit(int code) __attribute__((noreturn));
+int plat_random(void *buf, size_t n);                     /* kernel entropy (getrandom); 1 on success */
+extern int plat_argc;                                     /* the program's arguments, from before main() */
+extern char **plat_argv;
 
 #ifdef __cplusplus
 }

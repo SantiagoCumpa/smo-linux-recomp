@@ -3,9 +3,8 @@
  * other modules it asks for, in order. Unimplemented imports return 0. */
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 #include <math.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -100,17 +99,17 @@ static const char *g_elf;
 #define PROF_MAX 8192
 static struct { uint64_t callee, caller; unsigned n; } g_prof[PROF_MAX];
 static int g_prof_used;
-static HANDLE g_prof_target;
-static DWORD WINAPI profiler(LPVOID arg) {
+static pid_t g_prof_target;
+static uint32_t profiler(void * arg) {
     int start = 0, dur = 0;
     (void)arg;
     char mode = 's';
     if (sscanf(getenv("SMO_PROF"), "%d,%d,%c", &start, &dur, &mode) < 2 || dur <= 0) return 0;
-    Sleep((DWORD)start * 1000);
-    ULONGLONG end = GetTickCount64() + (ULONGLONG)dur * 1000;
+    plat_sleep_ms((uint32_t)start * 1000);
+    uint64_t end = plat_ms() + (uint64_t)dur * 1000;
     unsigned samples = 0;
     if (mode == 'f') {        /* SMO_PROF=<start>,<dur>,f : spin reading c->fn / x30: every function the main thread enters */
-        while (GetTickCount64() < end) {
+        while (plat_ms() < end) {
             for (int r = 0; r < 4096; r++) {
                 uint64_t callee = g_main_ctx->fn, caller = g_main_ctx->x[30];
                 unsigned h = (unsigned)((callee >> 2) * 2654435761u) % PROF_MAX;
@@ -126,25 +125,14 @@ static DWORD WINAPI profiler(LPVOID arg) {
                 printf("[prof] f_%llx lr %llx: %u\n", (unsigned long long)g_prof[j].callee, (unsigned long long)g_prof[j].caller, g_prof[j].n);
         return 0;
     }
-    while (GetTickCount64() < end) {
-        CONTEXT ctx;
+    while (plat_ms() < end) {
         uint64_t chain[64];
-        int k = 0;
-        memset(&ctx, 0, sizeof ctx);
-        ctx.ContextFlags = CONTEXT_FULL;
-        SuspendThread(g_prof_target);
-        GetThreadContext(g_prof_target, &ctx);
-        for (int depth = 0; depth < 400 && k < 64; depth++) {
-            uint64_t g = guest_function_of(ctx.Rip);
+        uintptr_t pcs[96];
+        int k = 0, np = plat_thread_backtrace(g_prof_target, pcs, 96);
+        for (int depth = 0; depth < np && k < 64; depth++) {
+            uint64_t g = guest_function_of(pcs[depth]);
             if (g && (k == 0 || chain[k - 1] != g)) chain[k++] = g;
-            DWORD64 base;
-            RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
-            if (!rf) break;
-            void *hd; DWORD64 est;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
-            if (!ctx.Rip) break;
         }
-        ResumeThread(g_prof_target);
         samples++;
         for (int i = 0; i < k; i++) {
             uint64_t callee = chain[i], caller = i + 1 < k ? chain[i + 1] : 0;
@@ -153,7 +141,7 @@ static DWORD WINAPI profiler(LPVOID arg) {
             if (j == g_prof_used) { if (g_prof_used == PROF_MAX) continue; g_prof[g_prof_used].callee = callee; g_prof[g_prof_used].caller = caller; g_prof_used++; }
             g_prof[j].n++;
         }
-        for (ULONGLONG t0 = GetTickCount64(); GetTickCount64() - t0 < 1;) YieldProcessor();
+        for (uint64_t t0 = plat_ms(); plat_ms() - t0 < 1;) plat_pause();
     }
     printf("\n[prof] %u samples of the main thread (callee <- caller: samples)\n", samples);
     for (int j = 0; j < g_prof_used; j++)
@@ -166,9 +154,8 @@ static size_t main_stack_size_from_npdm(void) {
     if (ov && strtoull(ov, NULL, 0) >= 0x10000) return (size_t)(strtoull(ov, NULL, 0) + 0xfff) & ~(size_t)0xfff;
     char path[1024];
     snprintf(path, sizeof path, "%s", g_elf);
-    char *sl = strrchr(path, '/'), *bs = strrchr(path, '\\');
-    char *cut = sl > bs ? sl : bs;
-    snprintf(cut ? cut + 1 : path, sizeof path - (size_t)((cut ? cut + 1 : path) - path), "..\\exefs\\main.npdm");   /* build/dump/update/{elf,exefs} */
+    char *cut = strrchr(path, '/');
+    snprintf(cut ? cut + 1 : path, sizeof path - (size_t)((cut ? cut + 1 : path) - path), "../exefs/main.npdm");   /* build/dump/update/{elf,exefs} */
     FILE *f = fopen(path, "rb");
     unsigned char h[0x20];
     if (!f || fread(h, 1, sizeof h, f) != sizeof h || memcmp(h, "META", 4)) {
@@ -186,16 +173,15 @@ void main_stack_report(void) {
     if (!g_main_stack_base) return;
     const uint64_t *p = (const uint64_t *)(uintptr_t)g_main_stack_base, *e = p + g_main_stack_size / 8;
     while (p < e && !*p) p++;
-    MEMORY_BASIC_INFORMATION lo, hi;
-    VirtualQuery((void *)(uintptr_t)(g_main_stack_base - 0x1000), &lo, sizeof lo);
-    VirtualQuery((void *)(uintptr_t)(g_main_stack_base + g_main_stack_size), &hi, sizeof hi);
+    int lo = plat_readable((void *)(uintptr_t)(g_main_stack_base - 0x1000), 1);
+    int hi = plat_readable((void *)(uintptr_t)(g_main_stack_base + g_main_stack_size), 1);
     printf("main guest stack: 0x%llx bytes at %llx, deepest use 0x%llx bytes (%.1f%%); page below: %s, page above: %s\n",
            (unsigned long long)g_main_stack_size, (unsigned long long)g_main_stack_base,
            (unsigned long long)((const uint8_t *)e - (const uint8_t *)p), 100.0 * (double)((const uint8_t *)e - (const uint8_t *)p) / (double)g_main_stack_size,
-           lo.State == MEM_RESERVE ? "no access" : "ACCESSIBLE", hi.State == MEM_RESERVE ? "no access" : "ACCESSIBLE");
+           !lo ? "no access" : "ACCESSIBLE", !hi ? "no access" : "ACCESSIBLE");
 }
 
-static DWORD WINAPI guest_main(LPVOID arg) {
+static uint32_t guest_main(void * arg) {
     (void)arg;
     static Ctx c;
     /* the main thread's stack has the size the program's own meta data asks for (main.npdm, META header +0x1c:
@@ -204,10 +190,10 @@ static DWORD WINAPI guest_main(LPVOID arg) {
      * moves the guest SP exactly as the ARM code does); the host's own frames live on the host stack and are not
      * guest-visible. SMO_MAIN_STACK=<bytes> overrides (diagnosis only). */
     size_t stack_size = main_stack_size_from_npdm();
-    uint8_t *stack_res = VirtualAlloc(NULL, stack_size + 0x20000, MEM_RESERVE, PAGE_NOACCESS);
-    uint8_t *stack = stack_res ? VirtualAlloc(stack_res + 0x10000, stack_size, MEM_COMMIT, PAGE_READWRITE) : NULL;
+    uint8_t *stack_res = plat_reserve(NULL, stack_size + 0x20000);
+    uint8_t *stack = stack_res && plat_commit(stack_res + 0x10000, stack_size, PLAT_RW) ? stack_res + 0x10000 : NULL;
     if (!stack) { fprintf(stderr, "cannot allocate the main thread's stack (0x%llx bytes)\n", (unsigned long long)stack_size); exit(1); }
-    uint8_t *tls = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint8_t *tls = plat_alloc(NULL, 0x10000, PLAT_RW);
     c.x[31] = (uint64_t)(stack + stack_size);          /* the initial SP is the top of the stack (16-byte aligned: the size is whole pages) */
     c.tpidr = (uint64_t)tls;
     { uint64_t os_main_thread_type(void); memcpy(tls + 0x1f8, &(uint64_t){os_main_thread_type()}, 8); }   /* [sdk 0x3349dc..e0] nn::os::detail::ThreadManager(): the main thread's ThreadType pointer */
@@ -245,6 +231,7 @@ static DWORD WINAPI guest_main(LPVOID arg) {
 int main(int argc, char **argv) {
     g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* the target's main.elf from the exe's folder (image.h) */
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 1 && !strcmp(argv[1], "--shaderc-selftest")) { int smo_shaderc_selftest(void); return smo_shaderc_selftest(); }   /* vk_shaderc_shim.c */
     {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
         int nnhid_pad_selftest(void), nnpad_tool(int, char **);
         int tool;
@@ -253,7 +240,7 @@ int main(int argc, char **argv) {
     }
     /* data symbols the game imports from the SDK module get their real values (build/gen/sdkdata.c, written by gen_tables.py) */
     for (int i = 0; i < sdk_data_count; i++) {
-        void *copy = _aligned_malloc(sdk_data[i].size, 16);
+        void *copy = plat_aligned_alloc(sdk_data[i].size, 16);
         memcpy(copy, sdk_data[i].bytes, sdk_data[i].size);
         import_set_address(sdk_data[i].name, copy);
     }
@@ -285,15 +272,18 @@ int main(int argc, char **argv) {
     display_init();
     int seconds = argc > 2 ? atoi(argv[2]) : 0;      /* no number = no time limit (a player's launch); tests pass theirs */
     /* the lifted code uses the host stack for every guest call: give it plenty */
-    HANDLE t = CreateThread(NULL, (SIZE_T)1 << 30, guest_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
-    if (getenv("SMO_PROF")) { g_prof_target = t; CloseHandle(CreateThread(NULL, 0, profiler, NULL, 0, NULL)); }
-    DWORD wr = WaitForSingleObject(t, seconds > 0 ? (DWORD)seconds * 1000 : INFINITE);
+    plat_thread *t = plat_thread_start(guest_main, NULL, (size_t)1 << 30);
+    if (!t) { fprintf(stderr, "cannot start the guest main thread (1 GB stack)\n"); return 1; }
+    pid_t t_tid = plat_thread_tid(t);
+    if (getenv("SMO_PROF")) { g_prof_target = t_tid; plat_thread_detach(plat_thread_start(profiler, NULL, 0)); }
+    enum { WAIT_DONE = 0, WAIT_TIMEOUT = 1 };
+    int wr = plat_thread_join(t, seconds > 0 ? (uint32_t)seconds * 1000 : PLAT_INFINITE) ? WAIT_DONE : WAIT_TIMEOUT;
     {   unsigned long long stage_list_started(void);     /* smo_nerve.c: SMO_STAGE_LIST (TEST ONLY): the limit counts from the start of the stage being played */
-        for (unsigned long long s; wr == WAIT_TIMEOUT && (s = stage_list_started()) && s + (unsigned long long)seconds * 1000 > GetTickCount64(); )
-            wr = WaitForSingleObject(t, (DWORD)(s + (unsigned long long)seconds * 1000 - GetTickCount64()));
+        for (unsigned long long s; wr == WAIT_TIMEOUT && (s = stage_list_started()) && s + (unsigned long long)seconds * 1000 > plat_ms(); )
+            wr = plat_thread_join(t, (uint32_t)(s + (unsigned long long)seconds * 1000 - plat_ms())) ? WAIT_DONE : WAIT_TIMEOUT;
     }
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
-        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = WaitForSingleObject(t, h - done);
+        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = plat_thread_join(t, h - done) ? WAIT_DONE : WAIT_TIMEOUT;
     }
     if (wr == WAIT_TIMEOUT) {
         printf("\nstill running after %d s with %d guest thread(s) started: stopping here.\n", seconds, guest_thread_count());
@@ -307,30 +297,21 @@ int main(int argc, char **argv) {
             printf("\n");
             /* where is the main host thread really? sample its instruction pointer and unwind */
             for (int s = 0; s < 3; s++) {
-                Sleep(50);
-                CONTEXT ctx;
-                memset(&ctx, 0, sizeof ctx);
-                ctx.ContextFlags = CONTEXT_FULL;
-                SuspendThread(t);
-                GetThreadContext(t, &ctx);
-                printf("  host rip sample %d: rip=%p -> f_%llx |", s, (void *)ctx.Rip, (unsigned long long)guest_function_of(ctx.Rip));
+                plat_sleep_ms(50);
+                uintptr_t pcs[200];
+                int np = plat_thread_backtrace(t_tid, pcs, 200);
+                uintptr_t rip = np ? pcs[0] : 0;
+                printf("  host rip sample %d: rip=%p -> f_%llx |", s, (void *)rip, (unsigned long long)guest_function_of(rip));
                 uint64_t last = 0;
-                for (int depth = 0, shown = 0; depth < 200 && shown < 12; depth++) {
-                    uint64_t g = guest_function_of(ctx.Rip);
+                for (int depth = 0, shown = 0; depth < np && shown < 12; depth++) {
+                    uint64_t g = guest_function_of(pcs[depth]);
                     if (g && g != last) { printf(" f_%llx", (unsigned long long)g); shown++; last = g; }
-                    else if (!g && depth == 0) printf(" [host %p]", (void *)ctx.Rip);
-                    DWORD64 base;
-                    RUNTIME_FUNCTION *rf = RtlLookupFunctionEntry(ctx.Rip, &base, NULL);
-                    if (!rf) break;
-                    void *hd; DWORD64 est;
-                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, rf, &ctx, &hd, &est, NULL);
-                    if (!ctx.Rip) break;
+                    else if (!g && depth == 0) printf(" [host %p]", (void *)pcs[depth]);
                 }
                 printf("\n");
-                ResumeThread(t);
             }
             for (int s = 0; s < 8; s++) {            /* is it moving? sample a few times */
-                Sleep(37);
+                plat_sleep_ms(37);
                 printf("  sample %d: f_%llx lr=%llx x0=%llx x1=%llx x8=%llx x9=%llx x11=%llx x12=%llx\n", s,
                        (unsigned long long)g_main_ctx->fn, (unsigned long long)g_main_ctx->x[30], (unsigned long long)g_main_ctx->x[0],
                        (unsigned long long)g_main_ctx->x[1], (unsigned long long)g_main_ctx->x[8], (unsigned long long)g_main_ctx->x[9],
@@ -349,8 +330,7 @@ int main(int argc, char **argv) {
                 uint64_t p = icall_first_x0(strtoull(spec, NULL, 16));
                 printf("[chain] %s: x0=%llx\n", spec, (unsigned long long)p);
                 for (char *o = colon ? colon + 1 : NULL; p; o = o ? strchr(o, ',') : NULL) {
-                    MEMORY_BASIC_INFORMATION mi;
-                    if (!VirtualQuery((void *)(uintptr_t)p, &mi, sizeof mi) || mi.State != MEM_COMMIT) { printf("[chain]   %llx not mapped\n", (unsigned long long)p); break; }
+                    if (!plat_readable((void *)(uintptr_t)p, 0x130)) { printf("[chain]   %llx not mapped\n", (unsigned long long)p); break; }
                     printf("[chain]   %llx:", (unsigned long long)p);
                     for (int w = 0; w < 0x130; w += 8) printf("%s%016llx", w % 0x40 ? " " : "\n[chain]     ", (unsigned long long)rd64(p + w));
                     printf("\n");

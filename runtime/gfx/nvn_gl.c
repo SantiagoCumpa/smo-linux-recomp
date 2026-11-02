@@ -39,7 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include <GL/gl.h>
 #include "runtime.h"
 #include "hostrt.h"
@@ -54,8 +54,8 @@
 #pragma comment(lib, "opengl32.lib")
 
 /* ask laptop drivers for the discrete GPU */
-__declspec(dllexport) DWORD NvOptimusEnablement = 1;
-__declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+__attribute__((visibility("default"))) uint32_t NvOptimusEnablement = 1;
+__attribute__((visibility("default"))) int AmdPowerXpressRequestHighPerformance = 1;
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -244,19 +244,19 @@ enum {
 
 /* ---------------------------------------------------------------- the render thread */
 typedef struct Job { void (*fn)(void *); void *arg; HANDLE done; struct Job *next; } Job;
-static CRITICAL_SECTION g_job_lock;
+static plat_lock_t g_job_lock;
 static Job *g_job_head, *g_job_tail;
 static HANDLE g_job_event, g_ready_event;
-static DWORD g_render_tid;
+static uint32_t g_render_tid;
 static HWND g_hwnd;
 static HDC g_dc;
-static __declspec(thread) HANDLE t_done;
+static _Thread_local HANDLE t_done;
 static void gl_housekeeping(void);
 static void (*pf_job_submit)(void *), (*pf_job_present)(void *);
-static LONG64 g_joblog_frame, g_joblog_cur;
-static void joblog(void (*fn)(void *), LONG64 t);
-static inline LONG64 pf_now(void);
-static inline void pf_add(int k, LONG64 t0);
+static int64_t g_joblog_frame, g_joblog_cur;
+static void joblog(void (*fn)(void *), int64_t t);
+static inline int64_t pf_now(void);
+static inline void pf_add(int k, int64_t t0);
 /* SMO_FRAMETL=<first frame>,<frames> (debug aid): a timeline of those frames. Every job a game thread queues for the render
  * thread (and whether it waits), when the render thread ran it, its submissions to the GPU and its waits for the GPU, the
  * presents, the game's waits for the refresh and the refreshes themselves are recorded with the performance counter, the
@@ -265,7 +265,7 @@ static inline void pf_add(int k, LONG64 t0);
  * tools/dev/frametl.py makes a table per frame of it. Costs one test per event when not set. */
 enum { TL_POST = 1, TL_RUN, TL_RUN_RET, TL_JOB_BEGIN, TL_JOB_END, TL_PACE_BEGIN, TL_PACE_END, TL_VSYNC, TL_FRAME_END, TL_PRESENT_CALL, TL_SYNC_CALL, TL_SYNC_RET,
        TL_GPU_WAIT, TL_GPU_WAIT_END, TL_GPU_SUBMIT };   /* nvn_vk_draw.c: 13/14 the render thread waits for a submission to finish (slot_wait), 15 vkQueueSubmit */
-static volatile LONG g_tl_on;
+static volatile int32_t g_tl_on;
 void nvn_tl(int ev, int arg);
 static int tl_kind(void (*fn)(void *));
 enum { PF_WAIT_SUBMIT_ = 13, PF_WAIT_PRESENT_ = 14, PF_WAIT_OTHER_ = 15 };
@@ -278,19 +278,19 @@ void hitch_wait_render(int on); void hitch_frame(long long frame, double ms, int
 #define HS_OUT() (g_hitch_rt = hs_p_, g_hitch_rt_arg = hs_a_)
 
 static void gl_run(void (*fn)(void *), void *arg) {
-    if (GetCurrentThreadId() == g_render_tid) { fn(arg); return; }
-    if (!t_done) t_done = CreateEventA(NULL, FALSE, FALSE, NULL);
+    if (plat_tid() == g_render_tid) { fn(arg); return; }
+    if (!t_done) t_done = plat_event_new(0, 0);
     Job j = {fn, arg, t_done, NULL};
-    LONG64 pf0 = pf_now();
+    int64_t pf0 = pf_now();
     if (g_joblog_frame > 0 && g_joblog_cur >= g_joblog_frame && g_joblog_cur < g_joblog_frame + 3) joblog(fn, pf0);
     if (g_tl_on) nvn_tl(TL_RUN, tl_kind(fn));
-    EnterCriticalSection(&g_job_lock);
+    plat_lock(&g_job_lock);
     if (g_job_tail) g_job_tail->next = &j; else g_job_head = &j;
     g_job_tail = &j;
-    LeaveCriticalSection(&g_job_lock);
-    SetEvent(g_job_event);
+    plat_unlock(&g_job_lock);
+    plat_event_set(g_job_event);
     hitch_wait_render(1);
-    WaitForSingleObject(j.done, INFINITE);
+    WaitForSingleObject(j.done, PLAT_INFINITE);
     hitch_wait_render(0);
     if (g_tl_on) nvn_tl(TL_RUN_RET, tl_kind(fn));
     pf_add(fn == pf_job_submit ? PF_WAIT_SUBMIT_ : fn == pf_job_present ? PF_WAIT_PRESENT_ : PF_WAIT_OTHER_, pf0);
@@ -309,7 +309,7 @@ static void gl_run(void (*fn)(void *), void *arg) {
  *     windows, queues) first wait until the queue is empty (gl_barrier); FinalizeCommandHandle is queued in order;
  *   - guest memory the commands refer to (vertex / uniform / storage buffers, texture storage) is read when the commands
  *     run, as on the console's GPU: the game must not change it before the fence signals, and that rule is the game's own. */
-static volatile LONG g_async_pending;
+static volatile int32_t g_async_pending;
 static int g_sync_submit = -1;
 static void job_nop(void *arg) { (void)arg; }
 static int gl_async_on(void) {
@@ -317,33 +317,33 @@ static int gl_async_on(void) {
     return !g_sync_submit;
 }
 static void gl_post(void (*fn)(void *), const void *arg, size_t size) {       /* run fn(copy of arg) on the render thread, in order, without waiting */
-    if (GetCurrentThreadId() == g_render_tid) { fn((void *)arg); return; }
+    if (plat_tid() == g_render_tid) { fn((void *)arg); return; }
     Job *j = malloc(sizeof *j + size + 8);
     if (size) memcpy(j + 1, arg, size);
     j->fn = fn; j->arg = j + 1; j->done = NULL; j->next = NULL;
-    InterlockedIncrement(&g_async_pending);
+    plat_inc(&g_async_pending);
     if (g_tl_on) nvn_tl(TL_POST, tl_kind(fn));
-    EnterCriticalSection(&g_job_lock);
+    plat_lock(&g_job_lock);
     if (g_job_tail) g_job_tail->next = j; else g_job_head = j;
     g_job_tail = j;
-    LeaveCriticalSection(&g_job_lock);
-    SetEvent(g_job_event);
+    plat_unlock(&g_job_lock);
+    plat_event_set(g_job_event);
 }
 static void gl_barrier(void) { if (g_async_pending) gl_run(job_nop, NULL); }   /* everything queued so far has run when this returns */
 
 /* ---------------------------------------------------------------- statistics and diagnostics */
 static struct {
-    LONG64 frames, submits, lists, draws, draws_skipped, clears, stale, tex_created, tex_uploads, tex_bytes, views, handles,
+    int64_t frames, submits, lists, draws, draws_skipped, clears, stale, tex_created, tex_uploads, tex_bytes, views, handles,
            prog_ok, prog_fail, binary_used, glsl_ok, glsl_fail, glsl_draws, fbo_made, fbo_bad, gl_errors, copies, unknown_fmt, arena_bytes,
            dispatches, dispatch_run, dispatch_skipped, compute_bytes, draws_from_compute;
 } g_st;
-static LONG64 g_frame_draws, g_frame_skipped, g_frame_clears;
+static int64_t g_frame_draws, g_frame_skipped, g_frame_clears;
 static int g_debug, g_logn;
 static const char *g_cur_op = "";
-static volatile LONG g_setshaders_calls, g_with_text, g_without_text;
-static LONG g_bufhist[6][32], g_storhist[32];
+static volatile int32_t g_setshaders_calls, g_with_text, g_without_text;
+static int32_t g_bufhist[6][32], g_storhist[32];
 
-/* ---- timing scopes. Always on: two QueryPerformanceCounter calls per scope.
+/* ---- timing scopes. Always on: two plat_qpc calls per scope.
  * Printed with the frame-rate line every 300 frames as milliseconds per frame. Scopes nest (PREP contains ARENA and
  * TEXSYNC; SUBMIT contains everything the render thread does for a batch); WAIT_* are measured on the calling guest
  * thread (how long it was blocked in gl_run), PACE is the sleep of display_pace. */
@@ -351,49 +351,49 @@ enum { PF_SUBMIT, PF_PREP, PF_DRAWCALL, PF_ARENA, PF_TEXHASH, PF_TEXUP, PF_HANDL
        PF_OTHERJOB, PF_WAIT_SUBMIT, PF_WAIT_PRESENT, PF_WAIT_OTHER, PF_PACE, PF_XLATE, PF_GLCOMPILE, PF_N };
 static const char *const k_pf_name[PF_N] = {"submit", "prep", "drawcall", "arena", "texhash", "texupload", "handle", "dispatch", "cflush", "copy", "present", "swap",
                                             "otherjob", "wait-submit", "wait-present", "wait-other", "pace", "shader-translate", "shader-compile"};
-static volatile LONG64 g_pf[PF_N], g_pfn[PF_N];
-static LONG64 g_pf_arena_bytes, g_pf_cflush_bytes, g_pf_hash_bytes;
+static volatile int64_t g_pf[PF_N], g_pfn[PF_N];
+static int64_t g_pf_arena_bytes, g_pf_cflush_bytes, g_pf_hash_bytes;
 /* SMO_GLSTATS=1: one more line every 300 frames with per-frame counts (render-thread waits of guest threads, compute
  * read-backs, objects created, shader work, and how many per-draw GL settings repeat the value of the previous draw). */
-static LONG64 g_gs_draws, g_gs_prog_same, g_gs_attr_set, g_gs_attr_same, g_gs_vbuf_bind, g_gs_buf_bind;
+static int64_t g_gs_draws, g_gs_prog_same, g_gs_attr_set, g_gs_attr_same, g_gs_vbuf_bind, g_gs_buf_bind;
 static GLuint g_gs_last_prog[2];
 static uint32_t g_gs_last_attr[16];
-static inline LONG64 pf_now(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
-static inline void pf_add(int k, LONG64 t0) { InterlockedExchangeAdd64(&g_pf[k], pf_now() - t0); InterlockedIncrement64(&g_pfn[k]); }
-void nvn_pf_pace(LONG64 ticks) { InterlockedExchangeAdd64(&g_pf[PF_PACE], ticks); InterlockedIncrement64(&g_pfn[PF_PACE]); }     /* display.c */
+static inline int64_t pf_now(void) { plat_counter t; plat_qpc(&t); return t.QuadPart; }
+static inline void pf_add(int k, int64_t t0) { plat_xadd(&g_pf[k], pf_now() - t0); plat_inc(&g_pfn[k]); }
+void nvn_pf_pace(int64_t ticks) { plat_xadd(&g_pf[PF_PACE], ticks); plat_inc(&g_pfn[PF_PACE]); }     /* display.c */
 
 /* SMO_FRAMETL (see the enum above): the record */
 #define TL_MAX (1 << 18)
-typedef struct { LONG64 t; uint32_t tid; uint16_t ev, arg; uint32_t cpu; } TlEv;
+typedef struct { int64_t t; uint32_t tid; uint16_t ev, arg; uint32_t cpu; } TlEv;
 static TlEv *g_tl;
-static volatile LONG g_tl_n;
-static LONG64 g_tl_first = -2, g_tl_frames;
+static volatile int32_t g_tl_n;
+static int64_t g_tl_first = -2, g_tl_frames;
 static int tl_kind(void (*fn)(void *)) {           /* 0 submit, 1 fence, 2 flush, 3 present, 4 SyncWait, 5 Finish, 9 other */
     return fn == g_rb->submit || fn == g_rb->submit_async ? 0 : fn == g_rb->fence ? 1 : fn == g_rb->flush ? 2 : fn == g_rb->present ? 3 :
            fn == g_rb->sync_wait ? 4 : fn == g_rb->finish ? 5 : 9;
 }
 void nvn_tl(int ev, int arg) {
     if (!g_tl_on) return;
-    LONG i = InterlockedIncrement(&g_tl_n) - 1;
+    int32_t i = plat_inc(&g_tl_n) - 1;
     if (i >= TL_MAX) return;
-    g_tl[i].t = pf_now(); g_tl[i].tid = GetCurrentThreadId(); g_tl[i].ev = (uint16_t)ev; g_tl[i].arg = (uint16_t)arg; g_tl[i].cpu = GetCurrentProcessorNumber();
+    g_tl[i].t = pf_now(); g_tl[i].tid = plat_tid(); g_tl[i].ev = (uint16_t)ev; g_tl[i].arg = (uint16_t)arg; g_tl[i].cpu = plat_cpu();
 }
-static DWORD WINAPI tl_write(void *arg) {           /* the record, written by a thread of its own (on the render thread it held a frame) */
-    LONG64 last = (LONG64)(uintptr_t)arg;
-    Sleep(20);                                     /* a thread between its test of g_tl_on and its store */
+static uint32_t tl_write(void *arg) {           /* the record, written by a thread of its own (on the render thread it held a frame) */
+    int64_t last = (int64_t)(uintptr_t)arg;
+    plat_sleep_ms(20);                                     /* a thread between its test of g_tl_on and its store */
     const char *out = getenv("SMO_FRAMETL_OUT");
     FILE *fp = fopen(out ? out : "frametl.txt", "w");
-    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
-    LONG n = g_tl_n < TL_MAX ? g_tl_n : TL_MAX;
+    plat_counter fq; plat_qpf(&fq);
+    int32_t n = g_tl_n < TL_MAX ? g_tl_n : TL_MAX;
     if (fp) {
         fprintf(fp, "# frametl frames %lld..%lld, %ld events, counter %lld Hz, render thread %lu\n", (long long)g_tl_first, (long long)last, (long)n, (long long)fq.QuadPart, (unsigned long)g_render_tid);
-        for (LONG i = 0; i < n; i++) fprintf(fp, "%lld %lu %u %u %u\n", (long long)g_tl[i].t, (unsigned long)g_tl[i].tid, g_tl[i].ev, g_tl[i].arg, g_tl[i].cpu);
+        for (int32_t i = 0; i < n; i++) fprintf(fp, "%lld %lu %u %u %u\n", (long long)g_tl[i].t, (unsigned long)g_tl[i].tid, g_tl[i].ev, g_tl[i].arg, g_tl[i].cpu);
         fclose(fp);
     }
     printf("nvn_tl: frames %lld..%lld: %ld events written to %s\n", (long long)g_tl_first, (long long)last, (long)n, out ? out : "frametl.txt");
     return 0;
 }
-static void tl_frame_end(LONG64 frame) {           /* render thread, after the present of `frame` */
+static void tl_frame_end(int64_t frame) {           /* render thread, after the present of `frame` */
     if (g_tl_first == -2) {
         const char *e = getenv("SMO_FRAMETL");
         g_tl_first = -1;
@@ -402,9 +402,9 @@ static void tl_frame_end(LONG64 frame) {           /* render thread, after the p
     }
     if (g_tl_first < 0) return;
     if (g_tl_on) nvn_tl(TL_FRAME_END, (int)(frame & 0xffff));
-    if (frame == g_tl_first - 1) InterlockedExchange(&g_tl_on, 1);
+    if (frame == g_tl_first - 1) plat_xchg(&g_tl_on, 1);
     if (frame != g_tl_first + g_tl_frames - 1) return;
-    InterlockedExchange(&g_tl_on, 0);
+    plat_xchg(&g_tl_on, 0);
     HANDLE th = CreateThread(NULL, 0, tl_write, (void *)(uintptr_t)frame, 0, NULL);
     if (th) CloseHandle(th);
     g_tl_frames = 0;                               /* recorded once */
@@ -424,9 +424,9 @@ static void logf_limited(int *counter, int limit, const char *fmt, ...) {
  * per id; hitch_draw prints the ones that arrived during a slow draw call, nvn_gl_report the table. */
 static int g_fdlog;
 static unsigned g_fd_prim, g_fd_poly, g_fd_dclamp, g_fd_rdisc, g_fd_count;
-static struct { LONG64 t; GLuint id; GLenum type, sev; char text[232]; } g_fd_ring[64];
+static struct { int64_t t; GLuint id; GLenum type, sev; char text[232]; } g_fd_ring[64];
 static unsigned g_fd_ring_n;
-static struct { GLuint id; GLenum type, sev; LONG64 n; char text[200]; } g_fd_ids[64];
+static struct { GLuint id; GLenum type, sev; int64_t n; char text[200]; } g_fd_ids[64];
 static void fd_note(GLenum type, GLuint id, GLenum severity, const char *message) {
     unsigned k = g_fd_ring_n++ & 63;
     g_fd_ring[k].t = pf_now(); g_fd_ring[k].id = id; g_fd_ring[k].type = type; g_fd_ring[k].sev = severity;
@@ -551,7 +551,7 @@ static void *hnew(uint64_t g, uint32_t kind, size_t size) {
 /* SamplerParams, View, TexBuilder, TexObj, EView, VNode, Tex, TexPoolEnt, TexPool, SamplerPool, Stage, Prog, Cmd, CmdBuf, Window:
  * nvn_front.h */
 
-static SRWLOCK g_pool_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_pool_lock = PLAT_RWLOCK_INIT;
 static Tex *volatile g_all_tex;            /* every texture, newest first (never unlinked: host records of textures are not freed) */
 /* The live textures by the 64 KB pages of guest memory they are stored on, for nvn_gl_memory_written: a flush of a
  * range looks only at the textures on its pages. It walked every texture record ever made, so each flush cost more the
@@ -561,7 +561,7 @@ static Tex *volatile g_all_tex;            /* every texture, newest first (never
 typedef struct { uint64_t page; Tex **t; int n, cap; } TexPage;
 static TexPage *g_tp;                      /* open addressing; pages are never removed (their lists empty out) */
 static size_t g_tp_cap, g_tp_used;
-static SRWLOCK g_tp_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_tp_lock = PLAT_RWLOCK_INIT;
 static TexPage *tp_find(uint64_t page) {
     if (!g_tp_cap) return NULL;
     for (size_t h = (size_t)((page * 0x9E3779B97F4A7C15ULL) >> 20) & (g_tp_cap - 1);; h = (h + 1) & (g_tp_cap - 1)) {
@@ -593,23 +593,23 @@ static TexPage *tp_get(uint64_t page) {    /* exclusive lock held */
 static void tp_add(Tex *t) {
     if (!t->mem || !t->storage) return;
     uint64_t a = (uint64_t)(uintptr_t)t->mem;
-    AcquireSRWLockExclusive(&g_tp_lock);
+    plat_rw_wlock(&g_tp_lock);
     for (uint64_t pg = a >> TP_SHIFT, last = (a + t->storage - 1) >> TP_SHIFT; pg <= last; pg++) {
         TexPage *p = tp_get(pg);
         if (p->n == p->cap) { p->cap *= 2; p->t = realloc(p->t, (size_t)p->cap * sizeof(Tex *)); }
         p->t[p->n++] = t;
     }
-    ReleaseSRWLockExclusive(&g_tp_lock);
+    plat_rw_wunlock(&g_tp_lock);
 }
 static void tp_remove(Tex *t) {
     if (!t->mem || !t->storage) return;
     uint64_t a = (uint64_t)(uintptr_t)t->mem;
-    AcquireSRWLockExclusive(&g_tp_lock);
+    plat_rw_wlock(&g_tp_lock);
     for (uint64_t pg = a >> TP_SHIFT, last = (a + t->storage - 1) >> TP_SHIFT; pg <= last; pg++) {
         TexPage *p = tp_find(pg);
         if (p) for (int i = 0; i < p->n; i++) if (p->t[i] == t) { p->t[i] = p->t[--p->n]; break; }
     }
-    ReleaseSRWLockExclusive(&g_tp_lock);
+    plat_rw_wunlock(&g_tp_lock);
 }
 /* ---- textures nothing names any more. agl (agl::TextureData) makes a texture in a temporary NVNtexture on the stack,
  * registers it in a texture pool slot through agl::driver::NVNtexture_::registerTexture, which copies the object (our
@@ -629,7 +629,7 @@ static Tex **g_unref;                       /* handed to the back end at its nex
 static int g_unref_n, g_unref_cap;
 static TexPool *g_tpools[16];
 static int g_ntpools;
-static LONG64 g_slot_releases, g_slot_unknown;     /* agl releases seen; finalizes of owning copies whose +0xc0 names no entry of the texture */
+static int64_t g_slot_releases, g_slot_unknown;     /* agl releases seen; finalizes of owning copies whose +0xc0 names no entry of the texture */
 /* The object that made the texture still names it. Its address may be stale (a stack temporary, memory the game gave
  * back), hence the guarded read (VirtualQuery is slow in this process: tens of milliseconds a call while loading). */
 static int tex_held_by_maker(const Tex *t) {
@@ -640,16 +640,16 @@ static void pool_ent_release(TexPoolEnt *e) {       /* g_pool_lock held exclusiv
     Tex *t = e->tex;
     if (!e->held) return;
     e->held = 0;
-    if (!t || --t->nslots > 0 || t->dead || !g_vk || InterlockedCompareExchange(&t->reclaim, 1, 0) != 0) return;      /* (the OpenGL path frees nothing early) */
+    if (!t || --t->nslots > 0 || t->dead || !g_vk || plat_cas(&t->reclaim, 1, 0) != 0) return;      /* (the OpenGL path frees nothing early) */
     if (g_unref_n == g_unref_cap) { g_unref_cap = g_unref_cap ? g_unref_cap * 2 : 256; g_unref = realloc(g_unref, sizeof *g_unref * (size_t)g_unref_cap); }
     g_unref[g_unref_n++] = t;
 }
 void nvn_front_take_unref(void (*take)(Tex *t)) {
     if (!g_unref_n) return;
-    AcquireSRWLockExclusive(&g_pool_lock);
+    plat_rw_wlock(&g_pool_lock);
     for (int i = 0; i < g_unref_n; i++) take(g_unref[i]);
     g_unref_n = 0;
-    ReleaseSRWLockExclusive(&g_pool_lock);
+    plat_rw_wunlock(&g_pool_lock);
 }
 int nvn_front_tex_unref(Tex *t) { return !t->dead && t->nregs && t->nslots <= 0 && !tex_held_by_maker(t); }
 void nvn_label_set(uint64_t obj, const char *text);
@@ -799,8 +799,8 @@ static uint64_t mem_hash(const uint8_t *p, size_t n, int full) {
 static struct { uint64_t page; uint64_t stamp; } *g_ww_tab;
 static uint64_t g_ww_stamp, g_ww_used, g_ww_floor;       /* g_ww_floor: stamp given to every page when the table had to be emptied */
 static int g_ww_off = -1;
-static LONG64 g_ww_clean, g_ww_dirty, g_ww_unwatched;
-static LONG64 g_th_n[4], g_th_bytes[4], g_th_same[4], g_th_skip;      /* textures hashed by nvn_front_tex_changed, by reason (see there); not hashed by the pool rule */
+static int64_t g_ww_clean, g_ww_dirty, g_ww_unwatched;
+static int64_t g_th_n[4], g_th_bytes[4], g_th_same[4], g_th_skip;      /* textures hashed by nvn_front_tex_changed, by reason (see there); not hashed by the pool rule */
 static uint64_t *ww_slot(uint64_t page, int insert) {
     for (unsigned h = (unsigned)((page * 0x9E3779B97F4A7C15ULL) >> 44);; h = (h + 1) & (WW_SLOTS - 1)) {
         if (g_ww_tab[h].page == page) return &g_ww_tab[h].stamp;
@@ -814,8 +814,8 @@ static uint64_t *ww_slot(uint64_t page, int insert) {
 /* Newest write stamp of the pages of [p, p+n), or 0 when the memory is not write-watched. Never returns less than 1 otherwise. */
 static uint64_t ww_newest(const uint8_t *p, size_t n) {
     static void *pages[16384];
-    ULONG_PTR count = 16384;
-    DWORD gran = 0;
+    uintptr_t count = 16384;
+    uint32_t gran = 0;
     if (g_ww_off < 0) { g_ww_off = getenv("SMO_NO_WRITEWATCH") != NULL; g_ww_tab = calloc(WW_SLOTS, sizeof *g_ww_tab); g_ww_stamp = 1; }
     if (g_ww_off || !n || GetWriteWatch(WRITE_WATCH_FLAG_RESET, (void *)p, n, pages, &count, &gran)) return 0;
     uint64_t first = (uint64_t)(uintptr_t)p >> 12, last = ((uint64_t)(uintptr_t)p + n - 1) >> 12, newest = g_ww_floor ? g_ww_floor : 1;
@@ -825,7 +825,7 @@ static uint64_t ww_newest(const uint8_t *p, size_t n) {
         if (count == 16384) {                      /* more written pages than the list holds: stamp the whole range */
             ResetWriteWatch((void *)p, n);
             for (uint64_t pg = first; pg <= last; pg++) *ww_slot(pg, 1) = stamp;
-        } else for (ULONG_PTR i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = stamp;
+        } else for (uintptr_t i = 0; i < count; i++) *ww_slot((uint64_t)(uintptr_t)pages[i] >> 12, 1) = stamp;
     }
     for (uint64_t pg = first; pg <= last; pg++) { uint64_t *s = ww_slot(pg, 0); if (s && *s > newest) newest = *s; }
     return newest;
@@ -865,7 +865,7 @@ static void tex_upload_memory(Tex *t, const Fmt *f) {
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);
                 tex_put(t, &sw, l, layer, 0, 0, 0, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin);
             } else tex_put(t, f, l, layer, 0, 0, 0, L.lvl_w[l], L.lvl_h[l], L.lvl_d[l], tmp);
-            g_st.tex_bytes += (LONG64)lin;
+            g_st.tex_bytes += (int64_t)lin;
         }
     }
 }
@@ -881,7 +881,7 @@ static void tex_sync(Tex *t) {
     if (t->gpu_written || !src || t->b.samples > 1 || !fmt_get(t->b.format, &f) || (f.kind >= 1 && f.kind <= 3)) return;
     if (!t->b.packaged && t->limit && src + t->data_size > t->limit) return;
     if (t->b.packaged && t->uploaded) return;      /* packaged data is consumed once at creation */
-    LONG64 pf0 = pf_now();
+    int64_t pf0 = pf_now();
     HS_IN("texture check (write watch, hash)", 0);
     uint64_t newest = ww_newest(src, t->data_size);
     if (newest) {
@@ -892,7 +892,7 @@ static void tex_sync(Tex *t) {
     uint64_t h = mem_hash(src, t->data_size, newest != 0 || (t->b.flags & 0x10) != 0);
     int same = t->uploaded && !t->dirty && h == t->hash && (!newest || t->ww_hashed);
     t->ww_hashed = newest != 0;                    /* t->hash is the hash of every word (needed to compare the next time) */
-    pf_add(PF_TEXHASH, pf0); g_pf_hash_bytes += (LONG64)t->data_size;
+    pf_add(PF_TEXHASH, pf0); g_pf_hash_bytes += (int64_t)t->data_size;
     HS_OUT();
     if (same) return;
     while (glGetError()) {}
@@ -1029,10 +1029,10 @@ static uint64_t resolve_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, uint32
     SamplerParams p;
     int have_sampler = 0;
     if (!nh || !tp) return g_dummy_handle;
-    AcquireSRWLockShared(&g_pool_lock);
+    plat_rw_rlock(&g_pool_lock);
     if (tid < (uint32_t)tp->count) { t = tp->e[tid].tex; v = tp->e[tid].view; }
     if (sp && sid < (uint32_t)sp->count && sp->used[sid]) { p = sp->e[sid]; have_sampler = 1; }
-    ReleaseSRWLockShared(&g_pool_lock);
+    plat_rw_runlock(&g_pool_lock);
     if (!t || t->dead) return g_dummy_handle;
     tex_sync(t);
     TexObj *o = tex_view_obj(t, &v);
@@ -1065,10 +1065,10 @@ static int resolve_names(TexPool *tp, SamplerPool *sp, uint64_t nh, GLuint *tex,
     SamplerParams p;
     int have_sampler = 0;
     if (!tp) return 0;
-    AcquireSRWLockShared(&g_pool_lock);
+    plat_rw_rlock(&g_pool_lock);
     if (tid < (uint32_t)tp->count) { t = tp->e[tid].tex; v = tp->e[tid].view; }
     if (sp && sid < (uint32_t)sp->count && sp->used[sid]) { p = sp->e[sid]; have_sampler = 1; }
-    ReleaseSRWLockShared(&g_pool_lock);
+    plat_rw_runlock(&g_pool_lock);
     if (!t || t->dead) return 0;
     tex_sync(t);
     *tex = tex_view_obj(t, &v)->gl;
@@ -1125,13 +1125,13 @@ static size_t arena_put_raw(const void *p, size_t n) {
     g_arena_pos = (g_arena_pos + 255) & ~(size_t)255;
     if (g_arena_pos + n > ARENA_SIZE) { HS_IN("buffer streaming: new 96 MB store (glBufferData)", 0); glBufferData(GL_ARRAY_BUFFER_, (ptrdiff_t)ARENA_SIZE, NULL, GL_STREAM_DRAW_); HS_OUT(); g_arena_pos = 0; g_arena_gen++; }
     size_t off = g_arena_pos;
-    LONG64 pf0 = pf_now();
+    int64_t pf0 = pf_now();
     HS_IN("buffer streaming (glBufferSubData)", 0);
     glBufferSubData(GL_ARRAY_BUFFER_, (ptrdiff_t)off, (ptrdiff_t)n, p);
     HS_OUT();
-    pf_add(PF_ARENA, pf0); g_pf_arena_bytes += (LONG64)n;
+    pf_add(PF_ARENA, pf0); g_pf_arena_bytes += (int64_t)n;
     g_arena_pos += n;
-    g_st.arena_bytes += (LONG64)n;
+    g_st.arena_bytes += (int64_t)n;
     return off;
 }
 /* Offset in the streaming buffer of a copy of guest memory [addr, addr+size), made at most once per batch. */
@@ -1180,13 +1180,13 @@ static void prog_add_stage(Prog *p, const char *text, int len, int serial) {
             for (slot = 0; slot < st->nbuf && st->map[slot] != n; slot++) {}
             if (slot == st->nbuf && st->nbuf < 16) st->map[st->nbuf++] = (uint8_t)n;
             o += sprintf(out + o, "program.buffer[%d", slot);
-            InterlockedIncrement(&g_bufhist[s][n & 31]);
+            plat_inc(&g_bufhist[s][n & 31]);
             continue;
         }
         if (len - i > 17 && !memcmp(text + i, "program.storage[", 16)) {
             int n = atoi(text + i + 16);
             st->storage |= 1u << (n & 31);
-            InterlockedIncrement(&g_storhist[n & 31]);
+            plat_inc(&g_storhist[n & 31]);
         }
         out[o++] = text[i++];
     }
@@ -1275,7 +1275,7 @@ static void pair_off(void);
 static ShEnt *g_shc[4096];
 static ShSrc *g_shs[4096];
 static int g_shc_off = -1;
-static LONG64 g_shc_hit, g_shc_src_hit, g_shc_compiled;
+static int64_t g_shc_hit, g_shc_src_hit, g_shc_compiled;
 static uint64_t sh_hash(uint64_t h, const void *data, size_t n) {
     const uint8_t *b = data;
     size_t i = 0;
@@ -1293,8 +1293,8 @@ static uint64_t sh_hash(uint64_t h, const void *data, size_t n) {
  *   and rewritten. Files are written under a temporary name and renamed, so several running copies can share the folder.
  *   SMO_SHADER_CACHE=<dir> chooses the folder (default: ..\\cache\\shaders), SMO_SHADER_CACHE=0
  *   turns it off (every stage is then compiled with glCreateShaderProgramv, as before). */
-static LONG64 g_shd_loaded, g_shd_saved, g_shd_refused;
-static volatile LONG64 g_shw_queued, g_shw_done, g_shw_compiled, g_shw_present, g_shw_failed;
+static int64_t g_shd_loaded, g_shd_saved, g_shd_refused;
+static volatile int64_t g_shw_queued, g_shw_done, g_shw_compiled, g_shw_present, g_shw_failed;
 static int g_shd_mode = -1;
 static char g_shd_dir[200];
 static uint64_t g_shd_drv;
@@ -1308,8 +1308,8 @@ static void shd_init(void) {
     if (!g_shd_mode) return;
     const char *v[3] = {(const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION)};
     snprintf(g_shd_dir, sizeof g_shd_dir, "%s", e && e[0] ? e : "../cache/shaders");      /* build\\cache\\shaders when run from build\\bin */
-    if (!(e && e[0])) CreateDirectoryA("../cache", NULL);
-    CreateDirectoryA(g_shd_dir, NULL);
+    if (!(e && e[0])) plat_mkdir("../cache");
+    plat_mkdir(g_shd_dir);
     g_shd_drv = 0x243F6A8885A308D3ULL;
     for (int i = 0; i < 3; i++) if (v[i]) g_shd_drv = sh_hash(g_shd_drv, v[i], strlen(v[i]));
     printf("nvn_gl: shader binaries are kept in %s (SMO_SHADER_CACHE=0 turns this off)%c", g_shd_dir, 10);
@@ -1348,13 +1348,13 @@ static GLuint shd_compile_save(GLenum type, const char *src, const char *path, G
         while (glGetError()) {}
         glGetProgramBinary(q, n, &got, &fmt, data);
         if (!glGetError() && got > 0) {
-            snprintf(tmp, sizeof tmp, "%s.%lu.%lu.tmp", path, (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId());
+            snprintf(tmp, sizeof tmp, "%s.%lu.%lu.tmp", path, (unsigned long)getpid(), (unsigned long)plat_tid());
             FILE *f = fopen(tmp, "wb");
             if (f) {
                 head[0] = fmt; head[1] = (uint32_t)got;
                 int good = fwrite(head, 4, 2, f) == 2 && fwrite(data, 1, (size_t)got, f) == (size_t)got;
                 fclose(f);
-                if (good && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) *saved = 1; else DeleteFileA(tmp);
+                if (good && plat_rename_replace(tmp, path)) *saved = 1; else !unlink(tmp);
             }
         }
         free(data);
@@ -1414,9 +1414,9 @@ typedef struct ShJob { struct ShJob *next; int stage, code_len; uint32_t cdata_s
  * soon as the game hands the stage over. Nothing is drawn differently: this only decides what is compiled ahead. */
 typedef struct ShVar { uint64_t h; int stage; uint32_t key[4]; struct ShVar *next; } ShVar;
 static ShVar *g_shv[4096];
-static CRITICAL_SECTION g_shw_lock;
-static LONG64 g_shv_loaded, g_shv_added, g_shv_queued;
-static volatile LONG64 g_shw_held, g_shw_held_ticks;
+static plat_lock_t g_shw_lock;
+static int64_t g_shv_loaded, g_shv_added, g_shv_queued;
+static volatile int64_t g_shw_held, g_shw_held_ticks;
 static void shv_put(uint64_t h, int stage, const uint32_t *key) {
     ShVar *e = calloc(1, sizeof *e);
     e->h = h; e->stage = stage; memcpy(e->key, key, 16); e->next = g_shv[h & 4095]; g_shv[h & 4095] = e;
@@ -1439,16 +1439,16 @@ static void shv_load(void) {                       /* render thread, before the 
 static void shv_record(uint64_t h, int stage, const uint32_t *key) {      /* render thread: this key had to be compiled here */
     char path[260];
     if (g_shd_mode <= 0 || !(key[0] | key[1] | key[2] | key[3])) return;
-    EnterCriticalSection(&g_shw_lock);
+    plat_lock(&g_shw_lock);
     int known = shv_has(h, stage, key);
     if (!known) shv_put(h, stage, key);
-    LeaveCriticalSection(&g_shw_lock);
+    plat_unlock(&g_shw_lock);
     if (known) return;
     snprintf(path, sizeof path, "%s/variants.txt", g_shd_dir);
     FILE *f = fopen(path, "a");
     if (f) { fprintf(f, "%016llx %d %x %x %x %x\n", (unsigned long long)h, stage, key[0], key[1], key[2], key[3]); fclose(f); g_shv_added++; }
 }
-static CRITICAL_SECTION g_shw_lock;
+static plat_lock_t g_shw_lock;
 static ShJob *g_shw_head, *g_shw_tail;
 static HANDLE g_shw_sem;
 static uint64_t g_shw_seen[16384];
@@ -1474,23 +1474,23 @@ static int g_shw_n;
 typedef struct PwSeen { uint64_t vh, fh; uint32_t vl, fl, mask; struct PwSeen *next; } PwSeen;
 static PwSeen *g_pw_seen[4096];
 static uint64_t g_pw_qseen[16384];
-static CRITICAL_SECTION g_pw_stripe[64];
-static volatile LONG g_pw_cold, g_shw_ctx_failed;
-static volatile LONG64 g_pw_named, g_pw_progs, g_pw_warmed, g_pw_cold_n, g_pw_ticks, g_pw_missing, g_pw_dup, g_pw_gate_ticks, g_pw_gates, g_pw_compiled;
+static plat_lock_t g_pw_stripe[64];
+static volatile int32_t g_pw_cold, g_shw_ctx_failed;
+static volatile int64_t g_pw_named, g_pw_progs, g_pw_warmed, g_pw_cold_n, g_pw_ticks, g_pw_missing, g_pw_dup, g_pw_gate_ticks, g_pw_gates, g_pw_compiled;
 static int pw_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("SMO_PAIR_WARM"); m = e ? atoi(e) : 1; } return m; }
 static int pw_seen(uint64_t vh, uint32_t vl, uint64_t fh, uint32_t fl, uint32_t mask) {
     unsigned k = (unsigned)((vh ^ fh * 0x9E3779B97F4A7C15ULL) >> 20) & 4095;
     int found = 0;
-    EnterCriticalSection(&g_shw_lock);
+    plat_lock(&g_shw_lock);
     for (PwSeen *e = g_pw_seen[k]; e && !found; e = e->next) found = e->vh == vh && e->fh == fh && e->vl == vl && e->fl == fl && e->mask == mask;
     if (!found) { PwSeen *e = calloc(1, sizeof *e); e->vh = vh; e->vl = vl; e->fh = fh; e->fl = fl; e->mask = mask; e->next = g_pw_seen[k]; g_pw_seen[k] = e; }
-    LeaveCriticalSection(&g_shw_lock);
+    plat_unlock(&g_shw_lock);
     return found;
 }
-static void pw_cold_mark(LONG64 t0) {
-    static LONG64 freq;
-    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
-    if ((pf_now() - t0) * 125 > freq) InterlockedExchange(&g_pw_cold, 1);          /* more than 8 ms */
+static void pw_cold_mark(int64_t t0) {
+    static int64_t freq;
+    if (!freq) { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
+    if ((pf_now() - t0) * 125 > freq) plat_xchg(&g_pw_cold, 1);          /* more than 8 ms */
 }
 /* Worker: the program for a stage text, from its binary; compiled (and saved) when there is none and the text is given. */
 static GLuint pw_load(int stage, uint64_t th, size_t tl, const char *src) {
@@ -1498,7 +1498,7 @@ static GLuint pw_load(int stage, uint64_t th, size_t tl, const char *src) {
     GLuint q = 0;
     GLint ok = 0;
     shd_path(path, sizeof path, th, tl);
-    EnterCriticalSection(&g_pw_stripe[th & 63]);
+    plat_lock(&g_pw_stripe[th & 63]);
     FILE *f = fopen(path, "rb");
     if (f) {
         uint32_t head[2] = {0, 0};
@@ -1517,13 +1517,13 @@ static GLuint pw_load(int stage, uint64_t th, size_t tl, const char *src) {
     }
     if (!q && src) {
         int saved = 0;
-        LONG64 t0 = pf_now();
+        int64_t t0 = pf_now();
         q = shd_compile_save(stage == 0 ? 0x8B31 : 0x8B30, src, path, &ok, &saved);
         if (q && !ok) { glDeleteProgram(q); q = 0; }
-        if (saved) { InterlockedIncrement64(&g_shw_compiled); InterlockedIncrement64(&g_pw_compiled); }
+        if (saved) { plat_inc(&g_shw_compiled); plat_inc(&g_pw_compiled); }
         pw_cold_mark(t0);
     }
-    LeaveCriticalSection(&g_pw_stripe[th & 63]);
+    plat_unlock(&g_pw_stripe[th & 63]);
     while (glGetError()) {}
     return q;
 }
@@ -1547,25 +1547,25 @@ static void pw_prog_known(const ShJob *j) {
     if (j->stage != 3 || getenv("SMO_NO_PAIR_LIST")) return;
     memcpy(&h, &j->key[2], 8);
     snprintf(path, sizeof path, "%s/progs.txt", g_shd_dir);
-    EnterCriticalSection(&g_shw_lock);
+    plat_lock(&g_shw_lock);
     FILE *f = fopen(path, "a");
     if (f) { fprintf(f, "%016llx\n", (unsigned long long)h); fclose(f); }
-    LeaveCriticalSection(&g_shw_lock);
+    plat_unlock(&g_shw_lock);
 }
-static LONG64 g_pw_progs_known;
+static int64_t g_pw_progs_known;
 static void pw_progs_load(void) {                  /* render thread, start, only when pairs.txt was read */
     char path[260], line[64];
     snprintf(path, sizeof path, "%s/progs.txt", g_shd_dir);
     FILE *f = fopen(path, "r");
     if (!f) return;
-    EnterCriticalSection(&g_shw_lock);
+    plat_lock(&g_shw_lock);
     while (fgets(line, sizeof line, f)) {
         unsigned long long h = 0;
         if (sscanf(line, "%llx", &h) != 1 || !h) continue;
         unsigned k = (unsigned)(h >> 20) & 16383;
         for (int probe = 0; probe < 64; probe++, k = (k + 1) & 16383) { if (g_pw_qseen[k] == h) break; if (!g_pw_qseen[k]) { g_pw_qseen[k] = h; g_pw_progs_known++; break; } }
     }
-    LeaveCriticalSection(&g_shw_lock);
+    plat_unlock(&g_shw_lock);
     fclose(f);
 }
 /* Worker: one pair job. stage 2 = named by the two text hashes (data: vh, fh, vl, fl); stage 3 = the machine code of a
@@ -1580,27 +1580,27 @@ static void pw_job(ShJob *j, GLuint pipe, GLuint empty_fs) {
         vt = pw_translate(0, vc, j->code_len, vd, j->cdata_size, &mask);      /* a program handed over: every input the vertex stage reads comes from an array */
         mask &= 0xffff;
         if (j->key[0]) ft = pw_translate(1, fc, (int)j->key[0], fd, j->key[1], NULL);
-        if (!vt || (j->key[0] && !ft)) { free(vt); free(ft); InterlockedIncrement64(&g_pw_missing); return; }
+        if (!vt || (j->key[0] && !ft)) { free(vt); free(ft); plat_inc(&g_pw_missing); return; }
         vl = (uint32_t)strlen(vt); vh = sh_hash(0x9E3779B97F4A7C15ULL ^ 0, vt, vl);
         if (ft) { fl = (uint32_t)strlen(ft); fh = sh_hash(0x9E3779B97F4A7C15ULL ^ 1, ft, fl); }
     }
-    if (pw_seen(vh, vl, fh, fl, mask)) { free(vt); free(ft); InterlockedIncrement64(&g_pw_dup); pw_prog_known(j); return; }
+    if (pw_seen(vh, vl, fh, fl, mask)) { free(vt); free(ft); plat_inc(&g_pw_dup); pw_prog_known(j); return; }
     if (mask & 0x10000) {                          /* a compute program: one work group with no buffer and no image bound (reads give 0, writes go nowhere) */
         GLuint cs = pw_load(5, vh, vl, NULL);
         if (cs) {
-            static LONG64 freq;
-            if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+            static int64_t freq;
+            if (!freq) { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
             glUseProgramStages(pipe, 0x20 /* COMPUTE_SHADER_BIT */, cs);
-            LONG64 t0 = pf_now();
+            int64_t t0 = pf_now();
             glDispatchCompute(1, 1, 1);
             glFinish();
-            LONG64 dt = pf_now() - t0;
-            InterlockedExchangeAdd64(&g_pw_ticks, dt); InterlockedIncrement64(&g_pw_warmed);
-            if (dt * 125 > freq) { InterlockedIncrement64(&g_pw_cold_n); InterlockedExchange(&g_pw_cold, 1); }
+            int64_t dt = pf_now() - t0;
+            plat_xadd(&g_pw_ticks, dt); plat_inc(&g_pw_warmed);
+            if (dt * 125 > freq) { plat_inc(&g_pw_cold_n); plat_xchg(&g_pw_cold, 1); }
             if (g_fdlog) printf("fd-warm: %016llx %x %016llx %x mask %x kind %d %.1f ms frame %lld%c", (unsigned long long)vh, vl, 0ull, 0u, mask, j->stage, (double)dt * 1000.0 / (double)freq, (long long)g_st.frames, 10);
             glUseProgramStages(pipe, 0x20, 0);
             glDeleteProgram(cs);
-        } else InterlockedIncrement64(&g_pw_missing);
+        } else plat_inc(&g_pw_missing);
         while (glGetError()) {}
         return;
     }
@@ -1610,38 +1610,38 @@ static void pw_job(ShJob *j, GLuint pipe, GLuint empty_fs) {
         glUseProgramStages(pipe, 1, vs);
         glUseProgramStages(pipe, 2, fs);
         for (GLuint k = 0; k < 16; k++) { if (mask >> k & 1) glEnableVertexAttribArray(k); else glDisableVertexAttribArray(k); }
-        LONG64 t0 = pf_now();
+        int64_t t0 = pf_now();
         glDrawArrays(GL_POINTS, 0, 1);
         glFinish();
-        LONG64 dt = pf_now() - t0;
-        static LONG64 freq;
-        if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
-        InterlockedExchangeAdd64(&g_pw_ticks, dt); InterlockedIncrement64(&g_pw_warmed);
-        if (dt * 125 > freq) { InterlockedIncrement64(&g_pw_cold_n); InterlockedExchange(&g_pw_cold, 1); }
+        int64_t dt = pf_now() - t0;
+        static int64_t freq;
+        if (!freq) { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
+        plat_xadd(&g_pw_ticks, dt); plat_inc(&g_pw_warmed);
+        if (dt * 125 > freq) { plat_inc(&g_pw_cold_n); plat_xchg(&g_pw_cold, 1); }
         if (g_fdlog) printf("fd-warm: %016llx %x %016llx %x mask %x kind %d %.1f ms frame %lld%c", (unsigned long long)vh, vl, (unsigned long long)fh, fl, mask, j->stage, (double)dt * 1000.0 / (double)freq, (long long)g_st.frames, 10);
         glUseProgramStages(pipe, 1, 0);
         glUseProgramStages(pipe, 2, 0);
         if (j->stage == 3 && !getenv("SMO_NO_PAIR_LIST")) {          /* into <cache>/pairs.txt (same line format as prec_note) */
             char path[260];
             snprintf(path, sizeof path, "%s/pairs.txt", g_shd_dir);
-            EnterCriticalSection(&g_shw_lock);
+            plat_lock(&g_shw_lock);
             FILE *f = fopen(path, "a");
             if (f) { fprintf(f, "%016llx %x %016llx %x %x\n", (unsigned long long)vh, (unsigned)vl, (unsigned long long)fh, (unsigned)fl, (unsigned)mask); fclose(f); }
-            LeaveCriticalSection(&g_shw_lock);
+            plat_unlock(&g_shw_lock);
             pw_prog_known(j);
         }
-    } else InterlockedIncrement64(&g_pw_missing);
+    } else plat_inc(&g_pw_missing);
     if (vs) glDeleteProgram(vs);
     if (fs && fs != empty_fs) glDeleteProgram(fs);
     while (glGetError()) {}
 }
 static void pw_enqueue(ShJob *j) {
     j->next = NULL;
-    EnterCriticalSection(&g_shw_lock);
+    plat_lock(&g_shw_lock);
     if (g_shw_tail) g_shw_tail->next = j; else g_shw_head = j;
     g_shw_tail = j;
-    LeaveCriticalSection(&g_shw_lock);
-    InterlockedIncrement64(&g_shw_queued);
+    plat_unlock(&g_shw_lock);
+    plat_inc(&g_shw_queued);
     ReleaseSemaphore(g_shw_sem, 1, NULL);
 }
 /* Start-up (prec_load): a pair that a draw used in an earlier run. */
@@ -1653,12 +1653,12 @@ static void pw_queue_named(uint64_t vh, uint32_t vl, uint64_t fh, uint32_t fl, u
     g_pw_named++;
     pw_enqueue(j);
 }
-static volatile LONG64 g_pw_gate_t0;
+static volatile int64_t g_pw_gate_t0;
 /* boot.c: milliseconds presents were held for shader preparation so far (not counted by the run-time limit). */
 unsigned nvn_gl_held_ms(void) {
-    LARGE_INTEGER f;
-    LONG64 t0 = g_pw_gate_t0, ticks = g_pw_gate_ticks + (t0 ? pf_now() - t0 : 0);
-    QueryPerformanceFrequency(&f);
+    plat_counter f;
+    int64_t t0 = g_pw_gate_t0, ticks = g_pw_gate_ticks + (t0 ? pf_now() - t0 : 0);
+    plat_qpf(&f);
     return (unsigned)(ticks * 1000 / f.QuadPart);
 }
 /* Render thread, before a present: hold it while cold shader work is pending (see above). */
@@ -1666,14 +1666,14 @@ static void pw_gate(void) {
     static int off = -1;
     if (off < 0) { const char *e = getenv("SMO_PAIR_GATE"); off = (e && !strcmp(e, "0")) || !pw_mode(); }
     if (off || !g_pw_cold) return;
-    if (g_shw_queued == g_shw_done || g_shw_ctx_failed) { InterlockedExchange(&g_pw_cold, 0); return; }
-    LONG64 t0 = pf_now(), last = t0, freq, start_done = g_shw_done;
+    if (g_shw_queued == g_shw_done || g_shw_ctx_failed) { plat_xchg(&g_pw_cold, 0); return; }
+    int64_t t0 = pf_now(), last = t0, freq, start_done = g_shw_done;
     char title[200] = "", text[300];
     g_pw_gate_t0 = t0;
-    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+    { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
     HS_IN("shader preparation (present held while the workers prepare programs)", 0);
     while (g_shw_queued != g_shw_done) {
-        Sleep(2);
+        plat_sleep_ms(2);
         if (pf_now() - last > freq) {            /* once per second while it lasts: the log and the window title */
             if (!title[0] && !GetWindowTextA(g_hwnd, title, sizeof title)) strcpy(title, " ");
             last = pf_now();
@@ -1686,12 +1686,12 @@ static void pw_gate(void) {
     }
     HS_OUT();
     if (title[0]) SetWindowTextA(g_hwnd, title);
-    InterlockedExchange(&g_pw_cold, 0);
+    plat_xchg(&g_pw_cold, 0);
     g_pw_gate_ticks += pf_now() - t0; g_pw_gates++;
     g_pw_gate_t0 = 0;
     printf("nvn_gl: shader preparation held the present of frame %lld for %.2f s (%lld jobs)%c", (long long)g_st.frames + 1, (double)(pf_now() - t0) / (double)freq, (long long)(g_shw_done - start_done), 10);
 }
-static DWORD WINAPI shd_worker(LPVOID arg) {
+static uint32_t shd_worker(void * arg) {
     PIXELFORMATDESCRIPTOR pfd;
     (void)arg;
     HWND w = CreateWindowExA(0, "STATIC", "", WS_POPUP, 0, 0, 8, 8, NULL, NULL, NULL, NULL);
@@ -1702,7 +1702,7 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
     pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32;
     if (!dc || !SetPixelFormat(dc, ChoosePixelFormat(dc, &pfd), &pfd)) return 0;
     HGLRC rc = wglCreateContext(dc);
-    if (!rc || !wglMakeCurrent(dc, rc)) { InterlockedIncrement(&g_shw_ctx_failed); return 0; }
+    if (!rc || !wglMakeCurrent(dc, rc)) { plat_inc(&g_shw_ctx_failed); return 0; }
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     GLuint pw_pipe = 0, pw_empty = 0;                  /* the pair jobs draw one discarded point through this pipeline */
     if (!getenv("SMO_GL_DRIVER_THREAD")) { glEnable(GL_DEBUG_OUTPUT_); glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS_); }
@@ -1720,13 +1720,13 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
         for (GLuint k = 0; k < 16; k++) { glVertexAttribFormat(k, 4, 0x1406 /* FLOAT */, 0, 0); glVertexAttribBinding(k, 0); }
     }
     for (;;) {
-        WaitForSingleObject(g_shw_sem, INFINITE);
-        EnterCriticalSection(&g_shw_lock);
+        WaitForSingleObject(g_shw_sem, PLAT_INFINITE);
+        plat_lock(&g_shw_lock);
         ShJob *j = g_shw_head;
         if (j) { g_shw_head = j->next; if (!g_shw_head) g_shw_tail = NULL; }
-        LeaveCriticalSection(&g_shw_lock);
+        plat_unlock(&g_shw_lock);
         if (!j) continue;
-        if (j->stage >= 2) { pw_job(j, pw_pipe, pw_empty); InterlockedIncrement64(&g_shw_done); free(j); continue; }
+        if (j->stage >= 2) { pw_job(j, pw_pipe, pw_empty); plat_inc(&g_shw_done); free(j); continue; }
         MxIn in;
         MxOut out;
         memset(&in, 0, sizeof in);
@@ -1739,19 +1739,19 @@ static DWORD WINAPI shd_worker(LPVOID arg) {
             char path[320];
             size_t len = strlen(out.glsl);
             shd_path(path, sizeof path, sh_hash(0x9E3779B97F4A7C15ULL ^ (uint64_t)j->stage, out.glsl, len), len);
-            if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) InterlockedIncrement64(&g_shw_present);
+            if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) plat_inc(&g_shw_present);
             else {
                 GLint ok = 0;
                 int saved = 0;
                 GLuint q = shd_compile_save(j->stage == 0 ? 0x8B31 : 0x8B30, out.glsl, path, &ok, &saved);
                 if (q) glDeleteProgram(q);
-                InterlockedExchange(&g_pw_cold, 1);            /* a compile: presents wait for the workers (pw_gate) */
-                if (saved) InterlockedIncrement64(&g_shw_compiled); else InterlockedIncrement64(&g_shw_failed);
+                plat_xchg(&g_pw_cold, 1);            /* a compile: presents wait for the workers (pw_gate) */
+                if (saved) plat_inc(&g_shw_compiled); else plat_inc(&g_shw_failed);
                 while (glGetError()) {}
             }
             free(out.glsl);
-        } else InterlockedIncrement64(&g_shw_failed);
-        InterlockedIncrement64(&g_shw_done);
+        } else plat_inc(&g_shw_failed);
+        plat_inc(&g_shw_done);
         free(j);
     }
 }
@@ -1760,8 +1760,8 @@ static void shd_workers_start(void) {
     g_shw_n = e ? atoi(e) : 3;
     if (g_shw_n < 0) g_shw_n = 0;
     if (g_shw_n > 8) g_shw_n = 8;
-    InitializeCriticalSection(&g_shw_lock);
-    for (int i = 0; i < 64; i++) InitializeCriticalSection(&g_pw_stripe[i]);
+    plat_lock_init(&g_shw_lock);
+    for (int i = 0; i < 64; i++) plat_lock_init(&g_pw_stripe[i]);
     if (!getenv("SMO_NO_SHADER_VARIANTS")) shv_load();
     g_shw_sem = CreateSemaphoreA(NULL, 0, 0x7fffffff, NULL);
     for (int i = 0; i < g_shw_n; i++) CloseHandle(CreateThread(NULL, 0, shd_worker, NULL, 0, NULL));
@@ -1777,7 +1777,7 @@ static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint
     memset(j->key, 0, sizeof j->key);
     memcpy(j->data, code, (size_t)code_len);
     if (cdata) memcpy(j->data + code_len, cdata, cdata_size);
-    EnterCriticalSection(&g_shw_lock);
+    plat_lock(&g_shw_lock);
     unsigned k = (unsigned)(h >> 20) & 16383;
     int seen = 0, extra = 0;
     for (int probe = 0; probe < 64; probe++, k = (k + 1) & 16383) { if (g_shw_seen[k] == h) { seen = 1; break; } if (!g_shw_seen[k]) { g_shw_seen[k] = h; break; } }
@@ -1793,9 +1793,9 @@ static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint
             extra++;
         }
     }
-    LeaveCriticalSection(&g_shw_lock);
+    plat_unlock(&g_shw_lock);
     if (seen) { free(j); return; }
-    InterlockedExchangeAdd64(&g_shw_queued, 1 + extra);
+    plat_xadd(&g_shw_queued, 1 + extra);
     g_shv_queued += extra;
     ReleaseSemaphore(g_shw_sem, 1 + extra, NULL);
     /* nvnProgramSetShaders holds its caller while every worker is busy compiling (not during start-up, where
@@ -1807,11 +1807,11 @@ static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint
     {
         static int nowait = -1;
         if (nowait < 0) nowait = getenv("SMO_SHADER_NOWAIT") != NULL;
-        if (!nowait && g_st.frames >= 300 && GetCurrentThreadId() != g_render_tid && g_shw_queued - g_shw_done >= g_shw_n) {
-            LONG64 t0 = pf_now(), freq = 0;
-            { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
-            while (g_shw_queued - g_shw_done >= g_shw_n && pf_now() - t0 < 30 * freq) Sleep(1);
-            InterlockedExchangeAdd64(&g_shw_held_ticks, pf_now() - t0); InterlockedIncrement64(&g_shw_held);
+        if (!nowait && g_st.frames >= 300 && plat_tid() != g_render_tid && g_shw_queued - g_shw_done >= g_shw_n) {
+            int64_t t0 = pf_now(), freq = 0;
+            { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
+            while (g_shw_queued - g_shw_done >= g_shw_n && pf_now() - t0 < 30 * freq) plat_sleep_ms(1);
+            plat_xadd(&g_shw_held_ticks, pf_now() - t0); plat_inc(&g_shw_held);
         }
     }
 }
@@ -1827,7 +1827,7 @@ static void shd_prewarm(int stage, const uint8_t *code, int code_len, const uint
 static int pair_mode(void) { static int m = -1; if (m < 0) { const char *e = getenv("SMO_PAIR"); m = e ? atoi(e) : 0; } return m; }
 typedef struct { uint64_t key; GLuint prog; int state; } PairEnt;      /* state 0 = free, 1 = ready, 2 = no linked program (pipeline) */
 static PairEnt g_pairs[16384];
-static LONG64 g_pair_loaded, g_pair_linked, g_pair_failed, g_pair_draws, g_pair_refused;
+static int64_t g_pair_loaded, g_pair_linked, g_pair_failed, g_pair_draws, g_pair_refused;
 static void pair_off(void) { if (g_pair_cur) { glUseProgram(0); g_pair_cur = 0; } }
 static GLuint pair_link(const char *vs, const char *fs, const char *path, int *saved) {
     GLint ok = 0, n = 0;
@@ -1857,13 +1857,13 @@ static GLuint pair_link(const char *vs, const char *fs, const char *path, int *s
         while (glGetError()) {}
         glGetProgramBinary(q, n, &got, &fmt, data);
         if (!glGetError() && got > 0) {
-            snprintf(tmp, sizeof tmp, "%s.%lu.%lu.tmp", path, (unsigned long)GetCurrentProcessId(), (unsigned long)GetCurrentThreadId());
+            snprintf(tmp, sizeof tmp, "%s.%lu.%lu.tmp", path, (unsigned long)getpid(), (unsigned long)plat_tid());
             FILE *f = fopen(tmp, "wb");
             if (f) {
                 head[0] = fmt; head[1] = (uint32_t)got;
                 int good = fwrite(head, 4, 2, f) == 2 && fwrite(data, 1, (size_t)got, f) == (size_t)got;
                 fclose(f);
-                if (good && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) *saved = 1; else DeleteFileA(tmp);
+                if (good && plat_rename_replace(tmp, path)) *saved = 1; else !unlink(tmp);
             }
         }
         free(data);
@@ -1911,7 +1911,7 @@ static GLuint pair_get(GLuint vs, GLuint fs, const char *fs_text_fixed) {
         /* Both stage texts name their buffer blocks CB<n> / SB<n> (mx_translate.c) with different bindings; in ONE program
          * blocks of the same name are the same block, so the fragment stage's are renamed FB<n> / TB<n> for the link
          * (block names are not used anywhere else in the text; the members c<n> / s<n> belong to each stage's own block). */
-        char *ft2 = _strdup(ft);
+        char *ft2 = strdup(ft);
         for (char *p = ft2; (p = strstr(p, " buffer CB")) != NULL; p += 9) p[8] = 'F';
         for (char *p = ft2; (p = strstr(p, " buffer SB")) != NULL; p += 9) p[8] = 'T';
         /* ... and so are their members: the translator writes them only as c<n>[ and s<n>[ (whole identifiers), and no
@@ -1941,7 +1941,7 @@ static GLuint pair_get(GLuint vs, GLuint fs, const char *fs_text_fixed) {
  * uses a combination that is not in it. */
 typedef struct PairRec { uint64_t vh, fh; uint32_t vl, fl, mask; struct PairRec *next; } PairRec;
 static PairRec *g_prec[4096];
-static LONG64 g_prec_loaded, g_prec_added;
+static int64_t g_prec_loaded, g_prec_added;
 static int g_prec_off = -1;
 static int prec_has(uint64_t vh, uint32_t vl, uint64_t fh, uint32_t fl, uint32_t mask, int add) {
     unsigned k = (unsigned)((vh ^ fh * 0x9E3779B97F4A7C15ULL) >> 20) & 4095;
@@ -1975,13 +1975,13 @@ static void prec_note_compute(uint64_t h, size_t len) {
     if (f) { fprintf(f, "%016llx %x %016llx %x %x\n", (unsigned long long)h, (unsigned)len, 0ull, 0u, 0x10000u); fclose(f); g_prec_added++; }
 }
 /* Render thread, start: the stage program of a listed pair is loaded from its binary now, not at its first draw. */
-static LONG64 g_pre_n, g_pre_ticks;
+static int64_t g_pre_n, g_pre_ticks;
 static void prec_preload(int stage, uint64_t h, uint32_t len) {
     static int off = -1;
     if (off < 0) { const char *e = getenv("SMO_PAIR_PRELOAD"); off = (e && !strcmp(e, "0")) || g_shc_off > 0 || getenv("SMO_NO_SHADERCACHE") != NULL; }
     if (off || !len) return;
     for (ShSrc *e = g_shs[h & 4095]; e; e = e->next) if (e->h == h && e->len == len) return;
-    LONG64 t0 = pf_now();
+    int64_t t0 = pf_now();
     GLuint q = pw_load(stage, h, len, NULL);
     g_pre_ticks += pf_now() - t0;
     if (!q) return;
@@ -2007,8 +2007,8 @@ static void prec_load(void) {                      /* render thread, once (shd_i
     }
     fclose(f);
     pw_progs_load();
-    { LARGE_INTEGER q; QueryPerformanceFrequency(&q); printf("nvn_gl: %lld programs known by their machine code (progs.txt)%c", (long long)g_pw_progs_known, 10); }
-    { LARGE_INTEGER q; QueryPerformanceFrequency(&q); printf("nvn_gl: %lld listed shader pairs queued for the workers; %lld stage binaries loaded ahead in %.0f ms%c", (long long)g_prec_loaded, (long long)g_pre_n, (double)g_pre_ticks * 1000.0 / (double)q.QuadPart, 10); }
+    { plat_counter q; plat_qpf(&q); printf("nvn_gl: %lld programs known by their machine code (progs.txt)%c", (long long)g_pw_progs_known, 10); }
+    { plat_counter q; plat_qpf(&q); printf("nvn_gl: %lld listed shader pairs queued for the workers; %lld stage binaries loaded ahead in %.0f ms%c", (long long)g_prec_loaded, (long long)g_pre_n, (double)g_pre_ticks * 1000.0 / (double)q.QuadPart, 10); }
 }
 static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     static int nfail, nlink;
@@ -2045,7 +2045,7 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     in.int_attrs = key[0]; in.sint_attrs = key[1]; in.int_tex = key[2]; in.sint_tex = key[3];
     in.binding_base = (unsigned)s * 20; in.ssbo_base = 40 + (unsigned)s * 16;
     in.fragdebug = getenv("SMO_FRAGDEBUG") != NULL;
-    LONG64 pf0 = pf_now();
+    int64_t pf0 = pf_now();
     int xl;
     { HS_IN("shader translate (machine code to GLSL)", 0); xl = mx_translate(&in, &out); HS_OUT(); }
     pf_add(PF_XLATE, pf0);
@@ -2072,14 +2072,14 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
     if (hit) { st->glsl = hit->prog; ok = 1; g_shc_src_hit++; }
     else {
         pf0 = pf_now();
-        LONG64 saved0 = g_shd_saved;
+        int64_t saved0 = g_shd_saved;
         st->glsl = g_shc_off ? glCreateShaderProgramv(s == 0 ? 0x8B31 : 0x8B30, 1, srcs) : shader_build(s == 0 ? 0x8B31 : 0x8B30, src, src_len, h2, &ok);
         if (g_shc_off) glGetProgramiv(st->glsl, 0x8B82, &ok);
         pf_add(PF_GLCOMPILE, pf0);
         if (g_shd_saved != saved0 && h0) shv_record(h0, s, key);
         g_shc_compiled++;
         if (ok && !g_shc_off) { ShSrc *e = calloc(1, sizeof *e); e->h = h2; e->len = src_len; e->prog = st->glsl; e->next = g_shs[h2 & 4095]; g_shs[h2 & 4095] = e;
-            if (st->glsl < 65536) { if (pair_mode()) e->text = _strdup(src); g_prog_src[st->glsl] = e; } }
+            if (st->glsl < 65536) { if (pair_mode()) e->text = strdup(src); g_prog_src[st->glsl] = e; } }
     }
     if (!ok) {
         char log[2000] = "";
@@ -2113,18 +2113,18 @@ static int stage_glsl(Prog *p, int s, const uint32_t *key) {
 }
 
 /* ---------------------------------------------------------------- deferred deletion (objects finalized on guest threads) */
-static CRITICAL_SECTION g_dead_lock;
+static plat_lock_t g_dead_lock;
 static struct { int kind; void *p; } *g_dead;
 static int g_dead_n, g_dead_cap;
 static void defer_free(int kind, void *p) {
-    EnterCriticalSection(&g_dead_lock);
+    plat_lock(&g_dead_lock);
     if (g_dead_n == g_dead_cap) { g_dead_cap = g_dead_cap ? g_dead_cap * 2 : 256; g_dead = realloc(g_dead, sizeof *g_dead * (size_t)g_dead_cap); }
     g_dead[g_dead_n].kind = kind; g_dead[g_dead_n++].p = p;
-    LeaveCriticalSection(&g_dead_lock);
+    plat_unlock(&g_dead_lock);
 }
 static void gl_housekeeping(void) {
     if (!g_dead_n) return;
-    EnterCriticalSection(&g_dead_lock);
+    plat_lock(&g_dead_lock);
     for (int i = 0; i < g_dead_n; i++) {
         if (g_dead[i].kind == K_TEX) tex_free_gl(g_dead[i].p);
         else if (g_dead[i].kind == K_PROG) {
@@ -2133,7 +2133,7 @@ static void gl_housekeeping(void) {
         }
     }
     g_dead_n = 0;
-    LeaveCriticalSection(&g_dead_lock);
+    plat_unlock(&g_dead_lock);
 }
 
 /* ---------------------------------------------------------------- command lists */
@@ -2149,14 +2149,14 @@ static const char *const k_op_name[OP_COUNT] = {
     "DispatchComputeIndirect", "SetRenderEnable", "ResetCounter", "ReportCounter", "ReportValue", "FenceSync", "WaitSync", "SignalEvent", "WaitEvent",
     "BindCoverageModulationTable", "DebugGroup", "DrawTexture"};
 
-typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; LONG64 created, used, seq; uint64_t blk[4][3]; int nblk, live_pos; } List;
+typedef struct { uint8_t *data; size_t len; uint32_t gen, model_cmd, model_ctrl, dispatches; int finalized; int64_t created, used, seq; uint64_t blk[4][3]; int nblk, live_pos; } List;
 static List *g_lists;
 static int g_list_count, g_list_cap, *g_list_free, g_list_free_n;
 static int *g_live, g_live_n, g_live_cap;      /* the slots that hold a list (job_list_overwrite and list_collect look only at these, not at every slot ever used) */
 static size_t g_list_bytes, g_list_bytes_max;  /* recorded command lists held, bytes (list_collect's budget), and the most held */
-static LONG64 g_list_budget_drops, g_list_final_drops, g_list_reuse_drops, g_list_reuse_events;
-static volatile LONG64 g_list_seq;             /* lists registered so far: a list's seq orders it against command memory reuse */
-static SRWLOCK g_list_lock = SRWLOCK_INIT;
+static int64_t g_list_budget_drops, g_list_final_drops, g_list_reuse_drops, g_list_reuse_events;
+static volatile int64_t g_list_seq;             /* lists registered so far: a list's seq orders it against command memory reuse */
+static plat_rwlock_t g_list_lock = PLAT_RWLOCK_INIT;
 /* the live lists by where they were written, in 64 KB chunks of each command memory pool (a hash table of
  * cells), so that job_list_overwrite looks only at the lists in the chunks a new recording covers. Looking at every live
  * list took 8% of the game's main thread in Cascade Kingdom, about 1.4 ms a frame (some 30 recordings a frame against
@@ -2239,8 +2239,8 @@ static Cmd *rec(Ctx *c, uint32_t op, size_t blob) {
     return m;
 }
 
-static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uint32_t model_ctrl, uint32_t dispatches, const CmdBuf *cb, LONG64 *seq) {
-    AcquireSRWLockExclusive(&g_list_lock);
+static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uint32_t model_ctrl, uint32_t dispatches, const CmdBuf *cb, int64_t *seq) {
+    plat_rw_wlock(&g_list_lock);
     int i;
     if (g_list_free_n) i = g_list_free[--g_list_free_n];
     else {
@@ -2256,7 +2256,7 @@ static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uin
     g_lists[i].data = data; g_lists[i].len = len; g_lists[i].created = g_st.frames; g_lists[i].used = -1; g_list_bytes += len;
     if (g_list_bytes > g_list_bytes_max) g_list_bytes_max = g_list_bytes;
     g_lists[i].model_cmd = model_cmd; g_lists[i].model_ctrl = model_ctrl; g_lists[i].dispatches = dispatches; g_lists[i].finalized = 0;
-    g_lists[i].seq = InterlockedIncrement64(&g_list_seq);
+    g_lists[i].seq = plat_inc(&g_list_seq);
     if (seq) *seq = g_lists[i].seq;
     g_lists[i].nblk = cb ? cb->rec_nblk : 0;
     if (cb) memcpy(g_lists[i].blk, cb->rec_blk, sizeof g_lists[i].blk);
@@ -2264,16 +2264,16 @@ static uint64_t list_register(uint8_t *data, size_t len, uint32_t model_cmd, uin
     if (g_live_n == g_live_cap) { g_live_cap = g_live_cap ? g_live_cap * 2 : 1024; g_live = realloc(g_live, sizeof *g_live * (size_t)g_live_cap); }
     g_lists[i].live_pos = g_live_n; g_live[g_live_n++] = i;
     uint64_t h = ((uint64_t)(g_lists[i].gen & 0x7fffffff) << 32) | (uint32_t)(i + 1);
-    ReleaseSRWLockExclusive(&g_list_lock);
-    InterlockedIncrement64(&g_st.lists);
+    plat_rw_wunlock(&g_list_lock);
+    plat_inc(&g_st.lists);
     return h;
 }
 static uint8_t *list_lookup(uint64_t h, size_t *len) {
     uint8_t *data = NULL;
     uint32_t i = (uint32_t)h - 1;
-    AcquireSRWLockShared(&g_list_lock);
+    plat_rw_rlock(&g_list_lock);
     if (h && i < (uint32_t)g_list_count && g_lists[i].data && (g_lists[i].gen & 0x7fffffff) == (uint32_t)(h >> 32)) { data = g_lists[i].data; *len = g_lists[i].len; g_lists[i].used = g_st.frames; }
-    ReleaseSRWLockShared(&g_list_lock);
+    plat_rw_runlock(&g_list_lock);
     return data;
 }
 /* When a recorded list is over. In NVN a command handle names commands in the game's own command memory: it stays valid
@@ -2287,7 +2287,7 @@ static uint8_t *list_lookup(uint64_t h, size_t *len) {
  * when their part of the world is in view, so a list unused for long is not over (boot107: the title Mario; boot160:
  * scenery at Top-Hat Tower's door gone in every other frame after a budget rule had dropped "idle" lists). A memory
  * budget (SMO_LIST_BUDGET_MB, default 4096) stays as a last resort and says when it drops lists, as they can be live. */
-typedef struct { uint64_t seg[4][3]; int nseg; LONG64 seq; } Overwrite;
+typedef struct { uint64_t seg[4][3]; int nseg; int64_t seq; } Overwrite;
 static void overwrite_check(List *l, const Overwrite *w) {
     if (!l->data || l->finalized || l->seq >= w->seq) return;
     int hit = 0;
@@ -2298,7 +2298,7 @@ static void overwrite_check(List *l, const Overwrite *w) {
 }
 static void job_list_overwrite(void *arg) {            /* lists registered before seq that overlap one of the pieces are over */
     const Overwrite *w = arg;
-    AcquireSRWLockExclusive(&g_list_lock);
+    plat_rw_wlock(&g_list_lock);
     g_list_reuse_events++;
     int all = 0;
     for (int j = 0; j < w->nseg && j < 4; j++) { uint64_t c0, c1; cell_span(w->seg[j], &c0, &c1); all |= c1 - c0 >= CELL_SPAN; }
@@ -2314,11 +2314,11 @@ static void job_list_overwrite(void *arg) {            /* lists registered befor
             }
         }
     }
-    ReleaseSRWLockExclusive(&g_list_lock);
+    plat_rw_wunlock(&g_list_lock);
 }
 static int list_lru_cmp(const void *a, const void *b) {
     const List *x = &g_lists[*(const int *)a], *y = &g_lists[*(const int *)b];
-    LONG64 lx = x->used >= 0 ? x->used : x->created, ly = y->used >= 0 ? y->used : y->created;
+    int64_t lx = x->used >= 0 ? x->used : x->created, ly = y->used >= 0 ? y->used : y->created;
     return lx < ly ? -1 : lx > ly;
 }
 static void list_drop(int i) {
@@ -2331,7 +2331,7 @@ static void list_drop(int i) {
 static void list_collect(void) {
     static size_t budget;
     if (!budget) { const char *e = getenv("SMO_LIST_BUDGET_MB"); budget = (size_t)(e && atoi(e) > 0 ? atoi(e) : 4096) << 20; }
-    AcquireSRWLockExclusive(&g_list_lock);
+    plat_rw_wlock(&g_list_lock);
     for (int k = g_live_n - 1; k >= 0; k--) {      /* backwards: list_drop moves the last live slot into the place of the dropped one */
         int i = g_live[k];
         if (g_lists[i].finalized) { if (g_lists[i].finalized == 1) g_list_final_drops++; list_drop(i); }      /* finalized by the game, or its memory reused */
@@ -2340,16 +2340,16 @@ static void list_collect(void) {
         int *cand = malloc(sizeof *cand * (size_t)g_list_count), nc = 0;
         for (int i = 0; i < g_list_count; i++) {
             List *l = &g_lists[i];
-            LONG64 last = l->used >= 0 ? l->used : l->created;
+            int64_t last = l->used >= 0 ? l->used : l->created;
             if (l->data && g_st.frames - last > 120) cand[nc++] = i;
         }
         qsort(cand, (size_t)nc, sizeof *cand, list_lru_cmp);
-        LONG64 d0 = g_list_budget_drops;
+        int64_t d0 = g_list_budget_drops;
         for (int k = 0; k < nc && g_list_bytes > budget / 4 * 3; k++) { list_drop(cand[k]); g_list_budget_drops++; }
         { static int nl; if (nl++ < 20) printf("nvn: command lists over the budget (%zu MB): %lld idle lists dropped, %zu MB kept (WARNING: the game may still submit some of them)\n", budget >> 20, (long long)(g_list_budget_drops - d0), g_list_bytes >> 20); }
         free(cand);
     }
-    ReleaseSRWLockExclusive(&g_list_lock);
+    plat_rw_wunlock(&g_list_lock);
 }
 
 /* ---------------------------------------------------------------- GPU state as left by the commands executed so far */
@@ -2447,7 +2447,7 @@ static void bind_handle_table(int s, GLenum target, GLuint index, int skip) {
     glBindBufferRange(target, index, g_arena, (ptrdiff_t)S.tex_off[s] + skip, skip ? (ptrdiff_t)256 : (ptrdiff_t)sizeof S.gl_tex[s]);
 }
 /* Debug aid SMO_DRAWLOG=<frame>: state of every draw of that frame, and how many samples each draw produced. */
-static LONG64 g_prev_frame_draws, g_drawlog_frame = -1, g_disp_frames, g_frame_dispatch;
+static int64_t g_prev_frame_draws, g_drawlog_frame = -1, g_disp_frames, g_frame_dispatch;
 static int g_drawlog_mindisp_n;     /* with SMO_DRAWLOG_MIN=<n>: the first frame from <frame> on that follows a frame of at least n draws */
 static int drawlog_now(void) {
     static int drawlog = -2, mindraws, mindisp;
@@ -2714,7 +2714,7 @@ static int draw_prepare(void) {
  * Debug aids: SMO_NOCOMPUTE=1 skips every dispatch (the state before this was implemented); the draw log (SMO_DRAWLOG)
  * also lists every dispatch of the frame with its buffers, and marks vertex buffers that a dispatch of the frame wrote. */
 static int g_dbg_nocompute;
-static struct { int serial; LONG64 calls, run, groups; } g_chist[64];
+static struct { int serial; int64_t calls, run, groups; } g_chist[64];
 /* Storage buffers written by dispatches live in GL buffers of their own from the first dispatch that writes them until the next
  * command that reads guest memory (a draw, a copy, the end of the batch): compute_flush() then copies the written ones back to
  * guest memory, once, however many dispatches wrote into them (a skinned model can be written by ~10 dispatches into one buffer). */
@@ -2736,7 +2736,7 @@ static void compute_flush(void) {
     for (int k = 0; k < 64; k++) {
         CBuf *b = &g_cbuf[k];
         if (!b->live) continue;
-        if (b->dirty) { LONG64 pf0 = pf_now(); HS_IN("compute read-back (glGetNamedBufferSubData)", 0); glGetNamedBufferSubData(b->buf, 0, (ptrdiff_t)b->size, P(b->addr)); HS_OUT(); pf_add(PF_CFLUSH, pf0); g_pf_cflush_bytes += (LONG64)b->size; g_st.compute_bytes += (LONG64)b->size; any = 1; }
+        if (b->dirty) { int64_t pf0 = pf_now(); HS_IN("compute read-back (glGetNamedBufferSubData)", 0); glGetNamedBufferSubData(b->buf, 0, (ptrdiff_t)b->size, P(b->addr)); HS_OUT(); pf_add(PF_CFLUSH, pf0); g_pf_cflush_bytes += (int64_t)b->size; g_st.compute_bytes += (int64_t)b->size; any = 1; }
         b->live = b->dirty = 0;
     }
     g_cbuf_live = 0;
@@ -2772,9 +2772,9 @@ static Tex *image_tex(int stage, int k, View *v) {            /* NVN image handl
     uint32_t tid = (uint32_t)S.nvn_img[stage][k];
     Tex *t = NULL;
     if (!S.tpool || !tid) return NULL;
-    AcquireSRWLockShared(&g_pool_lock);
+    plat_rw_rlock(&g_pool_lock);
     if (tid < (uint32_t)S.tpool->count) { t = S.tpool->e[tid].tex; *v = S.tpool->e[tid].view; }
-    ReleaseSRWLockShared(&g_pool_lock);
+    plat_rw_runlock(&g_pool_lock);
     return t && !t->dead ? t : NULL;
 }
 /* The GLSL program of a compute stage given as machine code (translated again when the integer-ness of a texture it samples or
@@ -2898,7 +2898,7 @@ static void compute_dispatch(unsigned gx, unsigned gy, unsigned gz) {
     int log = drawlog_now(), h;
     g_st.dispatches++; g_frame_dispatch++;
     for (h = 0; h < 63 && g_chist[h].serial && g_chist[h].serial != (p ? p->serial : -1); h++) {}
-    g_chist[h].serial = p ? p->serial : -1; g_chist[h].calls++; g_chist[h].groups += (LONG64)gx * gy * gz;
+    g_chist[h].serial = p ? p->serial : -1; g_chist[h].calls++; g_chist[h].groups += (int64_t)gx * gy * gz;
     if (!p) { logf_limited(&nlog, 10, "nvn_gl: DispatchCompute with no compute program bound\n"); return; }
     Stage *st = &p->st[5];
     int text = st->state == 1 || st->state == 2, glsl = 0;
@@ -2993,7 +2993,7 @@ static void compute_dispatch(unsigned gx, unsigned gy, unsigned gz) {
 
 
 
-typedef struct { uint64_t cmd_size, compute_size, control_size, flush_threshold; int flags, priority; volatile LONG64 cmd_used, control_used, compute_used; } QueueObj;
+typedef struct { uint64_t cmd_size, compute_size, control_size, flush_threshold; int flags, priority; volatile int64_t cmd_used, control_used, compute_used; } QueueObj;
 static uint64_t now_ns(void);
 static void fence_now(SyncObj *o, int flags);
 static void event_signal_at(uint64_t a, int mode, uint32_t value);
@@ -3110,7 +3110,7 @@ static void draw_shot(void) {
  * report counts the slow first draws. What the point does: the vertex stage runs once on vertex 0 of the bound
  * buffers; nothing reaches the framebuffer. It is not done while a counter other than "samples passed" is running or
  * when the vertex stage writes storage buffers. */
-static LONG64 g_fdw_n, g_fdw_slow, g_fdw_skipped, g_fdw_ticks;
+static int64_t g_fdw_n, g_fdw_slow, g_fdw_skipped, g_fdw_ticks;
 static void first_draw_warm(void) {
     static uint64_t seen[1 << 16];
     static int off = -1;
@@ -3121,22 +3121,22 @@ static void first_draw_warm(void) {
     for (int probe = 0; probe < 64; probe++, h = (h + 1) & 0xffff) { if (seen[h] == pair) return; if (!seen[h]) { seen[h] = pair; break; } }
     if (!S.prog[0] || S.prog[0]->st[0].glsl != g_gs_last_prog[0] || S.prog[0]->st[0].glsl_ssbo_w) { g_fdw_skipped++; return; }      /* not the GLSL path, or a vertex stage with side effects */
     for (int t = 0; t < 17; t++) if (t != 1 && g_counter[t].active) { g_fdw_skipped++; return; }
-    LONG64 t0 = pf_now(), freq;
-    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+    int64_t t0 = pf_now(), freq;
+    { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
     HS_IN("first draw of a program pair: discarded point (driver)", 0);
     glEnable(GL_RASTERIZER_DISCARD_);
     glDrawArrays(GL_POINTS, 0, 1);
     glDisable(GL_RASTERIZER_DISCARD_);
     HS_OUT();
-    LONG64 dt = pf_now() - t0;
+    int64_t dt = pf_now() - t0;
     g_fdw_n++; g_fdw_ticks += dt; g_fdw_slow += dt * 250 >= freq;
 }
 /* SMO_HITCH: a draw call that took more than 4 ms, and whether it was the first draw with this pair of programs. */
-static void hitch_draw(LONG64 t0) {
+static void hitch_draw(int64_t t0) {
     static uint64_t seen[1 << 16];
-    static LONG64 freq, n_first, n_first_slow, n_old_slow;
+    static int64_t freq, n_first, n_first_slow, n_old_slow;
     static double ms_first, ms_old;
-    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+    if (!freq) { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
     double ms = (double)(pf_now() - t0) * 1000.0 / (double)freq;
     uint64_t pair = ((uint64_t)g_gs_last_prog[0] << 32) | g_gs_last_prog[1] | 1ull << 63;
     unsigned h = (unsigned)((pair * 0x9E3779B97F4A7C15ULL) >> 48);
@@ -3188,7 +3188,7 @@ static void exec(const Cmd *m, int depth) {
             uint32_t dims[4] = {0, 0, 0, 0};
             int isint = 0;
             unsigned u = (unsigned)(first + i);
-            { LONG64 pf0 = pf_now(); HS_IN("texture handle (view, sampler, bindless handle)", 0); S.gl_tex[stage][4 + u] = resolve_handle(S.tpool, S.spool, h, dims, &isint); HS_OUT(); pf_add(PF_HANDLE, pf0); }
+            { int64_t pf0 = pf_now(); HS_IN("texture handle (view, sampler, bindless handle)", 0); S.gl_tex[stage][4 + u] = resolve_handle(S.tpool, S.spool, h, dims, &isint); HS_OUT(); pf_add(PF_HANDLE, pf0); }
             memcpy(&S.gl_tex[stage][48 + 2 * u], dims, 16);
             S.tex_int[stage] = (S.tex_int[stage] & ~(1u << u)) | ((uint32_t)(isint != 0) << u);
             S.tex_sint[stage] = (S.tex_sint[stage] & ~(1u << u)) | ((uint32_t)(isint == 2) << u);
@@ -3331,7 +3331,7 @@ static void exec(const Cmd *m, int depth) {
         break;
     }
     case OP_DRAW_ARRAYS: {
-        LONG64 pf0 = pf_now();
+        int64_t pf0 = pf_now();
         int ok;
         { HS_IN("draw state (pipeline, bindings)", 0); ok = draw_prepare(); HS_OUT(); }
         pf_add(PF_PREP, pf0);
@@ -3353,7 +3353,7 @@ static void exec(const Cmd *m, int depth) {
         static const GLenum itype[3] = {GL_UNSIGNED_BYTE, GL_UNSIGNED_SHORT, GL_UNSIGNED_INT};
         unsigned t = (unsigned)a[1] < 3 ? (unsigned)a[1] : 1;
         int count = (int)a[2];
-        LONG64 pf0 = pf_now();
+        int64_t pf0 = pf_now();
         int ok;
         { HS_IN("draw state (pipeline, bindings)", 0); ok = count > 0 && a[3] && draw_prepare(); HS_OUT(); }
         if (!ok) { pf_add(PF_PREP, pf0); g_st.draws_skipped++; g_frame_skipped++; break; }
@@ -3418,7 +3418,7 @@ static void exec(const Cmd *m, int depth) {
         memcpy(&dv, blob + 48, sizeof dv); copy_region(blob + 72, dr);
         if (a[6] & 4) { dr[0] += dr[3]; dr[3] = -dr[3]; }      /* NVN_COPY_FLAGS_MIRROR_X / MIRROR_Y */
         if (a[6] & 8) { dr[1] += dr[4]; dr[4] = -dr[4]; }
-        { LONG64 pf0 = pf_now(); blit_tex(s, &sv, sr, d, &dv, dr, (int)(a[6] & 1)); pf_add(PF_COPY, pf0); }
+        { int64_t pf0 = pf_now(); blit_tex(s, &sv, sr, d, &dv, dr, (int)(a[6] & 1)); pf_add(PF_COPY, pf0); }
         break;
     }
     case OP_DOWNSAMPLE: {
@@ -3566,12 +3566,12 @@ static void exec(const Cmd *m, int depth) {
     case OP_EVENT_WAIT: {                      /* the queue stops until the event's value equals (mode 0) or has reached (mode 1, wrapping) the value */
         static int nlog;
         uint32_t want = (uint32_t)a[2];
-        DWORD t0 = GetTickCount();
+        uint32_t t0 = ((uint32_t)plat_ms());
         while (a[0]) {
             uint32_t v = rd32(a[0]);
             if (a[1] == 0 ? v == want : (int32_t)(v - want) >= 0) break;
-            if (GetTickCount() - t0 > 5000) { logf_limited(&nlog, 10, "nvn_gl: WaitEvent: the event at %llx still holds %u after 5 s (waiting for %s %u); continuing\n", (unsigned long long)a[0], v, a[1] ? ">=" : "==", want); break; }
-            Sleep(0);
+            if (((uint32_t)plat_ms()) - t0 > 5000) { logf_limited(&nlog, 10, "nvn_gl: WaitEvent: the event at %llx still holds %u after 5 s (waiting for %s %u); continuing\n", (unsigned long long)a[0], v, a[1] ? ">=" : "==", want); break; }
+            plat_sleep_ms(0);
         }
         break;
     }
@@ -3598,7 +3598,7 @@ static void exec(const Cmd *m, int depth) {
         else if (a[0] == 1) { if (S.debug_depth > 0) { glPopDebugGroup(); S.debug_depth--; } }
         else glDebugMessageInsert(0x824A, 0x8268 /* DEBUG_TYPE_MARKER */, (GLuint)a[1], 0x826B /* DEBUG_SEVERITY_NOTIFICATION */, -1, (const char *)blob);
         break;
-    case OP_DISPATCH: { LONG64 pf0 = pf_now(); HS_IN("compute dispatch", 0); compute_dispatch((unsigned)a[0], (unsigned)a[1], (unsigned)a[2]); HS_OUT(); pf_add(PF_DISPATCH, pf0); break; }
+    case OP_DISPATCH: { int64_t pf0 = pf_now(); HS_IN("compute dispatch", 0); compute_dispatch((unsigned)a[0], (unsigned)a[1], (unsigned)a[2]); HS_OUT(); pf_add(PF_DISPATCH, pf0); break; }
     case OP_IMAGES: {
         int stage = (int)a[0] % 6, first = (int)a[1], count = (int)a[2];
         for (int i = 0; i < count && first + i < 8; i++) memcpy(&S.nvn_img[stage][first + i], blob + i * 8, 8);
@@ -3633,7 +3633,7 @@ static void job_submit(void *arg) {
     static int nlog;
     g_serial++;
     g_arena_gen++;                               /* guest memory may have changed since the last batch */
-    LONG64 pf0 = pf_now();
+    int64_t pf0 = pf_now();
     for (int i = 0; i < j->count; i++) replay(j->handles[i], 0);
     compute_flush();                             /* the guest may read what compute wrote as soon as the batch has been submitted */
     pf_add(PF_SUBMIT, pf0);
@@ -3668,29 +3668,28 @@ static void save_bmp(const char *path, Tex *t) {
 }
 
 /* Frame times (present to present) of the last 300 frames and CPU time per thread, printed with the frame-rate line. */
-#include <tlhelp32.h>
 static double g_pf_ft[300];
-static struct { DWORD tid; ULONGLONG cpu; } g_pf_thr[512];
+static struct { uint32_t tid; uint64_t cpu; } g_pf_thr[512];
 static int g_pf_nthr;
-static DWORD g_pf_main_tid;
-const char *guest_thread_name_of(DWORD tid);                             /* os_threads.c */
+static uint32_t g_pf_main_tid;
+const char *guest_thread_name_of(uint32_t tid);                             /* os_threads.c */
 static int pf_cmp_d(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 static void pf_threads(double frames) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     THREADENTRY32 te;
-    DWORD pid = GetCurrentProcessId();
-    struct { DWORD tid; double ms; } top[512];
+    uint32_t pid = getpid();
+    struct { uint32_t tid; double ms; } top[512];
     int n = 0;
     double total = 0;
     if (snap == INVALID_HANDLE_VALUE) return;
     te.dwSize = sizeof te;
-    for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+    for (int ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
         if (te.th32OwnerProcessID != pid) continue;
-        HANDLE h = OpenThread(0x0800 /* THREAD_QUERY_LIMITED_INFORMATION */, FALSE, te.th32ThreadID);
+        HANDLE h = OpenThread(0x0800 /* THREAD_QUERY_LIMITED_INFORMATION */, 0, te.th32ThreadID);
         FILETIME c, e, k, u;
         if (!h) continue;
         if (GetThreadTimes(h, &c, &e, &k, &u)) {
-            ULONGLONG cpu = (((ULONGLONG)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((ULONGLONG)u.dwHighDateTime << 32) | u.dwLowDateTime), prev = 0;
+            uint64_t cpu = (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime), prev = 0;
             int i;
             for (i = 0; i < g_pf_nthr && g_pf_thr[i].tid != te.th32ThreadID; i++) {}
             if (i < g_pf_nthr) prev = g_pf_thr[i].cpu; else if (g_pf_nthr < 512) { g_pf_thr[g_pf_nthr].tid = te.th32ThreadID; i = g_pf_nthr++; }
@@ -3711,11 +3710,11 @@ static void pf_threads(double frames) {
     }
     printf("\n");
 }
-static DWORD WINAPI pf_threads_thread(LPVOID arg) { for (;;) { WaitForSingleObject((HANDLE)arg, INFINITE); pf_threads(300.0); } }
-static void pf_frame_mark(LONG64 frame) {
-    static LONG64 last, freq, snap[PF_N], snapn[PF_N], b0[3];
-    LONG64 now = pf_now();
-    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+static uint32_t pf_threads_thread(void * arg) { for (;;) { WaitForSingleObject((HANDLE)arg, PLAT_INFINITE); pf_threads(300.0); } }
+static void pf_frame_mark(int64_t frame) {
+    static int64_t last, freq, snap[PF_N], snapn[PF_N], b0[3];
+    int64_t now = pf_now();
+    if (!freq) { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
     if (last) g_pf_ft[frame % 300] = (double)(now - last) * 1000.0 / (double)freq;
     if (last && g_hitch_ms) hitch_frame((long long)frame, (double)(now - last) * 1000.0 / (double)freq, g_frame_dispatch > 0);
     last = now;
@@ -3728,16 +3727,16 @@ static void pf_frame_mark(LONG64 frame) {
            sum / 300, ft[0], ft[150], ft[296], ft[299], sum > 0 ? 300000.0 / sum : 0.0, ft[296] > 0 ? 1000.0 / ft[296] : 0.0);
     printf("nvn_perf: ms/frame (calls/frame):");
     for (int k = 0; k < PF_N; k++) {
-        LONG64 t = g_pf[k], c = g_pfn[k];
+        int64_t t = g_pf[k], c = g_pfn[k];
         printf(" %s %.2f (%.1f)", k_pf_name[k], (double)(t - snap[k]) * 1000.0 / (double)freq / 300.0, (double)(c - snapn[k]) / 300.0);
         snap[k] = t; snapn[k] = c;
     }
     printf(" | MB/frame: streamed %.2f, read back %.2f, hashed %.2f\n", (double)(g_pf_arena_bytes - b0[0]) / 300.0 / 1048576.0, (double)(g_pf_cflush_bytes - b0[1]) / 300.0 / 1048576.0,
            (double)(g_pf_hash_bytes - b0[2]) / 300.0 / 1048576.0);
     {   /* why textures were hashed (nvn_front_tex_changed): per frame, count and MB, and how many came out unchanged */
-        static LONG64 n0[4], by0[4], s0[4];
+        static int64_t n0[4], by0[4], s0[4];
         static const char *why[4] = {"first look", "flushed by the game", "pages written", "memory not watched"};
-        static LONG64 sk0;
+        static int64_t sk0;
         printf("nvn_texhash: frames %lld..%lld per frame: %.1f not hashed (pool flags);", (long long)frame - 300, (long long)frame, (double)(g_th_skip - sk0) / 300.0);
         sk0 = g_th_skip;
         for (int k = 0; k < 4; k++) {
@@ -3748,10 +3747,10 @@ static void pf_frame_mark(LONG64 frame) {
     b0[0] = g_pf_arena_bytes; b0[1] = g_pf_cflush_bytes; b0[2] = g_pf_hash_bytes;
     {
         static int on = -1;
-        static LONG64 z[16];
+        static int64_t z[16];
         if (on < 0) on = getenv("SMO_GLSTATS") != NULL;
         if (on) {
-            LONG64 v[16] = {g_gs_draws, g_gs_prog_same, g_gs_attr_set, g_gs_attr_same, g_gs_vbuf_bind, g_gs_buf_bind, g_st.tex_created, g_st.tex_uploads, g_st.fbo_made, g_st.views,
+            int64_t v[16] = {g_gs_draws, g_gs_prog_same, g_gs_attr_set, g_gs_attr_same, g_gs_vbuf_bind, g_gs_buf_bind, g_st.tex_created, g_st.tex_uploads, g_st.fbo_made, g_st.views,
                             g_st.handles, g_shc_compiled, g_shd_loaded, g_shc_hit, g_pfn[PF_CFLUSH], g_pfn[PF_WAIT_SUBMIT] + g_pfn[PF_WAIT_PRESENT] + g_pfn[PF_WAIT_OTHER]};
             double d[16];
             for (int k = 0; k < 16; k++) { d[k] = (double)(v[k] - z[k]) / 300.0; z[k] = v[k]; }
@@ -3763,8 +3762,8 @@ static void pf_frame_mark(LONG64 frame) {
     {   /* the snapshot of all threads (CreateToolhelp32Snapshot) took 30-70 ms on the render thread: one long
          * frame in every 300 (hitch log, "present" scope). It is taken by a helper thread now. */
         static HANDLE ev;
-        if (!ev) { ev = CreateEventA(NULL, FALSE, FALSE, NULL); CloseHandle(CreateThread(NULL, 0, pf_threads_thread, ev, 0, NULL)); }
-        SetEvent(ev);
+        if (!ev) { ev = plat_event_new(0, 0); CloseHandle(CreateThread(NULL, 0, pf_threads_thread, ev, 0, NULL)); }
+        plat_event_set(ev);
     }
 }
 
@@ -3773,10 +3772,10 @@ static void job_fence(void *arg);
 static void job_sync_wait(void *arg);
 static void job_flush(void *arg);
 static void job_finish(void *arg);
-static void joblog(void (*fn)(void *), LONG64 t) {
-    static LONG64 freq;
-    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
-    printf("joblog: frame %lld t=%.3f ms thread %lu %s%c", (long long)g_joblog_cur, (double)(t % (freq * 100)) * 1000.0 / (double)freq, (unsigned long)GetCurrentThreadId(),
+static void joblog(void (*fn)(void *), int64_t t) {
+    static int64_t freq;
+    if (!freq) { plat_counter f; plat_qpf(&f); freq = f.QuadPart; }
+    printf("joblog: frame %lld t=%.3f ms thread %lu %s%c", (long long)g_joblog_cur, (double)(t % (freq * 100)) * 1000.0 / (double)freq, (unsigned long)plat_tid(),
            fn == job_submit ? "SubmitCommands" : fn == job_present ? "PresentTexture" : fn == job_fence ? "FenceSync" : fn == job_sync_wait ? "SyncWait" : fn == job_flush ? "Flush" :
            fn == job_finish ? "Finish" : "other", 10);
 }
@@ -3787,8 +3786,8 @@ static void job_present(void *arg) {
     static int shot = -2, every, shot_from, shot_to;
     Tex *t = j->win && j->index >= 0 && j->index < j->win->count ? j->win->tex[j->index] : NULL;
     RECT r;
-    LONG64 frame = g_st.frames + 1;
-    LONG64 pf0 = pf_now();
+    int64_t frame = g_st.frames + 1;
+    int64_t pf0 = pf_now();
     if (shot == -2) { shot = getenv("SMO_SHOT") ? atoi(getenv("SMO_SHOT")) : -1; every = getenv("SMO_SHOT_EVERY") ? atoi(getenv("SMO_SHOT_EVERY")) : 0; shot_from = getenv("SMO_SHOT_FROM") ? atoi(getenv("SMO_SHOT_FROM")) : 0; shot_to = getenv("SMO_SHOT_TO") ? atoi(getenv("SMO_SHOT_TO")) : 0x7fffffff; }
     GetClientRect(g_hwnd, &r);
     glDisable(GL_SCISSOR_TEST);
@@ -3830,7 +3829,7 @@ static void job_present(void *arg) {
         glClearColor(0, 0, 0, 1);                 /* nothing has been drawn into the presented texture yet */
         glClear(GL_COLOR_BUFFER_BIT);
     }
-    { LONG64 pf1 = pf_now(); HS_IN("SwapBuffers", 0); SwapBuffers(g_dc); HS_OUT(); pf_add(PF_SWAP, pf1); }
+    { int64_t pf1 = pf_now(); HS_IN("SwapBuffers", 0); SwapBuffers(g_dc); HS_OUT(); pf_add(PF_SWAP, pf1); }
     pf_add(PF_PRESENT, pf0);
     pf_frame_mark(frame);
     g_joblog_cur = frame;
@@ -3844,10 +3843,10 @@ static void job_present(void *arg) {
                (long long)g_st.tex_uploads, (long long)(g_st.tex_bytes >> 20), (long long)g_st.prog_ok, (long long)g_st.prog_fail, (long long)g_st.gl_errors);
     fflush(stdout);
     {   /* frame rate over the last 300 presented frames */
-        static ULONGLONG t0;
-        static LONG64 d0, c0;
+        static uint64_t t0;
+        static int64_t d0, c0;
         if (frame % 300 == 0) {
-            ULONGLONG now = GetTickCount64();
+            uint64_t now = plat_ms();
             if (t0 && now > t0) printf("nvn_gl: frames %lld..%lld: %.1f fps, %lld draws and %lld dispatches per frame\n", (long long)frame - 300, (long long)frame, 300000.0 / (double)(now - t0),
                                        (long long)(g_st.draws - d0) / 300, (long long)(g_st.dispatches - c0) / 300);
             t0 = now; d0 = g_st.draws; c0 = g_st.dispatches;
@@ -3887,12 +3886,12 @@ static void job_write_texels(void *arg) {
 /* The render thread's job loop (both back ends). */
 static void render_loop(void) {
     for (;;) {
-        WaitForSingleObject(g_job_event, INFINITE);
+        WaitForSingleObject(g_job_event, PLAT_INFINITE);
         for (;;) {
-            EnterCriticalSection(&g_job_lock);
+            plat_lock(&g_job_lock);
             Job *j = g_job_head;
             if (j) { g_job_head = j->next; if (!g_job_head) g_job_tail = NULL; }
-            LeaveCriticalSection(&g_job_lock);
+            plat_unlock(&g_job_lock);
             if (!j) break;
             HANDLE done = j->done;
             if (g_rb->idle) g_rb->idle();
@@ -3901,24 +3900,24 @@ static void render_loop(void) {
             j->fn(j->arg);                       /* a member of g_rb, or a job of the front end / of the back end itself */
             if (g_tl_on) nvn_tl(TL_JOB_END, tl_kind(j->fn));
             g_hitch_rt = "idle";
-            if (done) SetEvent(done); else { free(j); InterlockedDecrement(&g_async_pending); }      /* gl_post: nobody waits */
+            if (done) plat_event_set(done); else { free(j); plat_dec(&g_async_pending); }      /* gl_post: nobody waits */
         }
     }
 }
 
 void os_pin_host_thread(void);                    /* os_threads.c: the runtime's busy threads away from the console cores */
 void os_pin_render_thread(void);
-static DWORD WINAPI render_thread(LPVOID arg) {
+static uint32_t render_thread(void * arg) {
     (void)arg;
     pf_job_submit = g_rb->submit; pf_job_present = g_rb->present;
     g_joblog_frame = getenv("SMO_JOBLOG") ? atoi(getenv("SMO_JOBLOG")) : 0;
     PIXELFORMATDESCRIPTOR pfd;
-    g_render_tid = GetCurrentThreadId();
+    g_render_tid = plat_tid();
     if (g_vk) {                                 /* no OpenGL context, no shader workers; the jobs go to nvn_vk.c (vk_route) */
         os_pin_render_thread();                 /* away from the console cores; with SMO_HOST_LAYOUT=1 on a core of its own (os_threads.c) */
         nvn_vk_init(g_hwnd);
         hitch_set_render();
-        SetEvent(g_ready_event);
+        plat_event_set(g_ready_event);
         render_loop();
         return 0;
     }
@@ -3929,7 +3928,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     pfd.iPixelType = PFD_TYPE_RGBA; pfd.cColorBits = 32;
     SetPixelFormat(g_dc, ChoosePixelFormat(g_dc, &pfd), &pfd);
     HGLRC rc = wglCreateContext(g_dc);
-    if (!rc || !wglMakeCurrent(g_dc, rc)) { printf("nvn_gl: cannot create an OpenGL context (error %lu)\n", GetLastError()); fflush(stdout); ExitProcess(5); }
+    if (!rc || !wglMakeCurrent(g_dc, rc)) { printf("nvn_gl: cannot create an OpenGL context (error %lu)\n", GetLastError()); fflush(stdout); plat_exit(5); }
     int missing = 0;
 #define X(ret, name, args) gl##name = (void *)wglGetProcAddress("gl" #name); if (!gl##name) { printf("nvn_gl: the driver lacks gl" #name "\n"); missing++; }
     GLF(X)
@@ -3938,8 +3937,8 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     GLO(X)
 #undef X
     printf("nvn_gl: %s | %s | OpenGL %s\n", (const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION));
-    if (missing) { printf("nvn_gl: %d required OpenGL functions are missing; this backend needs an NVIDIA driver\n", missing); fflush(stdout); ExitProcess(5); }
-    BOOL (WINAPI *swap_interval)(int) = (void *)wglGetProcAddress("wglSwapIntervalEXT");
+    if (missing) { printf("nvn_gl: %d required OpenGL functions are missing; this backend needs an NVIDIA driver\n", missing); fflush(stdout); plat_exit(5); }
+    int (*swap_interval)(int) = (void *)wglGetProcAddress("wglSwapIntervalEXT");
     if (swap_interval) swap_interval(0);
     g_debug = getenv("SMO_GLDEBUG") != NULL;
     g_dbg_noscissor = getenv("SMO_NOSCISSOR") != NULL;
@@ -3991,7 +3990,7 @@ static DWORD WINAPI render_thread(LPVOID arg) {
     shd_init();
     hitch_set_render();
     nvn_misc_gl_selftest_hook();                  /* SMO_NVN_GLTEST: OpenGL self-test of nvn_misc.c, then exit */
-    SetEvent(g_ready_event);
+    plat_event_set(g_ready_event);
     render_loop();
     return 0;
 }
@@ -4001,18 +4000,18 @@ void nvn_gl_start(void *hwnd) {
     g_hwnd = hwnd;
     {   /* which back end. SMO_RENDERER=gl | vk (default: vk) */
         const char *e = getenv("SMO_RENDERER");
-        if (e && e[0] && strcmp(e, "gl") && strcmp(e, "vk")) { printf("nvn: SMO_RENDERER=%s is not a renderer (gl, vk)\n", e); fflush(stdout); ExitProcess(5); }
+        if (e && e[0] && strcmp(e, "gl") && strcmp(e, "vk")) { printf("nvn: SMO_RENDERER=%s is not a renderer (gl, vk)\n", e); fflush(stdout); plat_exit(5); }
         /* VULKAN IS THE DEFAULT. SMO_RENDERER=gl|vk wins; else renderer = vulkan | opengl of config\graphics.ini. */
         g_vk = e && e[0] ? !strcmp(e, "vk") : !gfx_options()->renderer;
         g_rb = g_vk ? &rb_vk : &rb_gl;
         printf("nvn: renderer: %s (%s)\n", g_vk ? "Vulkan (nvn_vk.c)" : "OpenGL (nvn_gl.c)", e && e[0] ? "SMO_RENDERER" : "graphics.ini; the default is Vulkan");
     }
-    InitializeCriticalSection(&g_job_lock);
-    InitializeCriticalSection(&g_dead_lock);
-    g_job_event = CreateEventA(NULL, FALSE, FALSE, NULL);
-    g_ready_event = CreateEventA(NULL, TRUE, FALSE, NULL);
+    plat_lock_init(&g_job_lock);
+    plat_lock_init(&g_dead_lock);
+    g_job_event = plat_event_new(0, 0);
+    g_ready_event = plat_event_new(1, 0);
     CreateThread(NULL, 16 << 20, render_thread, NULL, 0, NULL);
-    WaitForSingleObject(g_ready_event, INFINITE);
+    WaitForSingleObject(g_ready_event, PLAT_INFINITE);
 }
 
 void nvn_gl_report(FILE *out) {
@@ -4030,14 +4029,14 @@ void nvn_gl_report(FILE *out) {
             (long long)g_shc_compiled, (long long)g_shc_hit, (long long)g_shc_src_hit, (long long)g_ww_clean, (long long)g_ww_dirty, (long long)g_ww_unwatched);
     fprintf(out, "nvn_gl: shader binaries on disk: %lld loaded, %lld compiled and saved by the render thread, %lld refused by the driver (compiled again)\n", (long long)g_shd_loaded, (long long)g_shd_saved, (long long)g_shd_refused);
     for (int i = 0; g_fdlog && i < 64 && g_fd_ids[i].n; i++) fprintf(out, "fdlog-id: %u type %x severity %x: %lld messages, first: %s\n", g_fd_ids[i].id, g_fd_ids[i].type, g_fd_ids[i].sev, (long long)g_fd_ids[i].n, g_fd_ids[i].text);
-    { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    { plat_counter f; plat_qpf(&f);
       fprintf(out, "nvn_gl: shader pairs made ready by the workers (SMO_PAIR_WARM=%d): %lld from pairs.txt + %lld programs handed over; %lld warm draws, %lld of them over 8 ms (not in the driver's cache), %.1f s in all; %lld known already, %lld without binaries or not translated, %lld stages compiled for it\n",
               pw_mode(), (long long)g_pw_named, (long long)g_pw_progs, (long long)g_pw_warmed, (long long)g_pw_cold_n, (double)g_pw_ticks / (double)f.QuadPart, (long long)g_pw_dup, (long long)g_pw_missing, (long long)g_pw_compiled);
       fprintf(out, "nvn_gl: presents held for shader preparation: %lld times, %.2f s in all\n", (long long)g_pw_gates, (double)g_pw_gate_ticks / (double)f.QuadPart); }
     fprintf(out, "nvn_gl: shader pairs drawn (pairs.txt): %lld known at start, %lld added in this run\n", (long long)g_prec_loaded, (long long)g_prec_added);
     if (pair_mode()) fprintf(out, "nvn_gl: linked pair programs (SMO_PAIR=%d): %lld loaded from disk, %lld linked here, %lld not linkable, %lld binaries refused, %lld draws used one\n", pair_mode(), (long long)g_pair_loaded, (long long)g_pair_linked, (long long)g_pair_failed, (long long)g_pair_refused, (long long)g_pair_draws);
-    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fprintf(out, "nvn_gl: first draws of a program pair preceded by a discarded point: %lld (%lld over 4 ms, %.0f ms in all), not done %lld (counter running or vertex stage with side effects)\n", (long long)g_fdw_n, (long long)g_fdw_slow, (double)g_fdw_ticks * 1000.0 / (double)f.QuadPart, (long long)g_fdw_skipped); }
-    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fprintf(out, "nvn_gl: nvnProgramSetShaders held its caller %lld times, %.1f s in all, while all workers were compiling\n", (long long)g_shw_held, (double)g_shw_held_ticks / (double)f.QuadPart); }
+    { plat_counter f; plat_qpf(&f); fprintf(out, "nvn_gl: first draws of a program pair preceded by a discarded point: %lld (%lld over 4 ms, %.0f ms in all), not done %lld (counter running or vertex stage with side effects)\n", (long long)g_fdw_n, (long long)g_fdw_slow, (double)g_fdw_ticks * 1000.0 / (double)f.QuadPart, (long long)g_fdw_skipped); }
+    { plat_counter f; plat_qpf(&f); fprintf(out, "nvn_gl: nvnProgramSetShaders held its caller %lld times, %.1f s in all, while all workers were compiling\n", (long long)g_shw_held, (double)g_shw_held_ticks / (double)f.QuadPart); }
     fprintf(out, "nvn_gl: shader variants (variants.txt): %lld known at start, %lld of them queued for the workers, %lld added in this run\n", (long long)g_shv_loaded, (long long)g_shv_queued, (long long)g_shv_added);
     fprintf(out, "nvn_gl: shader workers (%d): %lld stages queued, %lld done (%lld compiled and saved, %lld already on disk, %lld not translated or not saved)\n", g_shw_n, (long long)g_shw_queued, (long long)g_shw_done,
             (long long)g_shw_compiled, (long long)g_shw_present, (long long)g_shw_failed);
@@ -4079,10 +4078,10 @@ static void dev_texel_fetch_handle(Ctx *c) { RET((uint64_t)(int64_t)(int32_t)(ui
 static void dev_image_handle(Ctx *c) { RET((uint64_t)(int64_t)(int32_t)(uint32_t)A1); }
 
 /* ---- programs */
-static volatile LONG g_prog_serial;
+static volatile int32_t g_prog_serial;
 static void prog_initialize(Ctx *c) {
     Prog *p = hnew(A0, K_PROG, sizeof(Prog));
-    p->serial = (int)InterlockedIncrement(&g_prog_serial);
+    p->serial = (int)plat_inc(&g_prog_serial);
     p->guest = A0;
     RET(1);
 }
@@ -4090,7 +4089,7 @@ static void prog_finalize(Ctx *c) {
     gl_barrier();
     Prog *p = hobj(A0, K_PROG);
     if (!p) return;
-    InterlockedExchange(&p->dead, 1);
+    plat_xchg(&p->dead, 1);
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
     defer_free(K_PROG, p);
@@ -4100,8 +4099,8 @@ static void prog_finalize(Ctx *c) {
  * control section (at least up to +0x720, plus the assembly text if any) and the code section (header + code + constants). */
 static void dump_stage_all(int serial, int index, uint64_t control, uint64_t data) {
     static const char *dir;
-    static volatile LONG init;
-    if (!init) { dir = getenv("SMO_SHADERDUMP_ALL"); InterlockedExchange(&init, 1); }
+    static volatile int32_t init;
+    if (!init) { dir = getenv("SMO_SHADERDUMP_ALL"); plat_xchg(&init, 1); }
     if (!dir || !control) return;
     uint32_t text_off = rd32(control + 0x14), text_len = rd32(control + 0x18), ctl_len = 0x720, data_len = 0;
     if (text_len && text_len < (1u << 20) && text_off < (1u << 20) && text_off + text_len > ctl_len) ctl_len = text_off + text_len;
@@ -4130,7 +4129,7 @@ static void dump_stage_all(int serial, int index, uint64_t control, uint64_t dat
 static int pw_queue_prog(Prog *p) {
     int m = pw_mode();
     Stage *v = &p->st[0], *f = &p->st[1];
-    if (!m || g_shd_mode <= 0 || !g_shw_n || g_shw_ctx_failed || (m < 2 && g_st.frames < 300) || GetCurrentThreadId() == g_render_tid) return 0;
+    if (!m || g_shd_mode <= 0 || !g_shw_n || g_shw_ctx_failed || (m < 2 && g_st.frames < 300) || plat_tid() == g_render_tid) return 0;
     if (!(v->code && v->code_len > 0 && v->glsl_state == 0) || p->st[2].state || p->st[3].state || p->st[4].state) return 0;
     int has_f = f->code && f->code_len > 0 && f->glsl_state == 0;
     if (f->state && !has_f) return 0;
@@ -4146,35 +4145,35 @@ static int pw_queue_prog(Prog *p) {
     if (!h) h = 1;
     memcpy(&j->key[2], &h, 8);
     int seen = 0;
-    EnterCriticalSection(&g_shw_lock);
+    plat_lock(&g_shw_lock);
     unsigned k = (unsigned)(h >> 20) & 16383;
     for (int probe = 0; probe < 64; probe++, k = (k + 1) & 16383) { if (g_pw_qseen[k] == h) { seen = 1; break; } if (!g_pw_qseen[k]) { g_pw_qseen[k] = h; break; } }
-    LeaveCriticalSection(&g_shw_lock);
-    if (seen) free(j); else { InterlockedIncrement64(&g_pw_progs); pw_enqueue(j); }
+    plat_unlock(&g_shw_lock);
+    if (seen) free(j); else { plat_inc(&g_pw_progs); pw_enqueue(j); }
     static int nowait = -1;
     if (nowait < 0) nowait = getenv("SMO_SHADER_NOWAIT") != NULL;
     if (!nowait && g_st.frames >= 300 && g_shw_queued != g_shw_done) {
-        LONG64 t0 = pf_now(), freq = 0;
-        { LARGE_INTEGER q; QueryPerformanceFrequency(&q); freq = q.QuadPart; }
-        while (g_shw_queued != g_shw_done && pf_now() - t0 < 30 * freq) Sleep(1);
-        InterlockedExchangeAdd64(&g_shw_held_ticks, pf_now() - t0); InterlockedIncrement64(&g_shw_held);
+        int64_t t0 = pf_now(), freq = 0;
+        { plat_counter q; plat_qpf(&q); freq = q.QuadPart; }
+        while (g_shw_queued != g_shw_done && pf_now() - t0 < 30 * freq) plat_sleep_ms(1);
+        plat_xadd(&g_shw_held_ticks, pf_now() - t0); plat_inc(&g_shw_held);
     }
     return 1;
 }
 /* nvnProgramSetShaders(program, count, const NVNshaderData *): { u64 data (GPU address), const void *control }.
  * control: magic 0x98761234, offset of the NV_gpu_program5 text at +0x14, its length at +0x18. */
-__declspec(thread) long long nvn_setsh_part[8];
+_Thread_local long long nvn_setsh_part[8];
 static void prog_set_shaders_(Ctx *c);
 static void prog_set_shaders(Ctx *c) {             /* the call timed part by part; a line for every call over 2 ms (SMO_VK_SETSH_LOG=<ms> changes the limit, 0 = no lines) */
-    static int lim = -1; static LONG nl; static LONG64 fq;
-    if (lim < 0) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); fq = f.QuadPart; lim = getenv("SMO_VK_SETSH_LOG") ? atoi(getenv("SMO_VK_SETSH_LOG")) : 2; }
+    static int lim = -1; static int32_t nl; static int64_t fq;
+    if (lim < 0) { plat_counter f; plat_qpf(&f); fq = f.QuadPart; lim = getenv("SMO_VK_SETSH_LOG") ? atoi(getenv("SMO_VK_SETSH_LOG")) : 2; }
     if (!lim || g_rb != &rb_vk) { prog_set_shaders_(c); return; }
     memset(nvn_setsh_part, 0, sizeof nvn_setsh_part);
     uint64_t guest = A0, ra = c->x[30];
-    LONG64 t0 = pf_now();
+    int64_t t0 = pf_now();
     prog_set_shaders_(c);
-    LONG64 t = pf_now() - t0;
-    if (t * 1000 > (LONG64)lim * fq && (InterlockedIncrement(&nl) <= 400 || (t * 1000 > 20 * fq && nl <= 4000))) {      /* a call over 20 ms is logged after the first 400 lines too (Intel: the lines were used up at loading) */
+    int64_t t = pf_now() - t0;
+    if (t * 1000 > (int64_t)lim * fq && (plat_inc(&nl) <= 400 || (t * 1000 > 20 * fq && nl <= 4000))) {      /* a call over 20 ms is logged after the first 400 lines too (Intel: the lines were used up at loading) */
         long long *q = nvn_setsh_part;
 #define SETSH_MS(x) ((double)(x) * 1000.0 / (double)fq)
         printf("nvn_setsh: frame %lld, program object %llx (called from %llx): %.1f ms | barrier %.1f | program_set %.1f (hash + job copy %.1f, lock %.1f, HELD %.1f) | rest %.1f\n",
@@ -4184,21 +4183,21 @@ static void prog_set_shaders(Ctx *c) {             /* the call timed part by par
 }
 static void prog_set_shaders_(Ctx *c) {
     static int nlog, nlog2;
-    { LONG64 tb = pf_now(); gl_barrier(); nvn_setsh_part[0] += pf_now() - tb; }
+    { int64_t tb = pf_now(); gl_barrier(); nvn_setsh_part[0] += pf_now() - tb; }
     Prog *p = hobj(A0, K_PROG);
     int count = (int)A1;
     uint64_t stride = strstr(hostfn_current_name(), "Ext") ? 24 : 16;      /* the Ext variant has a third pointer per shader */
-    InterlockedIncrement(&g_setshaders_calls);
-    if (!p) { p = hnew(A0, K_PROG, sizeof(Prog)); p->serial = (int)InterlockedIncrement(&g_prog_serial); p->guest = A0; }
+    plat_inc(&g_setshaders_calls);
+    if (!p) { p = hnew(A0, K_PROG, sizeof(Prog)); p->serial = (int)plat_inc(&g_prog_serial); p->guest = A0; }
     for (int s = 0; s < 6; s++) if (p->st[s].state == 1 || p->st[s].state == 4) { free(p->st[s].text); p->st[s].text = NULL; p->st[s].state = 0; }
     for (int i = 0; i < count && i < 6 && A2; i++) {
         uint64_t control = rd64(A2 + (uint64_t)i * stride + 8);
         if (!control || rd32(control) != 0x98761234u) { logf_limited(&nlog, 10, "nvn_gl: %s: shader %d of program #%d has no recognisable control section\n", hostfn_current_name(), i, p->serial); continue; }
         uint64_t data = rd64(A2 + (uint64_t)i * stride);
         dump_stage_all(p->serial, i, control, data);
-        {   static int diag = -1; static LONG nd;      /* SMO_SHADER_SRC_LOG=<n>: where the first n heap-held stages come from (guest return addresses, the memory around the control section) */
+        {   static int diag = -1; static int32_t nd;      /* SMO_SHADER_SRC_LOG=<n>: where the first n heap-held stages come from (guest return addresses, the memory around the control section) */
             if (diag < 0) diag = getenv("SMO_SHADER_SRC_LOG") ? atoi(getenv("SMO_SHADER_SRC_LOG")) : 0;
-            if (diag && (control >> 28) != 0x710 && InterlockedIncrement(&nd) <= diag) {
+            if (diag && (control >> 28) != 0x710 && plat_inc(&nd) <= diag) {
                 uint64_t fp = c->x[29], ra1 = fp ? rd64(fp + 8) : 0, fp2 = fp ? rd64(fp) : 0, ra2 = fp2 ? rd64(fp2 + 8) : 0, fp3 = fp2 ? rd64(fp2) : 0, ra3 = fp3 ? rd64(fp3 + 8) : 0, pg = control & ~0xffffull;
                 printf("shader-src: frame %lld program #%d stage %d of %d: control %llx data %llx (third pointer %llx) | called from %llx <- %llx <- %llx <- %llx | 64K base: %08x %08x %08x %08x %08x %08x %08x %08x | before control: %016llx %016llx %016llx %016llx | data: %08x %08x %08x %08x\n", nvn_front_frame_next(), p->serial, i, count,
                        (unsigned long long)control, (unsigned long long)data, (unsigned long long)(stride == 24 ? rd64(A2 + (uint64_t)i * stride + 16) : 0), (unsigned long long)c->x[30], (unsigned long long)ra1, (unsigned long long)ra2, (unsigned long long)ra3,
@@ -4209,7 +4208,7 @@ static void prog_set_shaders_(Ctx *c) {
         }
         static const int8_t stage_of_type[16] = {-1, 0, 3, 4, 2, 1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
         if (rd32(control + 0x18)) {
-            InterlockedIncrement(&g_with_text);
+            plat_inc(&g_with_text);
             prog_add_stage(p, P(control + rd32(control + 0x14)), (int)rd32(control + 0x18), p->serial);
             if (data && rd32(data) == 0x12345678u) {                  /* the machine code is there as well */
                 int s2 = stage_of_type[(rd32(data + 0x30) >> 10) & 15], len2 = (int)rd32(control + 0x6f8);
@@ -4231,7 +4230,7 @@ static void prog_set_shaders_(Ctx *c) {
         /* No assembly text: only Maxwell machine code. data: magic 0x12345678, program header (0x50 bytes) at +0x30, then 64-bit
          * instruction words; control +0x6f8 = size of the instructions in bytes. Header word 0 bits 10..13 = stage (1 vertex,
          * 2 tess control, 3 tess evaluation, 4 geometry, 5 fragment). */
-        InterlockedIncrement(&g_without_text);
+        plat_inc(&g_without_text);
         if (rd32(control + 0x714) == 5 && data) {                     /* compute stage (control +0x714 = NVN shader stage) */
             static int ncl;
             int len = (int)rd32(control + 0x6f8);
@@ -4251,7 +4250,7 @@ static void prog_set_shaders_(Ctx *c) {
         if (s < 0 || len <= 0 || len > (4 << 20)) { logf_limited(&nlog2, 10, "nvn_gl: program #%d shader %d: unexpected program header %08x, code size %d\n", p->serial, i, rd32(data + 0x30), len); continue; }
         p->st[s].code = P(data + 0x30); p->st[s].code_len = len; p->st[s].state = 4; p->st[s].dumped = 0; p->st[s].glsl_state = 0; memcpy(p->st[s].ctl, P(control + 0x6f0), 32);
     }
-    if (g_rb == &rb_vk) { LONG64 tb = pf_now(); nvn_vk_program_set(p); nvn_setsh_part[4] += pf_now() - tb; RET(1); return; }       /* the stages go to the Vulkan workers at once (nvn_vk_pipelines.c) */
+    if (g_rb == &rb_vk) { int64_t tb = pf_now(); nvn_vk_program_set(p); nvn_setsh_part[4] += pf_now() - tb; RET(1); return; }       /* the stages go to the Vulkan workers at once (nvn_vk_pipelines.c) */
     if (!pw_queue_prog(p))
     for (int s = 0; s < 2; s++) {              /* have the driver's binary ready before the first draw */
         Stage *st = &p->st[s];
@@ -4288,10 +4287,10 @@ static void spool_register(Ctx *c) {                   /* (pool, id, sampler) or
     gl_barrier();
     SamplerPool *sp = hobj(A0, K_SPOOL);
     if (!sp || (uint32_t)A1 >= (uint32_t)sp->count || !A2) return;
-    AcquireSRWLockExclusive(&g_pool_lock);
+    plat_rw_wlock(&g_pool_lock);
     memcpy(&sp->e[(uint32_t)A1], P(A2), sizeof(SamplerParams));
     sp->used[(uint32_t)A1] = 1;
-    ReleaseSRWLockExclusive(&g_pool_lock);
+    plat_rw_wunlock(&g_pool_lock);
 }
 
 /* ---- textures */
@@ -4371,7 +4370,7 @@ static void tex_initialize(Ctx *c) {                   /* (texture, builder) */
     t->storage = tex_storage_size2(&t->b, &t->data_size);
     t->pool_flags = t->b.pool ? (uint32_t)nvn_pool_flags(t->b.pool) : 0;
     t->guest = A0;
-    do { t->all_next = g_all_tex; } while (InterlockedCompareExchangePointer((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
+    do { t->all_next = g_all_tex; } while (plat_cas((void *volatile *)&g_all_tex, t, t->all_next) != t->all_next);
     tp_add(t);
     if (texlog_on()) printf("texlog: init %llx host %p %dx%d fmt 0x%x target %d mem %p levels %d depth %d samples %d flags 0x%x storage 0x%llx frame %lld (caller %llx)\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height,
                             t->b.format, t->b.target, (void *)t->mem, t->b.levels, t->b.depth, t->b.samples, t->b.flags, (unsigned long long)t->storage, (long long)g_st.frames, (unsigned long long)c->x[30]);
@@ -4393,20 +4392,20 @@ static void tex_finalize(Ctx *c) {
         int released = 0, own = 0;
         __try { id = (int32_t)rd32(A0 + 0xc0); own = rd8(A0 + 0xc4) & 1; } __except (1) { own = 0; }     /* past the 0xc0 bytes of an NVNtexture: an object of another kind may end there */
         if (own && id >= 0) {
-            AcquireSRWLockExclusive(&g_pool_lock);
+            plat_rw_wlock(&g_pool_lock);
             for (int i = 0; i < g_ntpools && !released; i++) {
                 TexPool *tp = g_tpools[i];
                 if ((uint32_t)id < (uint32_t)tp->count && tp->e[id].tex == t && tp->e[id].held) { pool_ent_release(&tp->e[id]); released = 1; }
             }
-            ReleaseSRWLockExclusive(&g_pool_lock);
-            InterlockedIncrement64(released ? &g_slot_releases : &g_slot_unknown);
+            plat_rw_wunlock(&g_pool_lock);
+            plat_inc(released ? &g_slot_releases : &g_slot_unknown);
         }
         if (texlog_on()) printf("texlog: finalize of a copy %llx (host %p belongs to %llx): copy cleared only; slot %d %s, %d entries left, frame %lld (caller %llx)\n", (unsigned long long)A0, (void *)t, (unsigned long long)t->guest,
                                 (int)id, released ? "released" : "not an entry of it", t->nslots, (long long)g_st.frames, (unsigned long long)c->x[30]);
         wr32(A0 + 8, 0);
         return;
     }
-    InterlockedExchange(&t->dead, 1);
+    plat_xchg(&t->dead, 1);
     tp_remove(t);
     if (texlog_on()) printf("texlog: finalize %llx host %p %dx%d fmt 0x%x mem %p (caller %llx)\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height, t->b.format, (void *)t->mem, (unsigned long long)c->x[30]);
     wr32(A0 + 8, 0);
@@ -4474,9 +4473,9 @@ static void tpool_initialize(Ctx *c) {                 /* (pool, memoryPool, off
     TexPool *tp = hnew(A0, K_TPOOL, sizeof *tp);
     tp->count = (int)A3 > 0 ? (int)A3 : 0; tp->mempool = A1; tp->offset = A2;
     tp->e = calloc((size_t)tp->count + 1, sizeof *tp->e);
-    AcquireSRWLockExclusive(&g_pool_lock);
+    plat_rw_wlock(&g_pool_lock);
     if (g_ntpools < 16) g_tpools[g_ntpools++] = tp;     /* where an agl release (tex_finalize) looks for its slot; SMO makes 1 */
-    ReleaseSRWLockExclusive(&g_pool_lock);
+    plat_rw_wunlock(&g_pool_lock);
     RET(1);
 }
 static void tpool_register(Ctx *c) {                   /* (pool, id, texture, view) */
@@ -4487,11 +4486,11 @@ static void tpool_register(Ctx *c) {                   /* (pool, id, texture, vi
     memset(&e, 0, sizeof e);
     e.tex = hobj(A2, K_TEX);
     if (A3) memcpy(&e.view, P(A3), sizeof e.view);
-    AcquireSRWLockExclusive(&g_pool_lock);
+    plat_rw_wlock(&g_pool_lock);
     pool_ent_release(&tp->e[(uint32_t)A1]);             /* registered over: the texture there before loses this entry */
     if (e.tex) { e.held = 1; e.tex->nslots++; e.tex->nregs++; }
     tp->e[(uint32_t)A1] = e;
-    ReleaseSRWLockExclusive(&g_pool_lock);
+    plat_rw_wunlock(&g_pool_lock);
     if (texlog_on() && e.tex) printf("texlog: register pool %llx slot %u <- %llx host %p %dx%d fmt 0x%x entries %d frame %lld (caller %llx)\n", (unsigned long long)A0, (unsigned)A1, (unsigned long long)A2, (void *)e.tex,
                                      e.tex->b.width, e.tex->b.height, e.tex->b.format, e.tex->nslots, (long long)g_st.frames, (unsigned long long)c->x[30]);
 }
@@ -4583,7 +4582,7 @@ static void cmd_end(Ctx *c) {
     CmdBuf *cb = cb_get(A0);
     cb->ctrl_used += 32; cb->rec_ctrl += 32;
     rec_close_piece(cb);
-    LONG64 seq = 0;
+    int64_t seq = 0;
     uint64_t h = list_register(cb->data, cb->len, (uint32_t)cb->rec_cmd, (uint32_t)cb->rec_ctrl, (uint32_t)cb->dispatches, cb, &seq);
     if (cb->rec_nblk >= 1 && cb->rec_nblk <= 4) {     /* older lists this one was written over are over (job_list_overwrite), after the queued submits */
         Overwrite w;
@@ -4737,13 +4736,13 @@ static void queue_submit(Ctx *c) {                      /* (queue, count, handle
     SubmitJob j = {(int)A1, P(A2)};
     QueueObj *q = hobj(A0, K_QUEUE);
     if (q && A2) {                              /* what the submitted commands took of the queue's memory (model: see rec; a dispatch's launch descriptor is 0x100 bytes) */
-        AcquireSRWLockShared(&g_list_lock);
+        plat_rw_rlock(&g_list_lock);
         for (int i = 0; i < j.count; i++) {
             uint64_t h = j.handles[i];
             uint32_t k = (uint32_t)h - 1;
-            if (h && k < (uint32_t)g_list_count && g_lists[k].data) { q->cmd_used += g_lists[k].model_cmd; q->control_used += g_lists[k].model_ctrl; q->compute_used += (LONG64)g_lists[k].dispatches * 0x100; }
+            if (h && k < (uint32_t)g_list_count && g_lists[k].data) { q->cmd_used += g_lists[k].model_cmd; q->control_used += g_lists[k].model_ctrl; q->compute_used += (int64_t)g_lists[k].dispatches * 0x100; }
         }
-        ReleaseSRWLockShared(&g_list_lock);
+        plat_rw_runlock(&g_list_lock);
     }
     if (j.count > 0 && A2) {
         if (gl_async_on() && j.count <= 4096) {
@@ -4778,10 +4777,10 @@ static void win_initialize(Ctx *c) {                    /* (window, builder) */
     RET(1);
 }
 static void win_acquire(Ctx *c) {                       /* (window, sync, int *textureIndex) -> 0 = success */
-    static volatile LONG next;
+    static volatile int32_t next;
     Window *w = hobj(A0, K_WIN);
-    if (A2) wr32(A2, (uint32_t)(InterlockedIncrement(&next) % (w && w->count ? (w->nactive ? w->nactive : w->count) : 2)));
-    InterlockedExchangePointer(&g_window_sync, A1 ? hobj(A1, K_SYNC) : NULL);        /* nvnSyncWait on it = wait for the refresh that frees the texture */
+    if (A2) wr32(A2, (uint32_t)(plat_inc(&next) % (w && w->count ? (w->nactive ? w->nactive : w->count) : 2)));
+    plat_xchg(&g_window_sync, A1 ? hobj(A1, K_SYNC) : NULL);        /* nvnSyncWait on it = wait for the refresh that frees the texture */
     display_clock_sample(A2);
     RET(0);
 }
@@ -4800,23 +4799,23 @@ static void win_set_crop(Ctx *c) { Window *w = hobj(A0, K_WIN); if (w) { w->crop
  * then measured 60.0 fps in each of 20 windows of 300 frames (1% lows 55.8 at the lowest), and busy scenes gain. */
 static HANDLE g_present_ev;
 static int g_present_out, g_present_sync = -1;
-static void job_present_signal(void *arg) { g_rb->present(arg); SetEvent(g_present_ev); }
-static volatile LONG64 g_presents_queued;              /* nvnQueuePresentTexture calls of the game: the frame it builds is this + 1 */
+static void job_present_signal(void *arg) { g_rb->present(arg); plat_event_set(g_present_ev); }
+static volatile int64_t g_presents_queued;              /* nvnQueuePresentTexture calls of the game: the frame it builds is this + 1 */
 long long nvn_front_presents_queued(void) { return g_presents_queued; }
 static void queue_present(Ctx *c) {                     /* (queue, window, textureIndex) */
-    InterlockedIncrement64(&g_presents_queued);
+    plat_inc(&g_presents_queued);
     PresentJob j = {hobj(A1, K_WIN), (int)A2};
     if (g_tl_on) nvn_tl(TL_PRESENT_CALL, 0);
-    g_pf_main_tid = GetCurrentThreadId();
+    g_pf_main_tid = plat_tid();
     display_before_present();
     if (g_present_sync < 0) g_present_sync = (getenv("SMO_PRESENT_ASYNC") && !atoi(getenv("SMO_PRESENT_ASYNC"))) || !gl_async_on();      /* async by default: the game draws the next frame while this one is replayed (New Donk City: 38-42 -> 44-54 fps); SMO_PRESENT_ASYNC=0: wait as before */
     if (g_present_sync) gl_run(g_rb->present, &j);
     else {
-        if (!g_present_ev) g_present_ev = CreateEventA(NULL, FALSE, FALSE, NULL);
+        if (!g_present_ev) g_present_ev = plat_event_new(0, 0);
         if (g_present_out) {                            /* the previous frame has been shown before this one is queued */
-            LONG64 pf0 = pf_now();
+            int64_t pf0 = pf_now();
             hitch_wait_render(1);
-            WaitForSingleObject(g_present_ev, INFINITE);
+            WaitForSingleObject(g_present_ev, PLAT_INFINITE);
             hitch_wait_render(0);
             pf_add(PF_WAIT_PRESENT_, pf0);
         }
@@ -4828,7 +4827,7 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
          * frame, until the menu is closed */
         int amiibo_menu_wanted(void); void amiibo_menu_run(void *present_job);
         if (amiibo_menu_wanted()) {
-            if (!g_present_sync && g_present_out) { WaitForSingleObject(g_present_ev, INFINITE); g_present_out = 0; }   /* this frame shown first */
+            if (!g_present_sync && g_present_out) { WaitForSingleObject(g_present_ev, PLAT_INFINITE); g_present_out = 0; }   /* this frame shown first */
             amiibo_menu_run(&j);
         }
     }
@@ -4845,30 +4844,30 @@ int nvn_menu_job(UiMenuJob *m) { if (!g_rb->menu) return 0; gl_run(g_rb->menu, m
 typedef struct LabelEnt { uint64_t key; char text[96]; struct LabelEnt *next; } LabelEnt;
 #define LABEL_N 65536                           /* (1024 buckets whose chains only grew: a finalized object left an empty entry) */
 static LabelEnt *g_labels[LABEL_N];
-static SRWLOCK g_label_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_label_lock = PLAT_RWLOCK_INIT;
 void nvn_label_set(uint64_t obj, const char *text) {
     unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
-    AcquireSRWLockExclusive(&g_label_lock);
+    plat_rw_wlock(&g_label_lock);
     LabelEnt *e = g_labels[h];
     while (e && e->key != obj) e = e->next;
     if (!e) { e = calloc(1, sizeof *e); e->key = obj; e->next = g_labels[h]; g_labels[h] = e; }
     snprintf(e->text, sizeof e->text, "%s", text ? text : "");
-    ReleaseSRWLockExclusive(&g_label_lock);
+    plat_rw_wunlock(&g_label_lock);
 }
 const char *nvn_label_get(uint64_t obj) {
     unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
     const char *r = "";
-    AcquireSRWLockShared(&g_label_lock);
+    plat_rw_rlock(&g_label_lock);
     for (LabelEnt *e = g_labels[h]; e; e = e->next) if (e->key == obj) r = e->text;
-    ReleaseSRWLockShared(&g_label_lock);
+    plat_rw_runlock(&g_label_lock);
     return r;
 }
 void nvn_label_drop(uint64_t obj) {                  /* the object is finalized: its entry goes */
     unsigned h = (unsigned)((obj >> 4) * 2654435761u) & (LABEL_N - 1);
-    AcquireSRWLockExclusive(&g_label_lock);
+    plat_rw_wlock(&g_label_lock);
     for (LabelEnt **pp = &g_labels[h]; *pp; pp = &(*pp)->next)
         if ((*pp)->key == obj) { LabelEnt *e = *pp; *pp = e->next; free(e); break; }
-    ReleaseSRWLockExclusive(&g_label_lock);
+    plat_rw_wunlock(&g_label_lock);
 }
 static void any_set_label(Ctx *c) {                     /* nvn<Object>SetDebugLabel(object, const char *label) */
     nvn_label_set(A0, A1 ? (const char *)P(A1) : "");
@@ -4882,11 +4881,11 @@ static void any_debug_id(Ctx *c) { RET(A0); }           /* nvn<Object>GetDebugID
 /* ---- device */
 static uint64_t g_nvn_device;
 static int g_device_flags;
-static LARGE_INTEGER g_qpf;
+static plat_counter g_qpf;
 static uint64_t now_ns(void) {
-    LARGE_INTEGER t;
-    if (!g_qpf.QuadPart) QueryPerformanceFrequency(&g_qpf);
-    QueryPerformanceCounter(&t);
+    plat_counter t;
+    if (!g_qpf.QuadPart) plat_qpf(&g_qpf);
+    plat_qpc(&t);
     return (uint64_t)(t.QuadPart / g_qpf.QuadPart) * 1000000000ull + (uint64_t)(t.QuadPart % g_qpf.QuadPart) * 1000000000ull / (uint64_t)g_qpf.QuadPart;
 }
 static void devb_defaults(Ctx *c) { memset(P(A0), 0, 0x40); }
@@ -4898,7 +4897,7 @@ static void dev_get_origin_mode(Ctx *c) { RET(g_origin_mode); }
 static void dev_get_depth_mode(Ctx *c) { RET(g_depth_mode); }
 static void dev_timestamp_now(Ctx *c) { RET(now_ns()); }
 static void dev_timestamp_of(Ctx *c) { RET(A1 ? rd64(A1 + 8) : 0); }      /* (device, const NVNcounterData *): counter timestamps are written in nanoseconds */
-static void dev_debug_domain(Ctx *c) { static volatile LONG next; RET(InterlockedIncrement(&next)); }
+static void dev_debug_domain(Ctx *c) { static volatile int32_t next; RET(plat_inc(&next)); }
 static void dev_separate_handle(Ctx *c) { RET((uint64_t)(int64_t)(int32_t)(uint32_t)A1 | 0x100000000ull); }   /* nvnDeviceGetSeparateTextureHandle [sdk 0x41bc60] */
 static void dev_separate_sampler_handle(Ctx *c) { RET((uint64_t)((int64_t)(int32_t)(uint32_t)A1 << 20)); }                 /* nvnDeviceGetSeparateSamplerHandle [sdk 0x41bc50]: sbfiz x0, x1, #20, #32 */
 static void dev_debugger_attached(Ctx *c) { RET(0); }   /* no external NVN debugger exists for this process: the true answer */
@@ -4916,7 +4915,7 @@ static void job_sync_drop(void *arg) { SyncObj *o = arg; if (o->s) glDeleteSync(
 static void sync_finalize(Ctx *c) {                     /* the small host record stays: a recorded FenceSync / WaitSync may still name it */
     SyncObj *o = hobj(A0, K_SYNC);
     if (!o) return;
-    InterlockedExchange(&o->dead, 1);
+    plat_xchg(&o->dead, 1);
     wr32(A0 + 8, 0);
     gl_run(g_rb->sync_drop, o);
 }
@@ -4977,7 +4976,7 @@ static void ev_finalize(Ctx *c) { wr64(A0 + 16, 0); }
 static void ev_get_value(Ctx *c) { uint64_t a = rd64(A0 + 16); RET(a ? rd32(a) : 0); }
 static void event_signal_at(uint64_t a, int mode, uint32_t value) {
     if (!a) return;
-    if (mode == 1) InterlockedExchangeAdd((volatile LONG *)P(a), (LONG)value); else InterlockedExchange((volatile LONG *)P(a), (LONG)value);
+    if (mode == 1) plat_xadd((volatile int32_t *)P(a), (int32_t)value); else plat_xchg((volatile int32_t *)P(a), (int32_t)value);
 }
 static void ev_signal(Ctx *c) { event_signal_at(rd64(A0 + 16), (int)A1, (uint32_t)A2); }      /* (event, mode, value) */
 
@@ -5118,9 +5117,9 @@ static void spool_finalize(Ctx *c) {
     gl_barrier();
     SamplerPool *sp = hobj(A0, K_SPOOL);
     if (!sp) return;
-    AcquireSRWLockExclusive(&g_pool_lock);
+    plat_rw_wlock(&g_pool_lock);
     sp->count = 0;                                      /* the record itself stays: recorded SetSamplerPool commands may still name it */
-    ReleaseSRWLockExclusive(&g_pool_lock);
+    plat_rw_wunlock(&g_pool_lock);
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
 }
@@ -5240,10 +5239,10 @@ static void tpool_finalize(Ctx *c) {
     gl_barrier();
     TexPool *tp = hobj(A0, K_TPOOL);
     if (!tp) return;
-    AcquireSRWLockExclusive(&g_pool_lock);
+    plat_rw_wlock(&g_pool_lock);
     for (int i = 0; i < tp->count; i++) pool_ent_release(&tp->e[i]);
     tp->count = 0;                                      /* the record itself stays: recorded SetTexturePool commands may still name it */
-    ReleaseSRWLockExclusive(&g_pool_lock);
+    plat_rw_wunlock(&g_pool_lock);
     wr32(A0 + 8, 0);
     nvn_label_drop(A0);
 }
@@ -5390,9 +5389,9 @@ static void cmd_set_label(Ctx *c) { cb_get(A0); any_set_label(c); }
 static void job_finalize_handle(void *arg) {
     uint64_t h = *(uint64_t *)arg;
     uint32_t i = (uint32_t)h - 1;
-    AcquireSRWLockExclusive(&g_list_lock);
+    plat_rw_wlock(&g_list_lock);
     if (h && i < (uint32_t)g_list_count && g_lists[i].data && (g_lists[i].gen & 0x7fffffff) == (uint32_t)(h >> 32)) g_lists[i].finalized = 1;
-    ReleaseSRWLockExclusive(&g_list_lock);
+    plat_rw_wunlock(&g_list_lock);
 }
 static void dev_finalize_command_handle(Ctx *c) {       /* (device, handle): the recorded commands of that handle are released (by the render thread, at the next present) */
     uint64_t h = A1;
@@ -5415,23 +5414,23 @@ const RBackend rb_gl = {"gl", job_submit, job_submit_async, job_present, job_fen
 int nvn_front_fmt(int nvn_format, Fmt *f) { return fmt_get(nvn_format, f); }
 uint8_t *nvn_front_list(uint64_t handle, size_t *len) { return list_lookup(handle, len); }
 /* debug aid: why a command handle has no list */
-void nvn_front_list_stale(void) { InterlockedIncrement64(&g_st.stale); }      /* the Vulkan back end met an unknown handle */
+void nvn_front_list_stale(void) { plat_inc(&g_st.stale); }      /* the Vulkan back end met an unknown handle */
 const char *nvn_front_list_why(uint64_t h) {
     static char b[160];
     uint32_t i = (uint32_t)h - 1;
-    AcquireSRWLockShared(&g_list_lock);
+    plat_rw_rlock(&g_list_lock);
     if (!h || i >= (uint32_t)g_list_count) snprintf(b, sizeof b, "index %u never registered (%d lists)", i, g_list_count);
     else if ((g_lists[i].gen & 0x7fffffff) != (uint32_t)(h >> 32)) snprintf(b, sizeof b, "slot %u reused (handle generation %u, slot now %u, %s)", i, (uint32_t)(h >> 32), g_lists[i].gen & 0x7fffffff, g_lists[i].data ? "holding another list" : "empty");
     else snprintf(b, sizeof b, "slot %u dropped (finalized %d, created frame %lld, last used %lld, now %lld)", i, g_lists[i].finalized, (long long)g_lists[i].created, (long long)g_lists[i].used, (long long)g_st.frames);
-    ReleaseSRWLockShared(&g_list_lock);
+    plat_rw_runlock(&g_list_lock);
     return b;
 }
 /* step-aligned comparison of the two renderers: with SMO_SHOT_STEPS=1 the scripted input (nnhid.c)
  * asks for a screenshot when a key step of SMO_SEQ begins; the next presented frame is saved as step_<n>.bmp in
  * SMO_SHOT_DIR by whichever back end runs. Counted in input polls, so both renderers save the same game frame. */
-static volatile LONG g_step_shot;
-void nvn_front_shot_step(int step) { static int on = -1; if (on < 0) on = getenv("SMO_SHOT_STEPS") != NULL; if (on) InterlockedExchange(&g_step_shot, step + 1); }
-int nvn_front_take_step_shot(void) { return g_step_shot ? (int)InterlockedExchange(&g_step_shot, 0) : 0; }
+static volatile int32_t g_step_shot;
+void nvn_front_shot_step(int step) { static int on = -1; if (on < 0) on = getenv("SMO_SHOT_STEPS") != NULL; if (on) plat_xchg(&g_step_shot, step + 1); }
+int nvn_front_take_step_shot(void) { return g_step_shot ? (int)plat_xchg(&g_step_shot, 0) : 0; }
 void nvn_front_batch_begin(void) { g_serial++; }
 void nvn_front_barrier_texmem(void) { g_serial++; }
 int nvn_front_tex_layers(const Tex *t) { return tex_layers(&t->b); }
@@ -5463,7 +5462,7 @@ int nvn_front_tex_changed(Tex *t) {
     static int hash_all = -1;
     if (hash_all < 0) hash_all = getenv("SMO_TEXHASH_ALL") && atoi(getenv("SMO_TEXHASH_ALL"));
     if (!hash_all && t->uploaded && !t->dirty && (t->pool_flags & 1 || (t->pool_flags & 6) == 4)) { g_th_skip++; return 0; }
-    LONG64 pf0 = pf_now();
+    int64_t pf0 = pf_now();
     uint64_t newest = ww_newest(src, t->data_size);
     if (newest) {
         if (t->uploaded && !t->dirty && t->ww_hashed && newest <= t->ww_seen) { g_ww_clean++; pf_add(PF_TEXHASH, pf0); return 0; }
@@ -5473,9 +5472,9 @@ int nvn_front_tex_changed(Tex *t) {
     int why = !t->uploaded ? 0 : t->dirty ? 1 : newest ? 2 : 3;      /* nvn_texhash line: first look, flushed by the game, pages written, memory not watched */
     uint64_t h = mem_hash(src, t->data_size, newest != 0 || (t->b.flags & 0x10) != 0);
     int same = t->uploaded && !t->dirty && h == t->hash && (!newest || t->ww_hashed);
-    g_th_n[why]++; g_th_bytes[why] += (LONG64)t->data_size; if (t->uploaded && h == t->hash) g_th_same[why]++;
+    g_th_n[why]++; g_th_bytes[why] += (int64_t)t->data_size; if (t->uploaded && h == t->hash) g_th_same[why]++;
     t->ww_hashed = newest != 0;
-    pf_add(PF_TEXHASH, pf0); g_pf_hash_bytes += (LONG64)t->data_size;
+    pf_add(PF_TEXHASH, pf0); g_pf_hash_bytes += (int64_t)t->data_size;
     if (same) return 0;
     t->hash = h; t->uploaded = 1; t->dirty = 0;
     g_st.tex_uploads++;
@@ -5510,7 +5509,7 @@ int nvn_front_tex_read(Tex *t, int decode, nvn_front_put_fn *put) {
                 tex_decode_rgba8(b->format, tmp, L.lvl_w[l], L.lvl_h[l], tmp + lin);
                 put(t, l, layer, L.lvl_w[l], L.lvl_h[l], 1, tmp + lin, (size_t)L.lvl_w[l] * L.lvl_h[l] * 4, 1, 0);
             } else put(t, l, layer, L.lvl_w[l], L.lvl_h[l], L.lvl_d[l], tmp, lin, 0, 0);
-            g_st.tex_bytes += (LONG64)lin;
+            g_st.tex_bytes += (int64_t)lin;
         }
     }
     return 1;
@@ -5520,10 +5519,10 @@ int nvn_front_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v
     int r = 0;
     *t = NULL;
     if (!nh || !tp) return 0;
-    AcquireSRWLockShared(&g_pool_lock);
+    plat_rw_rlock(&g_pool_lock);
     if (tid < (uint32_t)tp->count) { *t = tp->e[tid].tex; *v = tp->e[tid].view; }
     if (sp && sid < (uint32_t)sp->count && sp->used[sid]) { *p = sp->e[sid]; r |= 2; }
-    ReleaseSRWLockShared(&g_pool_lock);
+    plat_rw_runlock(&g_pool_lock);
     if (*t && !(*t)->dead) r |= 1; else *t = NULL;
     return r;
 }
@@ -5533,10 +5532,10 @@ const char *nvn_front_handle_why(TexPool *tp, uint64_t nh) {
     uint32_t tid = (uint32_t)nh & 0xfffff;
     Tex *t = NULL;
     if (!tp) return "no texture pool bound";
-    AcquireSRWLockShared(&g_pool_lock);
+    plat_rw_rlock(&g_pool_lock);
     int count = tp->count;
     if (tid < (uint32_t)count) t = tp->e[tid].tex;
-    ReleaseSRWLockShared(&g_pool_lock);
+    plat_rw_runlock(&g_pool_lock);
     if (tid >= (uint32_t)count) { snprintf(b, sizeof b, "slot %u outside the pool (%d slots%s)", tid, count, count ? "" : ": pool finalized"); return b; }
     if (!t) { snprintf(b, sizeof b, "slot %u never registered", tid); return b; }
     Tex *now = t->guest ? hobj(t->guest, K_TEX) : NULL;
@@ -5563,7 +5562,7 @@ static uint64_t ccmp_hash(uint64_t h, const void *p, size_t n) {
     return h;
 }
 void nvn_front_ccmp_dispatch(const Range *ubo, const Range *ssbo, uint32_t written, const uint8_t *code, int code_len, unsigned gx, unsigned gy, unsigned gz) {
-    if (g_ccmp_on < 0) { g_ccmp_dir = getenv("SMO_COMPUTE_CMP"); g_ccmp_on = g_ccmp_dir != NULL; g_ccmp_left = getenv("SMO_COMPUTE_CMP_N") ? atoi(getenv("SMO_COMPUTE_CMP_N")) : 600; if (g_ccmp_on) CreateDirectoryA(g_ccmp_dir, NULL); }
+    if (g_ccmp_on < 0) { g_ccmp_dir = getenv("SMO_COMPUTE_CMP"); g_ccmp_on = g_ccmp_dir != NULL; g_ccmp_left = getenv("SMO_COMPUTE_CMP_N") ? atoi(getenv("SMO_COMPUTE_CMP_N")) : 600; if (g_ccmp_on) plat_mkdir(g_ccmp_dir); }
     if (!g_ccmp_on || g_ccmp_left <= 0 || !code || code_len <= 0) return;
     uint32_t g[3] = {gx, gy, gz};
     uint64_t h = ccmp_hash(0xcbf29ce484222325ULL, code, (size_t)code_len);
@@ -5595,7 +5594,7 @@ void nvn_front_ccmp_landed(void) {
     g_ccmp_npend = 0;
 }
 long long nvn_front_frame_end(long long draws, long long skipped, long long clears) {
-    LONG64 frame = g_st.frames + 1;
+    int64_t frame = g_st.frames + 1;
     pf_frame_mark(frame);
     g_joblog_cur = frame;
     g_st.frames = frame;
@@ -5603,10 +5602,10 @@ long long nvn_front_frame_end(long long draws, long long skipped, long long clea
     if (frame <= 3 || frame % 600 == 0 || draws != 0 && g_logn < 40 && (g_logn++, 1))
         printf("nvn_vk: frame %lld: %lld draws (%lld skipped), %lld clears | totals: %lld lists, %lld textures, %lld uploads (%lld MB)\n", (long long)frame, draws, skipped, clears,
                (long long)g_st.lists, (long long)g_st.tex_created, (long long)g_st.tex_uploads, (long long)(g_st.tex_bytes >> 20));
-    {   static ULONGLONG t0;
-        static LONG64 d0;
+    {   static uint64_t t0;
+        static int64_t d0;
         if (frame % 300 == 0) {
-            ULONGLONG now = GetTickCount64();
+            uint64_t now = plat_ms();
             if (t0 && now > t0) printf("nvn_vk: frames %lld..%lld: %.1f fps, %lld draws per frame\n", (long long)frame - 300, (long long)frame, 300000.0 / (double)(now - t0), (long long)(g_st.draws - d0) / 300);
             t0 = now; d0 = g_st.draws;
         }
@@ -5619,13 +5618,13 @@ long long nvn_front_frame_end(long long draws, long long skipped, long long clea
 }
 void nvn_front_take_dead(void (*drop)(int kind, void *host)) {
     if (!g_dead_n) return;
-    EnterCriticalSection(&g_dead_lock);
+    plat_lock(&g_dead_lock);
     for (int i = 0; i < g_dead_n; i++) {
         drop(g_dead[i].kind, g_dead[i].p);
         if (g_dead[i].kind == K_PROG) { Prog *p = g_dead[i].p; for (int s = 0; s < 6; s++) { free(p->st[s].text); memset(&p->st[s], 0, sizeof p->st[s]); } }
     }
     g_dead_n = 0;
-    LeaveCriticalSection(&g_dead_lock);
+    plat_unlock(&g_dead_lock);
 }
 void nvn_front_count(int what, long long n) {
     switch (what) { case 0: g_st.draws += n; break; case 1: g_st.draws_skipped += n; break; case 2: g_st.clears += n; break; case 3: g_st.submits += n; break; case 5: g_st.tex_created += n; break; }
@@ -5638,13 +5637,13 @@ static void job_vk_shutdown(void *arg) { (void)arg; nvn_vk_shutdown(); }
  * in a job at that moment is left alone (the process is ending) and that is said. */
 static void vk_shutdown_at_exit(void) {
     static Job j;
-    if (GetCurrentThreadId() == g_render_tid) { nvn_vk_shutdown(); return; }
-    j.fn = job_vk_shutdown; j.arg = NULL; j.next = NULL; j.done = CreateEventA(NULL, FALSE, FALSE, NULL);
-    EnterCriticalSection(&g_job_lock);
+    if (plat_tid() == g_render_tid) { nvn_vk_shutdown(); return; }
+    j.fn = job_vk_shutdown; j.arg = NULL; j.next = NULL; j.done = plat_event_new(0, 0);
+    plat_lock(&g_job_lock);
     if (g_job_tail) g_job_tail->next = &j; else g_job_head = &j;
     g_job_tail = &j;
-    LeaveCriticalSection(&g_job_lock);
-    SetEvent(g_job_event);
+    plat_unlock(&g_job_lock);
+    plat_event_set(g_job_event);
     if (WaitForSingleObject(j.done, 3000) != WAIT_OBJECT_0) { printf("nvn_vk: shutdown NOT run: the render thread did not take the job within 3 s\n"); fflush(stdout); }
 }
 
@@ -5652,7 +5651,7 @@ static void vk_shutdown_at_exit(void) {
 Tex *nvn_front_tex_first(void) { return g_all_tex; }
 void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
     if (!size) return;
-    AcquireSRWLockShared(&g_tp_lock);
+    plat_rw_rlock(&g_tp_lock);
     if (g_tp_cap)
         for (uint64_t pg = addr >> TP_SHIFT, last = (addr + size - 1) >> TP_SHIFT; pg <= last; pg++) {
             const TexPage *p = tp_find(pg);
@@ -5661,7 +5660,7 @@ void nvn_gl_memory_written(uint64_t addr, uint64_t size) {
                 if (!t->dead && (uint64_t)(uintptr_t)t->mem < addr + size && addr < (uint64_t)(uintptr_t)t->mem + t->storage) t->dirty = 1;
             }
         }
-    ReleaseSRWLockShared(&g_tp_lock);
+    plat_rw_runlock(&g_tp_lock);
 }
 
 static const struct { const char *name; ImportFn fn; } k_nvn[] = {

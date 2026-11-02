@@ -30,7 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "smo_ui.h"
 
 void nfp_place_amiibo(const uint8_t *id);                 /* nnapplet.c */
@@ -65,7 +65,7 @@ static struct {
     UiImage bg, frame;
     int sel, top;
 } M;
-static volatile LONG g_request;
+static volatile int32_t g_request;
 
 #define VIS 7                                             /* rows shown */
 #define ROW_STEP 54.0f
@@ -323,9 +323,9 @@ static void menu_draw(void) {
 }
 
 /* ---------------------------------------------------------------- the menu */
-void amiibo_menu_request(void) { InterlockedExchange(&g_request, 1); }
+void amiibo_menu_request(void) { plat_xchg(&g_request, 1); }
 int amiibo_menu_wanted(void) { return g_request != 0; }
-int amiibo_menu_take_request(void) { return InterlockedExchange(&g_request, 0) != 0; }      /* tests: asked for since the last call */
+int amiibo_menu_take_request(void) { return plat_xchg(&g_request, 0) != 0; }      /* tests: asked for since the last call */
 
 static void keep_visible(void) {                          /* the chosen row at least two rows from the edges of the window, but at the ends */
     if (M.sel < 0) M.sel = 0;
@@ -367,9 +367,9 @@ static void save_shot(int opening, int k) {
 
 /* nvn_gl.c queue_present, the game's main thread, after a presented frame: the menu, until it is closed. pj = that frame. */
 void amiibo_menu_run(void *pj) {
-    InterlockedExchange(&g_request, 0);
-    LARGE_INTEGER t0, t1, fq;
-    QueryPerformanceCounter(&t0);
+    plat_xchg(&g_request, 0);
+    plat_counter t0, t1, fq;
+    plat_qpc(&t0);
     UiMenuJob job;
     memset(&job, 0, sizeof job);
     job.present = pj;
@@ -383,7 +383,7 @@ void amiibo_menu_run(void *pj) {
     keep_visible();
     display_menu_hold(1);
     menu_draw();
-    QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&fq);
+    plat_qpc(&t1); plat_qpf(&fq);
     printf("amiibo menu: open at frame %lld (%.0f ms from the request to the first picture)\n", nvn_front_frame_next(), (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart);
     uint64_t prev = hid_menu_buttons();                    /* what is held when it opens counts only once let go */
     hid_menu_key(0); hid_menu_key(1);
@@ -409,7 +409,7 @@ void amiibo_menu_run(void *pj) {
             if (M.sel != old) changed = dirty = 1;
         }
         if (press & BIT(B_A) || hid_menu_key(1)) { picked = M.sel; break; }
-        if (press & BIT(B_B) || hid_menu_key(0) || g_request) { InterlockedExchange(&g_request, 0); break; }
+        if (press & BIT(B_B) || hid_menu_key(0) || g_request) { plat_xchg(&g_request, 0); break; }
         if (dirty) { menu_draw(); dirty = 0; }
         if (changed && shots_left > 0) save_shot(opened, 3 - shots_left--);
         job.op = UI_MENU_SHOW; job.rgba = M.frame.px; job.w = M.frame.w; job.h = M.frame.h; job.changed = changed;

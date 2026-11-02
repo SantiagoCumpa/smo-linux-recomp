@@ -6,7 +6,7 @@
 #define NVN_FRONT_H
 #include <stdio.h>
 #include <stdint.h>
-#include <windows.h>
+#include "plat.h"
 #include <GL/gl.h>
 #include "mx_translate.h"
 
@@ -34,7 +34,7 @@ typedef struct { int target, format, lvl0, nlvl, lay0, nlay, dsmode; uint8_t swz
 typedef struct VNode { EView e; TexObj o; struct VNode *next; } VNode;
 typedef struct Tex {
     TexBuilder b;
-    volatile LONG dead;
+    volatile int32_t dead;
     uint8_t *mem, *limit;                  /* storage in the memory pool and the end of that pool */
     uint64_t guest;                        /* the NVNtexture */
     size_t storage, data_size;
@@ -49,7 +49,7 @@ typedef struct Tex {
     void *vk;                              /* the Vulkan back end's record of this texture (nvn_vk_draw.c: VTex), NULL until first used */
     long long ahead_seen;                  /* nvn_vk_draw.c tex_ahead: 1 + the frame the render thread first saw this record; -1 = looked at, not taken */
     int nslots, nregs;                     /* texture pool entries naming it that agl has not released, and registrations in all (nvn_gl.c, above pool_ent_release) */
-    volatile LONG reclaim;                 /* 1 while the Vulkan back end holds it on its list of textures nothing names (nvn_front_take_unref) */
+    volatile int32_t reclaim;                 /* 1 while the Vulkan back end holds it on its list of textures nothing names (nvn_front_take_unref) */
     long long last_use;                    /* Vulkan back end: the frame it was last used in (vt_get2) */
     int image_freed;                       /* Vulkan back end: its image was freed because nothing named it (a later use makes the image again) */
 } Tex;
@@ -58,7 +58,7 @@ typedef struct { Tex *tex; View view; int held; } TexPoolEnt;      /* held: the 
 typedef struct { int count; TexPoolEnt *e; uint64_t mempool, offset; } TexPool;
 typedef struct { int count; SamplerParams *e; uint8_t *used; uint64_t mempool, offset; } SamplerPool;
 typedef struct { char *text; int len, state, nbuf; GLuint gl; uint8_t map[16]; uint32_t storage, storage_w, glsl_ssbo_w, local[3], smem_bytes, lmem_bytes, glsl_images, glsl_images_w, glsl_images_r; uint16_t glsl_img_key[8], glsl_img_fmt[8]; const uint8_t *code; int code_len, dumped, glsl_state, glsl_alpha; GLuint glsl; uint32_t glsl_cbufs, glsl_ssbos, glsl_dep, glsl_tex, glsl_key[4], ctl[8]; void *vk; } Stage;   /* state: 0 none, 1 text ready, 2 compiled, 3 rejected, 4 machine code only; vk: the Vulkan back end's last variant of this stage */
-typedef struct { Stage st[6]; int serial, sample_shading, label_dirty; volatile LONG dead; uint64_t guest; } Prog;
+typedef struct { Stage st[6]; int serial, sample_shading, label_dirty; volatile int32_t dead; uint64_t guest; } Prog;
 typedef struct { uint32_t op, size; uint64_t a[7]; } Cmd;                                                    /* a blob may follow */
 typedef struct {
     uint8_t *data; size_t len, cap;
@@ -72,7 +72,7 @@ typedef struct {
                                                               rec_nblk 5 = more than 4 pieces */
 } CmdBuf;
 typedef struct { int count, interval, nactive; Tex *tex[8]; int crop[4]; uint64_t native; } Window;
-typedef struct { void *s; volatile LONG dead; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows */
+typedef struct { void *s; volatile int32_t dead; } SyncObj;       /* s: GL sync object; Vulkan: the number of the submission the fence follows */
 
 /* ---------------------------------------------------------------- command lists */
 enum {
@@ -122,7 +122,7 @@ extern const RBackend *g_rb;
 /* where one nvnProgramSetShaders call spent its time, in performance-counter ticks, per calling thread:
  * 0 gl_barrier, 4 program_set (all), 5 hashing + job copy,
  * 6 waiting for the shader lock, 7 caller held for the workers. Printed by nvn_gl.c prog_set_shaders ("nvn_setsh:"). */
-extern __declspec(thread) long long nvn_setsh_part[8];
+extern _Thread_local long long nvn_setsh_part[8];
 void nvn_vk_program_set(void *prog);        /* Vulkan, GUEST thread, from nvnProgramSetShaders: the program's stages go to the workers (nvn_vk_pipelines.c) */
 
 /* ---------------------------------------------------------------- front-end services for the Vulkan back end (end of nvn_gl.c) */

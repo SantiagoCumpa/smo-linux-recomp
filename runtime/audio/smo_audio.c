@@ -28,7 +28,7 @@
  *       come next, so for now nothing is heard (the frames are processed and timed).
  * Lifted code reached from the frame thread stops with the name of anything it needs (sdklift_rt.c). */
 #include <stdio.h>
-#include <windows.h>
+#include "plat.h"
 #include "hostrt.h"
 #include "sdklift.h"
 
@@ -53,11 +53,11 @@ static void audio_manager_by_hipc(Ctx *c) {
 #define CLP_PROCESS "_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv"
 
 #define MAX_SYS 8
-static SRWLOCK g_sys_lock = SRWLOCK_INIT;
+static plat_rwlock_t g_sys_lock = PLAT_RWLOCK_INIT;
 static uint64_t g_sys[MAX_SYS];                 /* started AudioRenderSystem objects */
 static int g_nsys;
 static HANDLE g_frame_thread;
-static volatile LONG64 g_frames, g_lists, g_commands_bytes;
+static volatile int64_t g_frames, g_lists, g_commands_bytes;
 static uint8_t *g_proc[16];                     /* CommandListProcessor per session (host memory, zeroed) */
 
 static ImportFn lifted(const char *name) {
@@ -67,7 +67,7 @@ static ImportFn lifted(const char *name) {
 }
 static uint64_t call1(Ctx *c, ImportFn f, uint64_t a0) { c->x[0] = a0; c->x[30] = 0; f(c); return c->x[0]; }
 
-static DWORD WINAPI frame_thread(LPVOID arg) {
+static uint32_t frame_thread(void * arg) {
     (void)arg;
     static Ctx c;                                /* one frame thread: its own guest context, stack and thread block */
     uint8_t *stack = VirtualAlloc(NULL, 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
@@ -78,10 +78,10 @@ static DWORD WINAPI frame_thread(LPVOID arg) {
     wr64(c.tpidr + 0x1f8, (uint64_t)(uintptr_t)thread_type);   /* Horizon thread block: ThreadType pointer at +0x1f8 */
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     ImportFn send = lifted(RS_SEND), rate = lifted(RS_RATE), count = lifted(RS_COUNT);
-    LARGE_INTEGER fq, t0, now;
-    QueryPerformanceFrequency(&fq);
-    QueryPerformanceCounter(&t0);
-    /* The wait for the next frame boundary sleeps on a high-resolution timer. It used to Sleep(1) until 2 ms before the
+    plat_counter fq, t0, now;
+    plat_qpf(&fq);
+    plat_qpc(&t0);
+    /* The wait for the next frame boundary sleeps on a high-resolution timer. It used to plat_sleep_ms(1) until 2 ms before the
      * boundary and then call SwitchToThread in a loop: 2 of every 5 ms busy on a time-critical thread (69% of a core in
      * all, measured), taken from the game's threads when the PC is busy. The output has 120 ms queued, so a frame a
      * fraction of a millisecond late changes nothing; the schedule stays on the performance counter. */
@@ -91,33 +91,33 @@ static DWORD WINAPI frame_thread(LPVOID arg) {
     for (;;) {
         uint64_t sys[MAX_SYS];
         int n;
-        AcquireSRWLockShared(&g_sys_lock);
+        plat_rw_rlock(&g_sys_lock);
         n = g_nsys;
         memcpy(sys, g_sys, sizeof sys);
-        ReleaseSRWLockShared(&g_sys_lock);
+        plat_rw_runlock(&g_sys_lock);
         if (n && period == 0) {
             uint32_t r = (uint32_t)call1(&c, rate, sys[0]), k = (uint32_t)call1(&c, count, sys[0]);
             period = r ? (double)k / r : 0.005;
             printf("smo_audio: rendering clock: %u samples at %u Hz = %.3f ms per frame\n", k, r, period * 1000.0);
         }
         for (int i = 0; i < n; i++) call1(&c, send, sys[i]);
-        if (n) InterlockedIncrement64(&g_frames);
+        if (n) plat_inc(&g_frames);
         /* the next frame boundary, on the performance counter (no drift); after a stall of more than 10 frames the
          * schedule restarts from now instead of rendering the missed frames in a burst */
         double p = period ? period : 0.005;
         long long frame = ++tick;
         for (;;) {
-            QueryPerformanceCounter(&now);
+            plat_qpc(&now);
             double t = (double)(now.QuadPart - t0.QuadPart) / (double)fq.QuadPart;
             double due = frame * p;
             if (!n || t >= due) { if (t > due + 10 * p) { t0 = now; tick = 0; } break; }
             double left = due - t;
-            LARGE_INTEGER rel;
-            rel.QuadPart = -(LONGLONG)(left * 1e7) - 1;              /* relative, 100 ns units */
-            if (timer && SetWaitableTimer(timer, &rel, 0, NULL, NULL, FALSE)) WaitForSingleObject(timer, 100);
-            else if (left > 0.002) Sleep(1); else SwitchToThread();
+            plat_counter rel;
+            rel.QuadPart = -(int64_t)(left * 1e7) - 1;              /* relative, 100 ns units */
+            if (timer && SetWaitableTimer(timer, &rel, 0, NULL, NULL, 0)) WaitForSingleObject(timer, 100);
+            else if (left > 0.002) plat_sleep_ms(1); else plat_yield();
         }
-        if (!n) Sleep(1);
+        if (!n) plat_sleep_ms(1);
     }
     return 0;
 }
@@ -127,11 +127,11 @@ static void rs_Start(Ctx *c) {
     if (!start) start = lifted(RS_START);
     uint64_t sys = c->x[0];
     start(c);
-    AcquireSRWLockExclusive(&g_sys_lock);
+    plat_rw_wlock(&g_sys_lock);
     int known = 0;
     for (int i = 0; i < g_nsys; i++) known |= g_sys[i] == sys;
     if (!known && g_nsys < MAX_SYS) g_sys[g_nsys++] = sys;
-    ReleaseSRWLockExclusive(&g_sys_lock);
+    plat_rw_wunlock(&g_sys_lock);
     printf("smo_audio: renderer %llx started (%d running)\n", (unsigned long long)sys, g_nsys);
     if (!g_frame_thread) g_frame_thread = CreateThread(NULL, 1 << 20, frame_thread, NULL, 0, NULL);
 }
@@ -139,9 +139,9 @@ static void rs_Stop(Ctx *c) {
     static ImportFn stop;
     if (!stop) stop = lifted(RS_STOP);
     uint64_t sys = c->x[0];
-    AcquireSRWLockExclusive(&g_sys_lock);
+    plat_rw_wlock(&g_sys_lock);
     for (int i = 0; i < g_nsys; i++) if (g_sys[i] == sys) { g_sys[i] = g_sys[--g_nsys]; break; }
-    ReleaseSRWLockExclusive(&g_sys_lock);
+    plat_rw_wunlock(&g_sys_lock);
     stop(c);
 }
 /* ---- THE SOUND: the device sink's channels go to the PC through waveOut (48 kHz, 16-bit, stereo).
@@ -151,7 +151,6 @@ static void rs_Stop(Ctx *c) {
  * samples, buffer i at GetMixBuffers() + i * sample count; the device takes them as 16-bit (clamped). Frames of 5 ms are
  * gathered into blocks of 40 ms; 16 blocks in flight at most (the oldest pending audio is dropped and counted if the
  * device falls behind; a block the device finished before the next one was ready is counted as an underrun). */
-#include <mmsystem.h>
 static float g_dev_volume[3];                    /* defined with its values below (the device layer) */
 #define SINK_BLOCK 1920                           /* frames per waveOut block (40 ms at 48 kHz) */
 #define SINK_NBLK 16
@@ -159,7 +158,7 @@ static HWAVEOUT g_wo;
 static WAVEHDR g_wh[SINK_NBLK];
 static int16_t g_wbuf[SINK_NBLK][SINK_BLOCK * 2];
 static int g_wcur, g_wfill, g_wopen = -1, g_wstarted;
-static LONG64 g_sink_frames, g_sink_blocks, g_sink_dropped, g_sink_underruns;
+static int64_t g_sink_frames, g_sink_blocks, g_sink_dropped, g_sink_underruns;
 static uint32_t g_sink_peak;
 static FILE *g_wav;                               /* SMO_AUDIO_WAV=<file>: what goes to the device, as a WAV file (header completed at exit) */
 static uint32_t g_wav_frames;
@@ -177,7 +176,7 @@ static void sink_open(void) {
     if (getenv("SMO_AUDIO_WAV")) { g_wav = fopen(getenv("SMO_AUDIO_WAV"), "wb"); if (g_wav) wav_header(); }
     WAVEFORMATEX f = {WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0};
     if (getenv("SMO_AUDIO") && !atoi(getenv("SMO_AUDIO"))) { g_wopen = 0; printf("smo_audio: sound output off (SMO_AUDIO=0)\n"); return; }
-    MMRESULT r = waveOutOpen(&g_wo, WAVE_MAPPER, &f, 0, 0, CALLBACK_NULL);
+    MMRESULT r = waveOutOpen(&g_wo, WAVE_MAPPER, &f, 0, 0, _NULL);
     g_wopen = r == MMSYSERR_NOERROR;
     printf("smo_audio: sound output: %s\n", g_wopen ? "waveOut, 48000 Hz, 16-bit stereo, 40 ms blocks" : "waveOutOpen FAILED: no sound");
     if (g_wopen) {
@@ -185,13 +184,13 @@ static void sink_open(void) {
         /* Test copies are silent, as nnaudio.c's AudioOut: only the copies a person plays (smo_native.exe, smo_user.exe)
          * are audible. The device stays open and is fed as with sound, so the timing, the dropped-sample and underrun
          * counts and an SMO_AUDIO_WAV capture are the same. SMO_VOLUME=<0..100> overrides either way. */
-        char exe[MAX_PATH] = "";
-        GetModuleFileNameA(NULL, exe, sizeof exe);
+        char exe[PATH_MAX] = "";
+        snprintf(exe, sizeof exe, "%s", plat_exe_path());
         const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SMO_VOLUME");
-        int percent = vol ? atoi(vol) : (!_stricmp(base, "smo_native.exe") || !_stricmp(base, "smo_user.exe")) ? 100 : 0;
+        int percent = vol ? atoi(vol) : (!strcasecmp(base, "smo_native.exe") || !strcasecmp(base, "smo_user.exe")) ? 100 : 0;
         if (percent < 0) percent = 0;
         if (percent > 100) percent = 100;
-        DWORD level = (DWORD)(0xffff * percent / 100);
+        uint32_t level = (uint32_t)(0xffff * percent / 100);
         waveOutSetVolume(g_wo, level | level << 16);
         printf("smo_audio: host volume %d%%%s\n", percent, percent ? "" : " (test copy: silent; SMO_VOLUME=<0..100> to change)");
     }
@@ -200,7 +199,7 @@ static void sink_submit(void) {                   /* the block g_wcur is full */
     WAVEHDR *h = &g_wh[g_wcur];
     if (h->dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(g_wo, h, sizeof *h);
     memset(h, 0, sizeof *h);
-    h->lpData = (LPSTR)g_wbuf[g_wcur]; h->dwBufferLength = SINK_BLOCK * 4;
+    h->lpData = (char *)g_wbuf[g_wcur]; h->dwBufferLength = SINK_BLOCK * 4;
     waveOutPrepareHeader(g_wo, h, sizeof *h);
     waveOutWrite(g_wo, h, sizeof *h);
     g_sink_blocks++;
@@ -354,8 +353,8 @@ static void dsp_SendCommandBuffer(Ctx *c) {
         }
     }
     c->x[30] = lr;
-    InterlockedIncrement64(&g_lists);
-    InterlockedAdd64(&g_commands_bytes, (LONG64)size);
+    plat_inc(&g_lists);
+    plat_add(&g_commands_bytes, (int64_t)size);
 }
 
 /* ---- the audio DEVICE layer: nn::audio::server::detail::* are stubs in the application SDK [sdk 0x193d94 ..

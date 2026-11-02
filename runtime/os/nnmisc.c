@@ -12,9 +12,7 @@
  * (below). */
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
-#include <windows.h>
-#include <wincrypt.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"
@@ -108,7 +106,7 @@ static void diag_UnexpectedDefault(Ctx *c) {              /* (function, file, li
 }
 
 /* ---------------------------------------------------------------- nn::oe */
-static LARGE_INTEGER g_start;
+static plat_counter g_start;
 /* Notification messages. On the console the system posts a message when the application's focus state changes
  * (HOME menu, an overlay), when the console is docked or undocked, and when it asks the application to exit; the
  * application reads them with TryPopNotificationMessage and may wait on the event GetNotificationMessageEvent
@@ -133,16 +131,16 @@ static uint32_t g_oe_queue[16];
 static int g_oe_count, g_oe_event_ready, g_oe_focus_state = 1, g_oe_focus_mode = 0, g_oe_was_foreground;
 static int g_oe_opmode_notify, g_oe_resume_notify, g_oe_focus_pending, g_oe_focus_recheck;
 static HWND g_oe_window;
-static CRITICAL_SECTION g_oe_lock;
+static plat_lock_t g_oe_lock;
 static void oe_event_setup(void) {
     if (!g_oe_event_ready) { os_init_event((uint64_t)(uintptr_t)g_oe_event, 0); g_oe_event_ready = 1; }
 }
 static void oe_push(uint32_t message) {
-    EnterCriticalSection(&g_oe_lock);
+    plat_lock(&g_oe_lock);
     oe_event_setup();
     if (g_oe_count < 16) g_oe_queue[g_oe_count++] = message;
     os_signal_event((uint64_t)(uintptr_t)g_oe_event);
-    LeaveCriticalSection(&g_oe_lock);
+    plat_unlock(&g_oe_lock);
 }
 /* Suspension. The applet manager suspends the application's process while it is not runnable (suyu am/applet.cpp
  * UpdateSuspensionStateLocked, am/lifecycle_manager.cpp IsRunnable): in the background unless the handling mode is NoSuspend,
@@ -155,31 +153,31 @@ static void oe_push(uint32_t message) {
  * SMO_FOCUS_TEST=<start s>,<seconds> (test): from <start> the window counts as not active (another program has the focus) for
  * <seconds>, then it is minimised for <seconds> and restored; the log says how often the game's main loop polled its messages
  * in each period (once per frame while the game runs). */
-extern volatile LONG g_guest_frozen;
-static volatile LONG g_oe_poll_count;
+extern volatile int32_t g_guest_frozen;
+static volatile int32_t g_oe_poll_count;
 static int g_oe_exit_requested;                           /* defined with the exit request code below */
 #define OE_MSG_RESUME 16u
-static BOOL CALLBACK oe_find_window(HWND w, LPARAM out) {
-    DWORD pid = 0;
-    if (GetWindowThreadProcessId(w, &pid) && pid == GetCurrentProcessId() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return FALSE; }
-    return TRUE;
+static int oe_find_window(HWND w, LPARAM out) {
+    uint32_t pid = 0;
+    if (GetWindowThreadProcessId(w, &pid) && pid == getpid() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return 0; }
+    return 1;
 }
-static DWORD WINAPI oe_watch(LPVOID pause) {
+static uint32_t oe_watch(void * pause) {
     static const char *const k_test_state[] = {"", "not active (another program has the focus)", "minimised"};
     const char *test = getenv("SMO_FOCUS_TEST");
     double t_start = 0, t_len = 0;
     int test_phase = 0;                                   /* 1 not active, 2 minimised, 3 over */
-    ULONGLONG t0 = GetTickCount64(), frozen_at = 0, phase_at = 0;
-    LONG polls_at = 0, phase_polls = 0;
+    uint64_t t0 = plat_ms(), frozen_at = 0, phase_at = 0;
+    int32_t polls_at = 0, phase_polls = 0;
     if (test) sscanf(test, "%lf,%lf", &t_start, &t_len);
     for (;;) {
-        Sleep(20);
-        double t = (double)(GetTickCount64() - t0) / 1000.0;
+        plat_sleep_ms(20);
+        double t = (double)(plat_ms() - t0) / 1000.0;
         if (test && test_phase < 3 && t >= t_start + test_phase * t_len) {
             HWND w = NULL;
             if (test_phase > 0)
                 printf("nn::oe: focus test: %s for %llu ms: the game's main loop polled %ld times\n", k_test_state[test_phase],
-                       (unsigned long long)(GetTickCount64() - phase_at), (long)(g_oe_poll_count - phase_polls));
+                       (unsigned long long)(plat_ms() - phase_at), (long)(g_oe_poll_count - phase_polls));
             if (test_phase == 1) EnumWindows(oe_find_window, (LPARAM)&w);
             if (test_phase == 0) g_oe_was_foreground = 1;  /* never the foreground window, so from now on another program has the focus */
             else if (test_phase == 1 && w) { g_oe_window = w; ShowWindow(w, SW_SHOWMINNOACTIVE); }
@@ -190,48 +188,48 @@ static DWORD WINAPI oe_watch(LPVOID pause) {
                 test_phase = 2;
             }
             test_phase++;
-            phase_at = GetTickCount64(); phase_polls = g_oe_poll_count;
+            phase_at = plat_ms(); phase_polls = g_oe_poll_count;
             if (test_phase < 3) printf("nn::oe: focus test: the window is %s (unfocused = %s, handling mode %d)\n", k_test_state[test_phase], pause ? "pause" : "run", g_oe_focus_mode);
             fflush(stdout);
         }
-        DWORD pid = 0;
+        uint32_t pid = 0;
         HWND fg = GetForegroundWindow();
         int testing = test_phase == 1 || test_phase == 2;   /* the test's state of the window wins over the real foreground */
-        int ours = !testing && fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+        int ours = !testing && fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid();
         if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
         int minimised = g_oe_window && IsIconic(g_oe_window);
         int runnable = !pause || !g_oe_was_foreground || ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
-            frozen_at = GetTickCount64(); polls_at = g_oe_poll_count;
-            InterlockedExchange(&g_guest_frozen, 1);
+            frozen_at = plat_ms(); polls_at = g_oe_poll_count;
+            plat_xchg(&g_guest_frozen, 1);
             trace_printf("     nn::oe: application suspended (%s, handling mode %d)\n", minimised ? "background" : "obscured", g_oe_focus_mode);
         } else if (runnable && g_guest_frozen) {
-            LONG polls = g_oe_poll_count - polls_at;
-            InterlockedExchange(&g_guest_frozen, 0);
-            printf("nn::oe: application resumed after %llu ms of suspension; main-loop polls during it: %ld\n", (unsigned long long)(GetTickCount64() - frozen_at), (long)polls);
+            int32_t polls = g_oe_poll_count - polls_at;
+            plat_xchg(&g_guest_frozen, 0);
+            printf("nn::oe: application resumed after %llu ms of suspension; main-loop polls during it: %ld\n", (unsigned long long)(plat_ms() - frozen_at), (long)polls);
             fflush(stdout);
-            trace_printf("     nn::oe: application resumed after %llu ms\n", (unsigned long long)(GetTickCount64() - frozen_at));
+            trace_printf("     nn::oe: application resumed after %llu ms\n", (unsigned long long)(plat_ms() - frozen_at));
         }
     }
     return 0;
 }
 static void oe_track_focus(void) {
     static int enabled = -1;
-    static ULONGLONG last;
-    static volatile LONG watcher;
-    ULONGLONG now = GetTickCount64();
+    static uint64_t last;
+    static volatile int32_t watcher;
+    uint64_t now = plat_ms();
     if (enabled < 0) { const char *e = getenv("SMO_FOCUS_NOTIFY"); enabled = !(e && e[0] == '0'); }
-    if (enabled && InterlockedCompareExchange(&watcher, 1, 0) == 0) {     /* the watcher: only to pause the game, or for the test */
+    if (enabled && plat_cas(&watcher, 1, 0) == 0) {     /* the watcher: only to pause the game, or for the test */
         int pause = gfx_options()->pause_unfocused;
-        if (pause || getenv("SMO_FOCUS_TEST")) CloseHandle(CreateThread(NULL, 0, oe_watch, (LPVOID)(intptr_t)pause, 0, NULL));
+        if (pause || getenv("SMO_FOCUS_TEST")) CloseHandle(CreateThread(NULL, 0, oe_watch, (void *)(intptr_t)pause, 0, NULL));
     }
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;
     last = now;
     g_oe_focus_recheck = 0;
-    DWORD pid = 0;
+    uint32_t pid = 0;
     HWND fg = GetForegroundWindow();
-    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == GetCurrentProcessId();
+    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid();
     if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
     if (!g_oe_was_foreground) return;
     /* the applet manager's rule (suyu am/lifecycle_manager.cpp UpdateRequestedFocusState, GetFocusStateWhile*), with
@@ -264,10 +262,10 @@ static void oe_track_focus(void) {
 static int g_oe_exit_locked, g_oe_exit_requested;
 int oe_exit_request(void) {                              /* display.c, window thread. Returns 1 when the game keeps running until it leaves its section */
     int locked;
-    EnterCriticalSection(&g_oe_lock);
+    plat_lock(&g_oe_lock);
     locked = g_oe_exit_locked;
     if (locked) g_oe_exit_requested = 1;
-    LeaveCriticalSection(&g_oe_lock);
+    plat_unlock(&g_oe_lock);
     if (!locked) return 0;
     trace_printf("     nn::oe: exit requested inside an exit-request handling section: MessageExitRequest posted\n");
     oe_push(OE_MSG_EXIT_REQUEST);
@@ -276,16 +274,16 @@ int oe_exit_request(void) {                              /* display.c, window th
 static void oe_TryPopNotificationMessage(Ctx *c) {       /* (uint32_t *out) -> bool */
     uint64_t out = A0;
     int got = 0;
-    InterlockedIncrement(&g_oe_poll_count);
+    plat_inc(&g_oe_poll_count);
     oe_track_focus();
-    EnterCriticalSection(&g_oe_lock);
+    plat_lock(&g_oe_lock);
     if (g_oe_count > 0) {
         if (out) wr32(out, g_oe_queue[0]);
         memmove(g_oe_queue, g_oe_queue + 1, (size_t)(--g_oe_count) * sizeof g_oe_queue[0]);
         got = 1;
         if (g_oe_count == 0 && g_oe_event_ready) os_init_event((uint64_t)(uintptr_t)g_oe_event, 0);   /* nothing pending: event cleared */
     }
-    LeaveCriticalSection(&g_oe_lock);
+    plat_unlock(&g_oe_lock);
     RET(got);
 }
 static void oe_GetCurrentFocusState(Ctx *c) { oe_track_focus(); RET(g_oe_focus_state); }
@@ -328,7 +326,7 @@ static uint64_t desired_language(void) {
     char name[LOCALE_NAME_MAX_LENGTH * 3] = "", pick[16] = "en-US";
     const char *env = getenv("SMO_LANGUAGE");
     wchar_t wname[LOCALE_NAME_MAX_LENGTH] = L"";
-    ULONG count = 0, size = 0;
+    uint32_t count = 0, size = 0;
     if (env && env[0]) snprintf(name, sizeof name, "%s", env);
     else {
         /* the display language of the user interface, not the regional format */
@@ -339,15 +337,15 @@ static uint64_t desired_language(void) {
         WideCharToMultiByte(CP_UTF8, 0, wname, -1, name, sizeof name, NULL, NULL);
     }
     int exact = 0;
-    for (size_t i = 0; i < sizeof supported / sizeof supported[0]; i++) if (!_stricmp(name, supported[i])) { strcpy(pick, supported[i]); exact = 1; }
+    for (size_t i = 0; i < sizeof supported / sizeof supported[0]; i++) if (!strcasecmp(name, supported[i])) { strcpy(pick, supported[i]); exact = 1; }
     if (!exact) {
-        if (!_strnicmp(name, "zh", 2)) strcpy(pick, strstr(name, "TW") || strstr(name, "HK") || strstr(name, "MO") || strstr(name, "Hant") ? "zh-Hant" : "zh-Hans");
-        else if (!_strnicmp(name, "en", 2)) strcpy(pick, !_stricmp(name, "en-US") || !_stricmp(name, "en-CA") ? "en-US" : "en-GB");
-        else if (!_strnicmp(name, "fr", 2)) strcpy(pick, !_stricmp(name, "fr-CA") ? "fr-CA" : "fr");
-        else if (!_strnicmp(name, "es", 2)) strcpy(pick, !_stricmp(name, "es-ES") || !_stricmp(name, "es") ? "es" : "es-419");
+        if (!strncasecmp(name, "zh", 2)) strcpy(pick, strstr(name, "TW") || strstr(name, "HK") || strstr(name, "MO") || strstr(name, "Hant") ? "zh-Hant" : "zh-Hans");
+        else if (!strncasecmp(name, "en", 2)) strcpy(pick, !strcasecmp(name, "en-US") || !strcasecmp(name, "en-CA") ? "en-US" : "en-GB");
+        else if (!strncasecmp(name, "fr", 2)) strcpy(pick, !strcasecmp(name, "fr-CA") ? "fr-CA" : "fr");
+        else if (!strncasecmp(name, "es", 2)) strcpy(pick, !strcasecmp(name, "es-ES") || !strcasecmp(name, "es") ? "es" : "es-419");
         else {
             char two[3] = {name[0], name[1], 0};
-            for (size_t i = 0; i < sizeof supported / sizeof supported[0]; i++) if (!_stricmp(two, supported[i])) strcpy(pick, supported[i]);
+            for (size_t i = 0; i < sizeof supported / sizeof supported[0]; i++) if (!strcasecmp(two, supported[i])) strcpy(pick, supported[i]);
         }
     }
     uint64_t v = 0;
@@ -382,10 +380,10 @@ static void err_ShowErrorResult(Ctx *c) {                 /* (Result): the conso
 /* ---------------------------------------------------------------- nn::util */
 static HCRYPTPROV crypt_provider(void) {
     static HCRYPTPROV prov;
-    static volatile LONG lock;
-    while (InterlockedExchange(&lock, 1)) SwitchToThread();
+    static volatile int32_t lock;
+    while (plat_xchg(&lock, 1)) plat_yield();
     if (!prov && !CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) prov = 0;
-    InterlockedExchange(&lock, 0);
+    plat_xchg(&lock, 0);
     return prov;
 }
 /* [sdk] BinaryFileHeader checks (layout in nnsdk.c): signature = first 8 bytes; alignment shift u8 @0xe;
@@ -398,9 +396,9 @@ static void util_BinaryFileHeader_IsEndianReverse(Ctx *c) { RET(rd16(A0 + 0xc) =
 static void crypto_Sha1(Ctx *c) {                         /* (void *out, size_t outSize, const void *data, size_t size) */
     HCRYPTHASH h = 0;
     uint8_t digest[20] = {0};
-    DWORD len = sizeof digest;
+    uint32_t len = sizeof digest;
     if (crypt_provider() && CryptCreateHash(crypt_provider(), CALG_SHA1, 0, 0, &h)) {
-        CryptHashData(h, (const BYTE *)(uintptr_t)A2, (DWORD)A3, 0);
+        CryptHashData(h, (const uint8_t *)(uintptr_t)A2, (uint32_t)A3, 0);
         CryptGetHashParam(h, HP_HASHVAL, digest, &len, 0);
         CryptDestroyHash(h);
     }
@@ -408,19 +406,19 @@ static void crypto_Sha1(Ctx *c) {                         /* (void *out, size_t 
 }
 /* Md5Impl: the guest object is not touched; the running hash is kept on the host, keyed by its address. */
 static struct { uint64_t key; HCRYPTHASH h; } g_md5[64];
-static CRITICAL_SECTION g_md5_lock;
+static plat_lock_t g_md5_lock;
 static HCRYPTHASH *md5_slot(uint64_t key, int create) {
     HCRYPTHASH *found = NULL;
-    EnterCriticalSection(&g_md5_lock);
+    plat_lock(&g_md5_lock);
     for (int i = 0; i < 64 && !found; i++) if (g_md5[i].key == key) found = &g_md5[i].h;
     for (int i = 0; i < 64 && !found && create; i++) if (!g_md5[i].key) { g_md5[i].key = key; g_md5[i].h = 0; found = &g_md5[i].h; }
-    LeaveCriticalSection(&g_md5_lock);
+    plat_unlock(&g_md5_lock);
     return found;
 }
 static void md5_drop(uint64_t key) {
-    EnterCriticalSection(&g_md5_lock);
+    plat_lock(&g_md5_lock);
     for (int i = 0; i < 64; i++) if (g_md5[i].key == key) { if (g_md5[i].h) CryptDestroyHash(g_md5[i].h); g_md5[i].key = 0; g_md5[i].h = 0; }
-    LeaveCriticalSection(&g_md5_lock);
+    plat_unlock(&g_md5_lock);
 }
 static void crypto_Md5_Initialize(Ctx *c) {
     md5_drop(A0);
@@ -428,11 +426,11 @@ static void crypto_Md5_Initialize(Ctx *c) {
     if (!h) fatal(c, "nn::crypto Md5Impl: more than 64 hashes in progress");
     if (!crypt_provider() || !CryptCreateHash(crypt_provider(), CALG_MD5, 0, 0, h)) *h = 0;
 }
-static void crypto_Md5_Update(Ctx *c) { HCRYPTHASH *h = md5_slot(A0, 0); if (h && *h) CryptHashData(*h, (const BYTE *)(uintptr_t)A1, (DWORD)A2, 0); }
+static void crypto_Md5_Update(Ctx *c) { HCRYPTHASH *h = md5_slot(A0, 0); if (h && *h) CryptHashData(*h, (const uint8_t *)(uintptr_t)A1, (uint32_t)A2, 0); }
 static void crypto_Md5_GetHash(Ctx *c) {                  /* (this, void *out, size_t outSize) */
     HCRYPTHASH *h = md5_slot(A0, 0);
     uint8_t digest[16] = {0};
-    DWORD len = sizeof digest;
+    uint32_t len = sizeof digest;
     if (h && *h) CryptGetHashParam(*h, HP_HASHVAL, digest, &len, 0);
     memcpy((void *)(uintptr_t)A1, digest, A2 < sizeof digest ? (size_t)A2 : sizeof digest);
 }
@@ -536,9 +534,9 @@ int image_protect_selftest(Ctx *c) {
 }
 
 void register_misc_imports(void) {
-    QueryPerformanceCounter(&g_start);
-    InitializeCriticalSection(&g_oe_lock);
-    InitializeCriticalSection(&g_md5_lock);
+    plat_qpc(&g_start);
+    plat_lock_init(&g_oe_lock);
+    plat_lock_init(&g_md5_lock);
     register_imports(replace_imports, (int)(sizeof replace_imports / sizeof replace_imports[0]));
     int n = (int)(sizeof fill_imports / sizeof fill_imports[0]), added = 0;
     for (int i = 0; i < n; i++) {

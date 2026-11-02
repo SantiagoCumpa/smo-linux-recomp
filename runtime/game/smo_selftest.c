@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -83,16 +83,16 @@ static void test_os(Ctx *c) {
 
 static void test_fs(Ctx *c) {
     int before = g_bad;
-    char tmp[MAX_PATH], path[MAX_PATH];
+    char tmp[PATH_MAX], path[PATH_MAX];
     GetTempPathA(sizeof tmp, tmp);
     snprintf(path, sizeof path, "%ssmo-recomp-selftest.bin", tmp);
     HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
     if (h == INVALID_HANDLE_VALUE) { check("fs", "temporary file", 0); return; }
     uint8_t data[100], back[50];
-    DWORD n = 0;
+    uint32_t n = 0;
     memset(data, 0xab, sizeof data);
     WriteFile(h, data, sizeof data, &n, NULL);
-    LARGE_INTEGER sz;
+    plat_counter sz;
     args(c, P(h), 10, 0, 0); call(c, "_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl");
     check("fs", "SetFileSize(10) = success", c->x[0] == 0);
     check("fs", "the file is 10 bytes", GetFileSizeEx(h, &sz) && sz.QuadPart == 10);
@@ -106,7 +106,7 @@ static void test_fs(Ctx *c) {
     check("fs", "the 10 bytes kept and the 40 new ones zero", grown_zero && back[0] == 0xab && back[9] == 0xab);
     args(c, P(h), 0, 0, 0); call(c, "_ZN2nn2fs9FlushFileENS0_10FileHandleE"); check("fs", "FlushFile = success", c->x[0] == 0);
     CloseHandle(h);
-    DeleteFileA(path);
+    !unlink(path);
     printf("  nn::fs (SetFileSize, FlushFile): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
@@ -122,7 +122,7 @@ static void test_util(Ctx *c) {
     int before = g_bad;
     /* a NintendoWare binary file: header 0x20, two pointers at 0x40, a relocation table at 0x100 with two sections:
      * section 0 (base 0: the file) covers the first pointer group, section 1 (base B, position 0x80) a pointer at 0x60 */
-    uint8_t *f = _aligned_malloc(0x1000, 0x1000), *other = _aligned_malloc(0x100, 0x100);
+    uint8_t *f = plat_aligned_alloc(0x1000, 0x1000), *other = plat_aligned_alloc(0x100, 0x100);
     memset(f, 0, 0x1000);
     memcpy(f, "FRES    ", 8);
     f[8] = 3; f[9] = 5; wr16(P(f) + 0xa, 9);          /* version 9.5.3 */
@@ -152,7 +152,7 @@ static void test_util(Ctx *c) {
     check("util", "SetRelocated(false) clears the flag", (rd16(P(f) + 0x14) & 1) == 0);
     args(c, P(f), 1, 0, 0); call(c, "_ZN2nn4util16BinaryFileHeader12SetRelocatedEb");
     check("util", "SetRelocated(true) sets it", (rd16(P(f) + 0x14) & 1) == 1);
-    _aligned_free(f); _aligned_free(other);
+    plat_aligned_free(f); plat_aligned_free(other);
     static const char u8[] = "AB\xc3\xa9\xe2\x9c\x93";  /* A B e-acute check-mark: 7 bytes, 4 characters */
     uint16_t u16[16];
     memset(u16, 0xff, sizeof u16);
@@ -189,7 +189,7 @@ static void test_diag_time_oe(Ctx *c) {
     {   /* the Capture button's picture, turned 90 degrees as the game asked: 3 x 2 in, 2 x 3 out (a BMP, bottom-up BGRA) */
         int album_save_capture(const uint8_t *rgba, int w, int h, char *out_path, size_t out_cap);
         uint8_t img[3 * 2 * 4], bmp[256];
-        char path[MAX_PATH] = "";
+        char path[PATH_MAX] = "";
         for (int i = 0; i < 6; i++) { img[i * 4] = (uint8_t)(10 + 40 * i); img[i * 4 + 1] = 7; img[i * 4 + 2] = 9; img[i * 4 + 3] = 255; }
         int r = album_save_capture(img, 3, 2, path, sizeof path);
         FILE *f = path[0] ? fopen(path, "rb") : NULL;
@@ -202,7 +202,7 @@ static void test_diag_time_oe(Ctx *c) {
         check("capture", "turned picture saved, 2 x 3", r == 0 && n == 54 + 2 * 3 * 4 && bw == 2 && bh == 3);
         check("capture", "pixels where a clockwise turn puts them", n == 54 + 24 && PX(1, 0)[2] == 10 && PX(0, 2)[2] == 10 + 40 * 5 && PX(0, 0)[2] == 10 + 40 * 3);
         #undef PX
-        if (path[0]) DeleteFileA(path);
+        if (path[0]) !unlink(path);
     }
     args(c, 0, 0, 0, 0); call(c, "_ZN2nn2oe29SetScreenShotImageOrientationENS_5album16ImageOrientationE");
     args(c, 1, 0, 0, 0); call(c, "_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb");
@@ -212,15 +212,15 @@ static void test_diag_time_oe(Ctx *c) {
     printf("  nn::diag (symbols, backtrace), nn::time state, nn::oe (screenshot orientation, inactivity time): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
-static ULONGLONG newest_write(const char *dir) {          /* the newest last-write time in a folder, its own entry included */
-    char pattern[MAX_PATH];
+static uint64_t newest_write(const char *dir) {          /* the newest last-write time in a folder, its own entry included */
+    char pattern[PATH_MAX];
     WIN32_FIND_DATAA fd;
-    ULONGLONG newest = 0;
+    uint64_t newest = 0;
     snprintf(pattern, sizeof pattern, "%s\\*", dir);
     HANDLE h = FindFirstFileA(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     do {
-        ULONGLONG t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        uint64_t t = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
         if (t > newest) newest = t;
     } while (FindNextFileA(h, &fd));
     FindClose(h);
@@ -229,7 +229,7 @@ static ULONGLONG newest_write(const char *dir) {          /* the newest last-wri
 static void test_web(Ctx *c) {
     int before = g_bad;
     const char *env = getenv("SMO_MANUAL");
-    char probe[MAX_PATH];
+    char probe[PATH_MAX];
     snprintf(probe, sizeof probe, "%s\\html-document\\htmlcontents.htdocs\\html\\USen\\index.html", env && env[0] ? env : "..\\manual");
     if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) { printf("  nn::web Help: SKIPPED (no extracted document: scripts\\setup.py --only manual)\n"); return; }
     static uint8_t arg[0x2100], ret[0x1100];
@@ -242,10 +242,10 @@ static void test_web(Ctx *c) {
     args(c, P(arg), 1, 0, 0); call(c, "_ZN2nn3web22ShowOfflineHtmlPageArg17SetPointerEnabledEb");
     args(c, P(arg), 0, 0, 0); call(c, "_ZN2nn3web36ShowOfflineHtmlPageArgWithPlayReport20SetPlayReportEnabledEb");
     args(c, P(ret), 0, 0, 0); call(c, "_ZN2nn3web26OfflineHtmlPageReturnValueC1Ev");
-    char page_dir[MAX_PATH], js_dir[MAX_PATH];
+    char page_dir[PATH_MAX], js_dir[PATH_MAX];
     snprintf(page_dir, sizeof page_dir, "%s\\html-document\\htmlcontents.htdocs\\html\\USen", env && env[0] ? env : "..\\manual");
     snprintf(js_dir, sizeof js_dir, "%s\\html-document\\htmlcontents.htdocs\\js", env && env[0] ? env : "..\\manual");
-    ULONGLONG page_was = newest_write(page_dir), js_was = newest_write(js_dir);
+    uint64_t page_was = newest_write(page_dir), js_was = newest_write(js_dir);
     SetEnvironmentVariableA("SMO_WEB_NOOPEN", "1");
     _putenv("SMO_WEB_NOOPEN=1");
     args(c, P(ret), P(arg), 0, 0); call(c, "_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE");
@@ -256,7 +256,7 @@ static void test_web(Ctx *c) {
     check("web", "GetLastUrl answers a URL", c->x[0] == P(ret) + 8 && !strncmp((const char *)(uintptr_t)c->x[0], "http", 4));
     /* the web browser's copy: in %TEMP%\smo-recomp-help, a <base> naming the page's own folder, then window.nx, inside
      * <head>; nothing written next to the document (the dump is read in place) */
-    char tmp[MAX_PATH] = "", copy[MAX_PATH];
+    char tmp[PATH_MAX] = "", copy[PATH_MAX];
     GetTempPathA(sizeof tmp, tmp);
     snprintf(copy, sizeof copy, "%ssmo-recomp-help\\index.html", tmp);
     FILE *fp = fopen(copy, "rb");
@@ -345,7 +345,7 @@ static void test_sdk7(Ctx *c) {
 }
 
 int smo_import_selftest(void) {
-    Ctx *c = _aligned_malloc(sizeof *c, 16);
+    Ctx *c = plat_aligned_alloc(sizeof *c, 16);
     uint8_t *stack = VirtualAlloc(NULL, 8 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     memset(c, 0, sizeof *c);
     c->x[31] = P(stack + (8 << 20) - 0x1000);

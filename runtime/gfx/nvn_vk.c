@@ -24,7 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 /* the Khronos headers of the Vulkan SDK (VULKAN_HEADERS, -I in build_exe.py) */
 #define VK_USE_PLATFORM_WIN32_KHR
 #define VK_NO_PROTOTYPES
@@ -120,7 +120,7 @@ static struct {
     VkFence fence;
     int fence_pending, alive, validate;
 } V;
-static volatile LONG64 g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
+static volatile int64_t g_vk_frames, g_vk_recreated, g_vk_skipped, g_vk_errors, g_vk_messages, g_vk_missing_calls;
 static int g_vk_missing_warn = -1;
 
 static const char *vk_result_name(VkResult r) {
@@ -137,12 +137,12 @@ static const char *vk_result_name(VkResult r) {
 static void vk_fatal(const char *what, VkResult r) {
     printf("nvn_vk: %s failed: %s\n", what, vk_result_name(r));
     fflush(stdout);
-    ExitProcess(5);
+    plat_exit(5);
 }
 /* A call that may fail while running (present path): counted, reported a few times, the frame goes on. */
 static int vk_ok(const char *what, VkResult r) {
     if (r == VK_SUCCESS) return 1;
-    if (InterlockedIncrement64(&g_vk_errors) <= 20) { printf("nvn_vk: %s: %s\n", what, vk_result_name(r)); fflush(stdout); }
+    if (plat_inc(&g_vk_errors) <= 20) { printf("nvn_vk: %s: %s\n", what, vk_result_name(r)); fflush(stdout); }
     return 0;
 }
 
@@ -152,11 +152,11 @@ void nvn_vk_missing(const char *what) {
     static const char *seen[64];
     static int nseen;
     if (g_vk_missing_warn < 0) { const char *e = getenv("SMO_VK_MISSING"); g_vk_missing_warn = !(e && !strcmp(e, "exit")); }
-    InterlockedIncrement64(&g_vk_missing_calls);
+    plat_inc(&g_vk_missing_calls);
     if (!g_vk_missing_warn) {
         printf("nvn_vk: NOT IMPLEMENTED in the Vulkan back end: %s. SMO_VK_MISSING=exit: the game stops here.\n", what);
         fflush(stdout);
-        ExitProcess(7);
+        plat_exit(7);
     }
     for (int i = 0; i < nseen; i++) if (seen[i] == what) return;
     if (nseen < 64) seen[nseen++] = what;
@@ -166,7 +166,7 @@ void nvn_vk_missing(const char *what) {
 
 static VkBool32 VKAPI_PTR vk_debug_cb(VkFlags severity, VkFlags types, const VkDebugUtilsMessengerCallbackDataEXT *data, void *user) {
     (void)types; (void)user;
-    if (InterlockedIncrement64(&g_vk_messages) <= 200)
+    if (plat_inc(&g_vk_messages) <= 200)
         printf("vk-validation: %s: %s: %s\n", severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning", data && data->pMessageIdName ? data->pMessageIdName : "?",
                data && data->pMessage ? data->pMessage : "");
     fflush(stdout);
@@ -227,7 +227,7 @@ static int swapchain_create(void) {
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
     void *p = (void *)GetProcAddress(V.loader, name);
-    if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); ExitProcess(5); }
+    if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); plat_exit(5); }
     return p;
 }
 
@@ -243,19 +243,19 @@ static void *vk_sym(const char *name) {
 static const char *vkc_dir(void);                  /* nvn_vk_pipelines.c */
 static void nv_cache_dir(void) {
     const char *off = getenv("SMO_VK_NVCACHE"), *set = getenv("__GL_SHADER_DISK_CACHE_PATH"), *own = getenv("SMO_VK_CACHE");
-    char rel[260], dir[260], exe[MAX_PATH] = "";
-    GetModuleFileNameA(NULL, exe, sizeof exe);
+    char rel[260], dir[260], exe[PATH_MAX] = "";
+    snprintf(exe, sizeof exe, "%s", plat_exe_path());
     const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe;
     if (off && !atoi(off)) { printf("nvn_vk: SMO_VK_NVCACHE=0: the driver's shader disk cache stays in its own folder\n"); return; }
     if (set && set[0]) { printf("nvn_vk: the driver's shader disk cache: %s (__GL_SHADER_DISK_CACHE_PATH)\n", set); return; }
-    if (!(own && own[0]) && _stricmp(base, "smo_native.exe") && _stricmp(base, "smo_user.exe")) {
+    if (!(own && own[0]) && strcasecmp(base, "smo_native.exe") && strcasecmp(base, "smo_user.exe")) {
         printf("nvn_vk: the driver's shader disk cache stays in its own folder (a test copy without SMO_VK_CACHE)\n");
         return;
     }
     snprintf(rel, sizeof rel, "%s/nv", vkc_dir());
     if (!_fullpath(dir, rel, sizeof dir)) return;
-    CreateDirectoryA(vkc_dir(), NULL);
-    CreateDirectoryA(dir, NULL);
+    plat_mkdir(vkc_dir());
+    plat_mkdir(dir);
     SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_PATH", dir);
     if (!getenv("__GL_SHADER_DISK_CACHE_SIZE")) SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_SIZE", "8589934592");      /* 8 GB, in bytes */
     printf("nvn_vk: the driver's shader disk cache: %s (the game's own; SMO_VK_NVCACHE=0: the driver's folder)\n", dir);
@@ -270,7 +270,7 @@ int nvn_vk_init(void *hwnd) {
     V.hwnd = hwnd;
     nv_cache_dir();                                /* before the driver is loaded */
     V.loader = LoadLibraryA("vulkan-1.dll");
-    if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); ExitProcess(5); }
+    if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); plat_exit(5); }
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
 #undef X
@@ -286,7 +286,7 @@ int nvn_vk_init(void *hwnd) {
     const char *exts[4], *layers[1];
     uint32_t next = 0, nlayers = 0;
     exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
-    if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); ExitProcess(5); }
+    if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); plat_exit(5); }
     { const char *e = getenv("SMO_VK_VALIDATE"); V.validate = e && atoi(e) != 0; }
     if (V.validate) {
         static VkLayerProperties lp[64];
@@ -329,7 +329,7 @@ int nvn_vk_init(void *hwnd) {
     VkPhysicalDevice gpus[16];
     uint32_t ngpu = 16;
     r = vkEnumeratePhysicalDevices(V.instance, &ngpu, gpus);
-    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !ngpu) { printf("nvn_vk: no Vulkan device (%s, %u devices)\n", vk_result_name(r), (unsigned)ngpu); fflush(stdout); ExitProcess(5); }
+    if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !ngpu) { printf("nvn_vk: no Vulkan device (%s, %u devices)\n", vk_result_name(r), (unsigned)ngpu); fflush(stdout); plat_exit(5); }
     int forced = getenv("SMO_VK_DEVICE") ? atoi(getenv("SMO_VK_DEVICE")) : -1, best = -1, best_score = -1;
     uint32_t best_family = 0;
     if (forced < 0 && gfx_options()->gpu[0]) {    /* gpu = <number> | <part of the name> in graphics.ini (the environment switch wins) */
@@ -366,7 +366,7 @@ int nvn_vk_init(void *hwnd) {
                family < 0 ? " - cannot present to the window with a graphics + compute queue" : p.apiVersion < VK_API_VERSION_1_3 ? " - below Vulkan 1.3" : "");
         if (forced >= 0 ? (int)i == forced && usable : score > best_score) { best = (int)i; best_score = score; best_family = (uint32_t)family; }
     }
-    if (best < 0) { printf("nvn_vk: no usable Vulkan 1.3 device%s\n", forced >= 0 ? " (SMO_VK_DEVICE names one that is not usable)" : ""); fflush(stdout); ExitProcess(5); }
+    if (best < 0) { printf("nvn_vk: no usable Vulkan 1.3 device%s\n", forced >= 0 ? " (SMO_VK_DEVICE names one that is not usable)" : ""); fflush(stdout); plat_exit(5); }
     V.gpu = gpus[best]; V.family = best_family;
     vkGetPhysicalDeviceProperties(V.gpu, &V.props);
 
@@ -378,7 +378,7 @@ int nvn_vk_init(void *hwnd) {
            VK_API_VERSION_PATCH(loader_version));
     for (unsigned i = 1; i < sizeof k_wanted / sizeof *k_wanted; i++) printf(" %s=%s", k_wanted[i] + 3, has_name(dext, ndext, k_wanted[i]) ? "yes" : "NO");
     printf("%s\n", r == VK_INCOMPLETE ? " (list cut at 512: NO may be wrong)" : "");
-    if (!has_name(dext, ndext, "VK_KHR_swapchain")) { printf("nvn_vk: the device has no VK_KHR_swapchain\n"); fflush(stdout); ExitProcess(5); }
+    if (!has_name(dext, ndext, "VK_KHR_swapchain")) { printf("nvn_vk: the device has no VK_KHR_swapchain\n"); fflush(stdout); plat_exit(5); }
 
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi;
@@ -401,7 +401,7 @@ int nvn_vk_init(void *hwnd) {
     V.format.format = 0;
     for (uint32_t i = 0; i < nfmt && !V.format.format; i++) if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) V.format = fmts[i];
     for (uint32_t i = 0; i < nfmt && !V.format.format; i++) if (fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) V.format = fmts[i];
-    if (!V.format.format) { printf("nvn_vk: the surface offers no 8-bit UNORM format in the sRGB colour space (%u formats, first: %d)\n", (unsigned)nfmt, (int)fmts[0].format); fflush(stdout); ExitProcess(5); }
+    if (!V.format.format) { printf("nvn_vk: the surface offers no 8-bit UNORM format in the sRGB colour space (%u formats, first: %d)\n", (unsigned)nfmt, (int)fmts[0].format); fflush(stdout); plat_exit(5); }
 
     /* present mode: the 60 Hz pacing is display.c's, so the swapchain must not wait for the display */
     VkPresentModeKHR modes[16];
@@ -468,16 +468,16 @@ static void wait_last_submit(void) {
 static void present_colour(const float rgba[4]) {
     if (!V.alive) return;
     wait_last_submit();
-    if (!V.swapchain && !swapchain_create()) { InterlockedIncrement64(&g_vk_skipped); return; }
+    if (!V.swapchain && !swapchain_create()) { plat_inc(&g_vk_skipped); return; }
     uint32_t index = 0;
     VkResult r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, V.acquired, NULL, &index);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {                        /* the window changed size: a new swapchain, this frame is shown by it */
         swapchain_destroy();
-        InterlockedIncrement64(&g_vk_recreated);
-        if (!swapchain_create()) { InterlockedIncrement64(&g_vk_skipped); return; }
+        plat_inc(&g_vk_recreated);
+        if (!swapchain_create()) { plat_inc(&g_vk_skipped); return; }
         r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, V.acquired, NULL, &index);
     }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vk_ok("vkAcquireNextImageKHR", r); InterlockedIncrement64(&g_vk_skipped); return; }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vk_ok("vkAcquireNextImageKHR", r); plat_inc(&g_vk_skipped); return; }
     int suboptimal = r == VK_SUBOPTIMAL_KHR;
 
     VkCommandBufferBeginInfo bi;
@@ -508,7 +508,7 @@ static void present_colour(const float rgba[4]) {
     sb.commandBufferCount = 1; sb.pCommandBuffers = &V.cmd;
     sb.signalSemaphoreCount = 1; sb.pSignalSemaphores = &V.rendered;
     r = vkQueueSubmit(V.queue, 1, &sb, V.fence);
-    if (!vk_ok("vkQueueSubmit", r)) { InterlockedIncrement64(&g_vk_skipped); return; }
+    if (!vk_ok("vkQueueSubmit", r)) { plat_inc(&g_vk_skipped); return; }
     V.fence_pending = 1;
 
     VkPresentInfoKHR pr;
@@ -516,9 +516,9 @@ static void present_colour(const float rgba[4]) {
     pr.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
     pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &V.rendered; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
     r = vkQueuePresentKHR(V.queue, &pr);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { swapchain_destroy(); InterlockedIncrement64(&g_vk_recreated); }      /* made again at the next present */
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { swapchain_destroy(); plat_inc(&g_vk_recreated); }      /* made again at the next present */
     else vk_ok("vkQueuePresentKHR", r);
-    InterlockedIncrement64(&g_vk_frames);
+    plat_inc(&g_vk_frames);
 }
 
 /* nvnQueuePresentTexture while this back end holds no texture of the game: the window is cleared to black, as the
@@ -572,18 +572,18 @@ void nvn_vk_selftest_hook(void) {
     const char *e = getenv("SMO_VK_SELFTEST");
     int n = e ? atoi(e) : 0;
     if (!V.alive || n <= 0) return;
-    LARGE_INTEGER f, t0, prev, now;
+    plat_counter f, t0, prev, now;
     double *dt = malloc(sizeof *dt * (size_t)n), sum = 0;
-    QueryPerformanceFrequency(&f);
+    plat_qpf(&f);
     printf("nvn_vk: self-test: %d frames on the display clock\n", n);
     fflush(stdout);
     for (int i = -30; i < n; i++) {                          /* 30 frames to settle (first swapchain images, clock start), not measured */
-        if (i == 0) { QueryPerformanceCounter(&t0); prev = t0; }
+        if (i == 0) { plat_qpc(&t0); prev = t0; }
         display_before_present();
         nvn_render_run(job_selftest_frame, &i);
         display_pace();
         display_wait_refresh();
-        if (i >= 0) { QueryPerformanceCounter(&now); dt[i] = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)f.QuadPart; sum += dt[i]; prev = now; }
+        if (i >= 0) { plat_qpc(&now); dt[i] = (double)(now.QuadPart - prev.QuadPart) * 1000.0 / (double)f.QuadPart; sum += dt[i]; prev = now; }
     }
     qsort(dt, (size_t)n, sizeof *dt, cmp_double);
     int late = 0;
@@ -592,7 +592,7 @@ void nvn_vk_selftest_hook(void) {
            n, sum / 1000.0, (double)n * 1000.0 / sum, dt[0], dt[n / 2], dt[(int)((double)(n - 1) * 0.99)], dt[n - 1], late, (long long)g_vk_skipped, (long long)g_vk_errors, (long long)g_vk_recreated);
     nvn_render_run(job_shutdown, NULL);
     fflush(stdout);
-    ExitProcess(g_vk_errors || g_vk_skipped ? 1 : 0);
+    plat_exit(g_vk_errors || g_vk_skipped ? 1 : 0);
 }
 
 #include "nvn_vk_draw.c"                                   /* everything that draws: not a build unit of its own */

@@ -28,8 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
-#include <shlwapi.h>
+#include "plat.h"
 #include "WebView2.h"
 
 void display_menu_hold(int on);                     /* display.c */
@@ -51,10 +50,10 @@ static HWND g_parent;
 static ICoreWebView2Environment *g_env;
 static ICoreWebView2Controller *g_ctl;
 static ICoreWebView2 *g_wv;
-static volatile LONG g_state;                         /* ST_*: written by the window thread, waited for by the guest thread */
-static volatile LONG g_called_back;                   /* the page went to a callback address (g_callback) */
+static volatile int32_t g_state;                         /* ST_*: written by the window thread, waited for by the guest thread */
+static volatile int32_t g_called_back;                   /* the page went to a callback address (g_callback) */
 static int g_creating, g_shot_n;
-static char g_shot_path[MAX_PATH], g_callback[4096];
+static char g_shot_path[PATH_MAX], g_callback[4096];
 static wchar_t g_url[4096], *g_script;
 static HMODULE g_loader;
 typedef HRESULT (STDAPICALLTYPE *CreateEnvFn)(PCWSTR, PCWSTR, ICoreWebView2EnvironmentOptions *, ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *);
@@ -78,7 +77,7 @@ static const IID k_iid_added = {0xb99369f3, 0x9b11, 0x47b5, {0xbc, 0x6f, 0x8e, 0
         if (IsEqualIID(riid, &k_iid_unknown) || IsEqualIID(riid, &iid)) { *pp = This; return S_OK; }                      \
         *pp = NULL; return E_NOINTERFACE;                                                                                \
     }                                                                                                                    \
-    static ULONG STDMETHODCALLTYPE T##_ref(T *This) { (void)This; return 1; }                                           \
+    static uint32_t STDMETHODCALLTYPE T##_ref(T *This) { (void)This; return 1; }                                           \
     static HRESULT STDMETHODCALLTYPE T##_invoke invoke_args;
 HANDLER(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler, k_iid_env_done,
         (ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This, HRESULT hr, ICoreWebView2Environment *env))
@@ -114,7 +113,7 @@ static void fail_open(const char *what, HRESULT hr) {
     printf("guide: %s failed (0x%08lx): the page goes to the web browser instead\n", what, (unsigned long)hr);
     fflush(stdout);
     g_creating = 0;
-    InterlockedExchange(&g_state, ST_FAILED);
+    plat_xchg(&g_state, ST_FAILED);
 }
 /* The manual is laid out for the console's 1280 x 720 screen (its style sheet has fixed sizes), so the page gets the largest
  * 16:9 area of the window, centred, and is zoomed to fill it: in a 2560 x 1440 window it would otherwise fill the top-left
@@ -130,17 +129,17 @@ static void fit(void) {
 }
 static void show_page(void) {
     fit();
-    ICoreWebView2Controller_put_IsVisible(g_ctl, TRUE);
+    ICoreWebView2Controller_put_IsVisible(g_ctl, 1);
     HRESULT hr = ICoreWebView2_Navigate(g_wv, g_url);
-    if (FAILED(hr)) { fail_open("ICoreWebView2::Navigate", hr); ICoreWebView2Controller_put_IsVisible(g_ctl, FALSE); return; }
+    if (FAILED(hr)) { fail_open("ICoreWebView2::Navigate", hr); ICoreWebView2Controller_put_IsVisible(g_ctl, 0); return; }
     ICoreWebView2Controller_MoveFocus(g_ctl, COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
-    InterlockedExchange(&g_state, ST_OPEN);
+    plat_xchg(&g_state, ST_OPEN);
 }
 static void hide_page(int state) {
-    if (g_ctl) ICoreWebView2Controller_put_IsVisible(g_ctl, FALSE);
+    if (g_ctl) ICoreWebView2Controller_put_IsVisible(g_ctl, 0);
     if (g_wv) ICoreWebView2_Navigate(g_wv, L"about:blank");             /* stops the page's timers and its videos */
     SetFocus(g_parent);
-    InterlockedExchange(&g_state, state);
+    plat_xchg(&g_state, state);
 }
 
 static HRESULT STDMETHODCALLTYPE ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler_invoke(
@@ -162,10 +161,10 @@ static HRESULT STDMETHODCALLTYPE ICoreWebView2CreateCoreWebView2ControllerComple
     if (FAILED(ICoreWebView2Controller_get_CoreWebView2(ctl, &g_wv)) || !g_wv) { fail_open("ICoreWebView2Controller::get_CoreWebView2", E_FAIL); return S_OK; }
     ICoreWebView2Settings *s = NULL;
     if (SUCCEEDED(ICoreWebView2_get_Settings(g_wv, &s)) && s) {        /* an applet, not a browser: no menus, zoom, dev tools */
-        ICoreWebView2Settings_put_AreDefaultContextMenusEnabled(s, FALSE);
-        ICoreWebView2Settings_put_AreDevToolsEnabled(s, FALSE);
-        ICoreWebView2Settings_put_IsZoomControlEnabled(s, FALSE);
-        ICoreWebView2Settings_put_IsStatusBarEnabled(s, FALSE);
+        ICoreWebView2Settings_put_AreDefaultContextMenusEnabled(s, 0);
+        ICoreWebView2Settings_put_AreDevToolsEnabled(s, 0);
+        ICoreWebView2Settings_put_IsZoomControlEnabled(s, 0);
+        ICoreWebView2Settings_put_IsStatusBarEnabled(s, 0);
         ICoreWebView2Settings_Release(s);
     }
     EventRegistrationToken tok;
@@ -196,9 +195,9 @@ static HRESULT STDMETHODCALLTYPE ICoreWebView2NavigationStartingEventHandler_inv
     LPWSTR uri = NULL;
     if (g_state != ST_OPEN || FAILED(ICoreWebView2NavigationStartingEventArgs_get_Uri(args, &uri)) || !uri) return S_OK;
     if (!_wcsnicmp(uri, L"http://localhost/", 17) && !g_called_back) {
-        ICoreWebView2NavigationStartingEventArgs_put_Cancel(args, TRUE);
+        ICoreWebView2NavigationStartingEventArgs_put_Cancel(args, 1);
         WideCharToMultiByte(CP_UTF8, 0, uri, -1, g_callback, (int)sizeof g_callback, NULL, NULL);
-        InterlockedExchange(&g_called_back, 1);
+        plat_xchg(&g_called_back, 1);
         PostMessageW(g_parent, WM_SMO_GUIDE, GUIDE_CLOSE, 0);         /* hide_page outside this event */
     }
     CoTaskMemFree(uri);
@@ -228,22 +227,22 @@ static HRESULT STDMETHODCALLTYPE ICoreWebView2CapturePreviewCompletedHandler_inv
     fflush(stdout);
     return S_OK;
 }
-static void CALLBACK shot_timer(HWND h, UINT m, UINT_PTR id, DWORD t) {    /* SMO_GUIDE_SHOT: after loading, after a pad action */
+static void shot_timer(HWND h, unsigned m, uintptr_t id, uint32_t t) {    /* SMO_GUIDE_SHOT: after loading, after a pad action */
     (void)m; (void)t;
     KillTimer(h, id);
-    wchar_t w[MAX_PATH];
+    wchar_t w[PATH_MAX];
     const char *base = getenv("SMO_GUIDE_SHOT"), *dot = strrchr(base, '.');
     if (!g_wv || g_state != ST_OPEN || g_shot_stream || g_shot_n >= 8) return;
     if (++g_shot_n == 1) snprintf(g_shot_path, sizeof g_shot_path, "%s", base);
     else snprintf(g_shot_path, sizeof g_shot_path, "%.*s_%d%s", dot ? (int)(dot - base) : (int)strlen(base), base, g_shot_n, dot ? dot : "");
-    MultiByteToWideChar(CP_UTF8, 0, g_shot_path, -1, w, MAX_PATH);
-    if (SUCCEEDED(SHCreateStreamOnFileEx(w, STGM_CREATE | STGM_WRITE, FILE_ATTRIBUTE_NORMAL, TRUE, NULL, &g_shot_stream)))
+    MultiByteToWideChar(CP_UTF8, 0, g_shot_path, -1, w, PATH_MAX);
+    if (SUCCEEDED(SHCreateStreamOnFileEx(w, STGM_CREATE | STGM_WRITE, FILE_ATTRIBUTE_NORMAL, 1, NULL, &g_shot_stream)))
         ICoreWebView2_CapturePreview(g_wv, COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, g_shot_stream, &ICoreWebView2CapturePreviewCompletedHandler_obj);
 }
 static HRESULT STDMETHODCALLTYPE ICoreWebView2NavigationCompletedEventHandler_invoke(
         ICoreWebView2NavigationCompletedEventHandler *This, ICoreWebView2 *wv, ICoreWebView2NavigationCompletedEventArgs *args) {
     (void)This; (void)wv;
-    BOOL ok = FALSE;
+    int ok = 0;
     ICoreWebView2NavigationCompletedEventArgs_get_IsSuccess(args, &ok);
     if (g_state != ST_OPEN) return S_OK;                                 /* about:blank after closing */
     printf("guide: the page %s\n", ok ? "has loaded" : "did NOT load");
@@ -255,11 +254,11 @@ static HRESULT STDMETHODCALLTYPE ICoreWebView2AcceleratorKeyPressedEventHandler_
         ICoreWebView2AcceleratorKeyPressedEventHandler *This, ICoreWebView2Controller *ctl, ICoreWebView2AcceleratorKeyPressedEventArgs *args) {
     (void)This; (void)ctl;
     COREWEBVIEW2_KEY_EVENT_KIND kind;
-    UINT key = 0;
+    unsigned key = 0;
     ICoreWebView2AcceleratorKeyPressedEventArgs_get_KeyEventKind(args, &kind);
     ICoreWebView2AcceleratorKeyPressedEventArgs_get_VirtualKey(args, &key);
     if (key == VK_F11 && kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN) {    /* the game window's own key, also while the page has the focus */
-        ICoreWebView2AcceleratorKeyPressedEventArgs_put_Handled(args, TRUE);
+        ICoreWebView2AcceleratorKeyPressedEventArgs_put_Handled(args, 1);
         display_toggle_fullscreen();
     }
     return S_OK;
@@ -305,8 +304,8 @@ int guide_show(const char *url, const char *script, char *callback, size_t cap) 
         MultiByteToWideChar(CP_UTF8, 0, script, -1, g_script, n);
     }
     if (!g_loader) {
-        wchar_t exe[MAX_PATH], *slash;
-        GetModuleFileNameW(NULL, exe, MAX_PATH);
+        wchar_t exe[PATH_MAX], *slash;
+        GetModuleFileNameW(NULL, exe, PATH_MAX);
         slash = wcsrchr(exe, L'\\');
         if (slash) wcscpy(slash + 1, L"WebView2Loader.dll");
         g_loader = LoadLibraryW(exe);
@@ -315,14 +314,14 @@ int guide_show(const char *url, const char *script, char *callback, size_t cap) 
     if (g_state == ST_FAILED) return 0;                                   /* WebView2 did not start earlier in this run */
     MultiByteToWideChar(CP_UTF8, 0, url, -1, g_url, (int)(sizeof g_url / sizeof g_url[0]));
     g_callback[0] = 0;
-    InterlockedExchange(&g_called_back, 0);
-    InterlockedExchange(&g_state, ST_OPENING);
-    if (!PostMessageW(hwnd, WM_SMO_GUIDE, GUIDE_OPEN, 0)) { InterlockedExchange(&g_state, ST_IDLE); return 0; }
-    for (int t = 0; g_state == ST_OPENING && t < 30000 && !display_closing(); t += 10) Sleep(10);
-    if (display_closing()) { PostMessageW(hwnd, WM_SMO_GUIDE, GUIDE_CLOSE, 0); InterlockedExchange(&g_state, ST_IDLE); return 1; }   /* no browser while the game is ending */
+    plat_xchg(&g_called_back, 0);
+    plat_xchg(&g_state, ST_OPENING);
+    if (!PostMessageW(hwnd, WM_SMO_GUIDE, GUIDE_OPEN, 0)) { plat_xchg(&g_state, ST_IDLE); return 0; }
+    for (int t = 0; g_state == ST_OPENING && t < 30000 && !display_closing(); t += 10) plat_sleep_ms(10);
+    if (display_closing()) { PostMessageW(hwnd, WM_SMO_GUIDE, GUIDE_CLOSE, 0); plat_xchg(&g_state, ST_IDLE); return 1; }   /* no browser while the game is ending */
     if (g_state != ST_OPEN) {
         if (g_state == ST_OPENING) printf("guide: WebView2 did not start within 30 s: the page goes to the web browser instead\n");
-        InterlockedExchange(&g_state, ST_FAILED);
+        plat_xchg(&g_state, ST_FAILED);
         return 0;
     }
     printf("guide: open in the game window (%s)\n", url);
@@ -344,11 +343,11 @@ int guide_show(const char *url, const char *script, char *callback, size_t cap) 
         if (dir >= 0 && (held == 0 || (held >= 30 && (held - 30) % 5 == 0))) PostMessageW(hwnd, WM_SMO_GUIDE, GUIDE_PAD, dir);
         if (dir >= 0) held++;
         last_dir = dir;
-        Sleep(16);
+        plat_sleep_ms(16);
     }
     hid_menu_closed();
     display_menu_hold(0);
-    InterlockedExchange(&g_state, ST_IDLE);
+    plat_xchg(&g_state, ST_IDLE);
     if (g_called_back) {
         snprintf(callback, cap, "%s", g_callback);
         printf("guide: the page went to %s: closed with that callback address, back to the game\n", g_callback);

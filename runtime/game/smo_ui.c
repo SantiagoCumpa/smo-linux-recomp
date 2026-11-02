@@ -27,7 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <windows.h>
+#include "plat.h"
 #include "smo_ui.h"
 #include "tex_decode.h"
 
@@ -41,7 +41,7 @@ void ui_image_free(UiImage *im) { if (im) { free(im->px); memset(im, 0, sizeof *
 
 /* ================================================================ files */
 uint8_t *ui_file(const char *path, size_t *size) {
-    char full[MAX_PATH];
+    char full[PATH_MAX];
     snprintf(full, sizeof full, "%s\\%s", fs_rom_root(), path);
     for (char *p = full; *p; p++) if (*p == '/') *p = '\\';
     FILE *f = fopen(full, "rb");

@@ -131,7 +131,7 @@ static void online_fr_Profile_GetAccountId(Ctx *c) { RET(rd64(A0)); }
 #define BCAT_NOT_MOUNTED 0xa7au
 #define BCAT_ALREADY_OPEN 0xc7au
 #define BCAT_NOT_OPEN 0xe7au
-extern volatile LONG g_bcat_mounted;                      /* nnsdk.c */
+extern volatile int32_t g_bcat_mounted;                      /* nnsdk.c */
 int bcat_dirname_valid(const char *s);                    /* nnsdk.c: [sdk 0xc1be0] */
 static int online_bcat_dir_ok(uint64_t name) { const char *s = (const char *)(uintptr_t)name; return strnlen(s, 32) < 32 && bcat_dirname_valid(s); }
 static int online_bcat_file_ok(uint64_t name) {              /* [sdk 0xc1b60] */
@@ -173,16 +173,16 @@ static void online_bcat_close(Ctx *c) {                       /* Close and the d
 }
 
 /* ---------------------------------------------------------------- nn::pl */
-static volatile LONG g_vr_mode;                        /* the flag the am module keeps ([suyu] common_state_getter.cpp:225) */
+static volatile int32_t g_vr_mode;                        /* the flag the am module keeps ([suyu] common_state_getter.cpp:225) */
 static void online_pl_BeginVrMode(Ctx *c) {
     ImportFn permit = import_lookup("_ZN2nn4pctl27CheckStereoVisionPermissionEb");
     c->x[0] = 0;
     if (permit) permit(c);
     if (!permit || !(c->x[0] & 1)) { RET(0xd08eu); return; }
-    InterlockedExchange(&g_vr_mode, 1);
+    plat_xchg(&g_vr_mode, 1);
     RET(0);
 }
-static void online_pl_EndVrMode(Ctx *c) { InterlockedExchange(&g_vr_mode, 0); RET(0); }
+static void online_pl_EndVrMode(Ctx *c) { plat_xchg(&g_vr_mode, 0); RET(0); }
 
 static const ImportDef online_defs[] = {
     {"_ZN2nn7account12AsyncContextC1Ev", online_acc_Async_ctor},

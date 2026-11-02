@@ -6,8 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <windows.h>
-#include <shlwapi.h>
+#include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -53,7 +52,7 @@ typedef struct {
 } TzRule;
 _Static_assert(sizeof(TzRule) == 0x4000 && sizeof(TzType) == 0x10, "time zone rule layout");
 typedef struct { int year, mon, mday, hour, min, sec, wday, yday, isdst, utoff; char zone[16]; } TzTm;
-typedef struct { LONG Bias, StandardBias, DaylightBias; SYSTEMTIME StandardDate, DaylightDate; } RegTzi;
+typedef struct { int32_t Bias, StandardBias, DaylightBias; SYSTEMTIME StandardDate, DaylightDate; } RegTzi;
 typedef struct { RegTzi base; int first, last; RegTzi dyn[160]; uint8_t have[160]; } WinZone;
 #define TZ_OVERFLOW 0x19274u            /* module 116, description 201 */
 #define TZ_OUT_OF_RANGE 0x70c74u        /* 902 */
@@ -123,7 +122,7 @@ static int tz_validate(const TzRule *r) {                                   /* s
 
 static int winzone_load(const wchar_t *key, WinZone *z) {
     wchar_t path[256];
-    DWORD size = sizeof z->base, type = 0, v = 0;
+    uint32_t size = sizeof z->base, type = 0, v = 0;
     memset(z, 0, sizeof *z);
     _snwprintf(path, 255, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Time Zones\\%ls", key); path[255] = 0;
     if (SHGetValueW(HKEY_LOCAL_MACHINE, path, L"TZI", &type, &z->base, &size) != ERROR_SUCCESS || size != sizeof z->base) return -1;
@@ -189,7 +188,7 @@ static int tzdb_load(const char *iana, TzRule *r, char *std_name, int32_t *std_o
     std_name[0] = dst_name[0] = 0;
     if (!iana || !iana[0] || strstr(iana, "..") || strchr(iana, ':') || iana[0] == '/' || iana[0] == '\\') return -1;
     for (int k = 0; k < 3; k++) {
-        char path[MAX_PATH];
+        char path[PATH_MAX];
         static uint8_t buf[256 * 1024];
         if (!dirs[k] || !dirs[k][0]) continue;
         snprintf(path, sizeof path, "%s\\%s", dirs[k], iana);
@@ -268,7 +267,7 @@ static int tzrule_name(TzRule *r, const char *name) {                       /* i
     return at;
 }
 /* w = the transitions Windows' data gives for 1970..2037 (types without names). */
-static void winrule_build(TzRule *w, const WinZone *z, int fixed, LONG fixed_bias) {
+static void winrule_build(TzRule *w, const WinZone *z, int fixed, int32_t fixed_bias) {
     int cur = -1;
     memset(w, 0, sizeof *w);
     for (int year = 1970; year <= 2037; year++) {
@@ -291,10 +290,10 @@ static void winrule_build(TzRule *w, const WinZone *z, int fixed, LONG fixed_bia
  * console's archive has it), continued after the file's last explicit transition by the transitions Windows' data gives
  * (a compiled zone file continues with the rule in its footer; Windows' current entry is that rule, kept up to date by
  * Windows Update). Without the file (iana NULL or not found): Windows' data for all of 1970..2037, numeric names. */
-static void tzrule_build(TzRule *r, const WinZone *z, const char *iana, int fixed, LONG fixed_bias) {
+static void tzrule_build(TzRule *r, const WinZone *z, const char *iana, int fixed, int32_t fixed_bias) {
     static TzRule w;
-    static SRWLOCK lock = SRWLOCK_INIT;                                     /* w and the file buffer are shared */
-    AcquireSRWLockExclusive(&lock);
+    static plat_rwlock_t lock = PLAT_RWLOCK_INIT;                                     /* w and the file buffer are shared */
+    plat_rw_wlock(&lock);
     char std_name[16], dst_name[16];
     int32_t n_std = 0, n_dst = 0;
     int map[128], cur, have_file = iana && tzdb_load(iana, r, std_name, &n_std, dst_name, &n_dst) == 0;
@@ -323,13 +322,13 @@ static void tzrule_build(TzRule *r, const WinZone *z, const char *iana, int fixe
         if (type == cur || r->timecnt >= 1000) continue;
         r->ats[r->timecnt] = w.ats[k]; r->types[r->timecnt++] = (uint8_t)type; cur = type;
     }
-    ReleaseSRWLockExclusive(&lock);
+    plat_rw_wunlock(&lock);
 }
 static void location_name(char out[0x24]);
 static TzRule *my_rule(void) {                                              /* the rule of the Windows time zone, built once */
     static TzRule rule;
-    static volatile LONG ready;
-    if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
+    static volatile int32_t ready;
+    if (plat_cas(&ready, 1, 0) == 0) {
         DYNAMIC_TIME_ZONE_INFORMATION d;
         static WinZone z;
         char iana[0x24];
@@ -344,7 +343,7 @@ static TzRule *my_rule(void) {                                              /* t
         tzrule_build(&rule, &z, iana, d.DynamicDaylightTimeDisabled != 0, d.Bias + d.StandardBias);   /* "adjust for daylight saving time" off */
         ready = 2;
     }
-    while (ready != 2) SwitchToThread();
+    while (ready != 2) plat_yield();
     return &rule;
 }
 static void calendar_out(Ctx *c, const TzRule *r) {
@@ -371,8 +370,8 @@ static void time_ToPosixTimeFromUtc(Ctx *c) { struct tm t; read_calendar(A0, &t)
 /* The location name: the IANA name of the Windows time zone (ICU, Windows 10 1903+; "UTC" if ICU is absent). */
 static void location_name(char out[0x24]) {
     static char name[0x24];
-    static volatile LONG ready;
-    if (InterlockedCompareExchange(&ready, 1, 0) == 0) {
+    static volatile int32_t ready;
+    if (plat_cas(&ready, 1, 0) == 0) {
         strcpy(name, "UTC");
         HMODULE icu = LoadLibraryA("icu.dll");
         typedef int (__cdecl *GetTz)(unsigned short *, int, int *);
@@ -384,7 +383,7 @@ static void location_name(char out[0x24]) {
         }
         ready = 2;
     }
-    while (ready != 2) SwitchToThread();
+    while (ready != 2) plat_yield();
     memset(out, 0, 0x24);
     strcpy(out, name);
 }
@@ -409,8 +408,8 @@ void register_time_imports(void) {
  * the current year, every 2 h 59 min of 1990..2037; then the handlers on the PC's own zone. */
 #define GP(p) ((uint64_t)(uintptr_t)(p))
 int nntime_selftest(Ctx *c) {
-    typedef BOOL (WINAPI *ToLocal)(const DYNAMIC_TIME_ZONE_INFORMATION *, const SYSTEMTIME *, SYSTEMTIME *);
-    typedef DWORD (WINAPI *EnumTz)(DWORD, DYNAMIC_TIME_ZONE_INFORMATION *);
+    typedef int (*ToLocal)(const DYNAMIC_TIME_ZONE_INFORMATION *, const SYSTEMTIME *, SYSTEMTIME *);
+    typedef uint32_t (*EnumTz)(uint32_t, DYNAMIC_TIME_ZONE_INFORMATION *);
     ToLocal to_local = (ToLocal)GetProcAddress(GetModuleHandleA("kernel32.dll"), "SystemTimeToTzSpecificLocalTimeEx");
     EnumTz enum_tz = (EnumTz)GetProcAddress(LoadLibraryA("advapi32.dll"), "EnumDynamicTimeZoneInformation");
     static TzRule r;
@@ -425,7 +424,7 @@ int nntime_selftest(Ctx *c) {
     int this_year = st.wYear;
     int64_t y0 = days_from_civil(this_year, 1, 1) * 86400, y1 = days_from_civil(this_year + 1, 1, 1) * 86400;
     if (!to_local || !enum_tz) { printf("  time zone: Windows conversion functions not found\n"); return 1; }
-    for (DWORD i = 0; ; i++) {
+    for (uint32_t i = 0; ; i++) {
         DYNAMIC_TIME_ZONE_INFORMATION d;
         long long dn = 0, dother = 0;
         int64_t first_bad = 0;
@@ -440,7 +439,7 @@ int nntime_selftest(Ctx *c) {
                 SYSTEMTIME su, sl;
                 tz_split(t, 0, &u);
                 memset(&su, 0, sizeof su);
-                su.wYear = (WORD)u.year; su.wMonth = (WORD)u.mon; su.wDay = (WORD)u.mday; su.wHour = (WORD)u.hour; su.wMinute = (WORD)u.min; su.wSecond = (WORD)u.sec;
+                su.wYear = (uint16_t)u.year; su.wMonth = (uint16_t)u.mon; su.wDay = (uint16_t)u.mday; su.wHour = (uint16_t)u.hour; su.wMinute = (uint16_t)u.min; su.wSecond = (uint16_t)u.sec;
                 if (!to_local(&d, &su, &sl) || tz_local(&r, t, &l)) { bad++; break; }
                 cases++;
                 if (sl.wYear != l.year || sl.wMonth != l.mon || sl.wDay != l.mday || sl.wHour != l.hour || sl.wMinute != l.min || sl.wSecond != l.sec) {
