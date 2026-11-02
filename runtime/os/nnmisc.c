@@ -19,8 +19,6 @@
 #include "hostrt.h"
 #include "gfx_options.h"
 
-#pragma comment(lib, "advapi32.lib")
-
 #define A0 (c->x[0])
 #define A1 (c->x[1])
 #define A2 (c->x[2])

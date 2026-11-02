@@ -43,7 +43,7 @@ HOST_SOURCES = {
     'os': ['os_threads.c', 'nnsdk.c', 'nntime.c', 'nnmisc.c', 'smo_nn.c'],
     'fs': ['nnfs.c', 'nnfsdir.c'],
     'gfx': ['nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'nvn_misc.c', 'nvn_handles.c', 'nvn_layout.c', 'mx_translate.c',
-            'tex_decode.c', 'display.c', 'gfx_options.c', 'vk_shaderc_shim.c'],
+            'tex_decode.c', 'display.c', 'gfx_options.c', 'vk_shaderc_shim.c', 'gl_absent.c'],
     'audio': ['nnaudio.c', 'smo_audio.c'],
     'input': ['nnhid.c', 'nnpad_sdl.c'],
     'services': ['nnservices.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmovie_ff.c'],
@@ -79,7 +79,7 @@ def build_game_dll(force):
         f.write('\n'.join('"%s"' % o.replace('\\', '/') for o in objs))
     t0 = time.time()
     r = subprocess.run([CLANG, '-shared', '-fPIC', '-fvisibility=hidden', '-fuse-ld=lld', '-O1', '-w'] + T.runtime_includes()
-                       + ['-I', LIFT, shim, '@' + rsp, '-Wl,-z,now', '-Wl,--no-undefined', '-lm', '-o', dll],
+                       + ['-I', LIFT, shim, '@' + rsp, '-Wl,-z,now', '-Wl,--no-undefined', '-Wl,-soname,' + T.GAME_LIB, '-lm', '-o', dll],
                        capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip()
     if r.returncode:

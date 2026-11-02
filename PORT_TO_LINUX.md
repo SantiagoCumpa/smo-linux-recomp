@@ -84,6 +84,12 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
 - [x] Fase 5 — `runtime/game/*` (`smo_nerve.c` con `process_vm_readv`, `smo_fast.c` con `dl_iterate_phdr`,
   `smo_selftest.c`, `smo_ui.c`) y `libc/nncxxrt.c`
 - [x] Compilación completa del runtime sin errores con clang (`build/tmp/syncheck.py`, sin dump: 50 de 50 archivos)
+- [x] Enlace completo sin dump: `tests/check_link.py` compila el runtime con encabezados sustitutos, enlaza
+  `smo_native` contra una `libsmo_game.so` vacía (0 símbolos sin resolver; encontró dos fallos: `#pragma comment(lib)`
+  de Windows en `nnmisc.c`/`nvn_gl.c`, y la biblioteca del juego sin `soname`, con lo que `$ORIGIN` no servía) y
+  corre `--shaderc-selftest` (OK) y `SMO_PAD_SELFTEST=1` (51/51 con mandos virtuales de SDL3)
+- [ ] Limpieza — quitar el código del backend OpenGL de `nvn_gl.c` (hoy inalcanzable; sus 38 llamadas a GL 1.1
+  enlazan contra `runtime/gfx/gl_absent.c`, que aborta si alguna se llamara) y luego borrar `gl_absent.c`
 - [x] Fase 6 — barreras de memoria en `recomp.py`: `dmb`/`dsb` → `__atomic_thread_fence` (acquire con `LD`,
   release con `ST`, seq_cst el resto), `isb` → barrera del compilador, `ldar`/`ldaxr` → `lda<n>` (acquire),
   `stlr` → `stl<n>` (release) en `runtime.h`. Comprobado sin dump con `tests/check_ordered.py` (ELF falso; 256 casos

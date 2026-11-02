@@ -63,11 +63,8 @@
 #include "nvn_sdk.h"
 #include "nvn_misc.h"
 
-#pragma comment(lib, "opengl32.lib")
-
-/* ask laptop drivers for the discrete GPU */
-__attribute__((visibility("default"))) uint32_t NvOptimusEnablement = 1;
-__attribute__((visibility("default"))) int AmdPowerXpressRequestHighPerformance = 1;
+/* The discrete GPU of a hybrid laptop: PRIME render offload variables set by scripts/run.py, and nvn_vk.c prefers a
+ * discrete device (the Windows exports NvOptimusEnablement / AmdPowerXpressRequestHighPerformance mean nothing here). */
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
