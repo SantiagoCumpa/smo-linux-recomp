@@ -54,14 +54,16 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
 - [x] Fase 0 — `build_exe.py`: `libsmo_game.so` + `smo_native` con pkg-config, rpath, shaderc enlazado
 - [x] Fase 0 — `extract.py`: symlinks en vez de junctions
 - [x] Fase 0 — `setup.py` deps (clang, lld, pkg-config) con mensajes de `pacman`
-- [~] Fase 0 — `run.py` + tests: sin `.exe`, `flock`, PRIME, cachés en `./build/cache` (hecho: `run.py`,
-  `check_game_places.py`, `difftest.py`, `linkcheck.py`; faltan `check_all_shaders.py`, `bntx_layout_check.py`,
-  `check_fast_paths.py`, `build_mx_equiv.py`, `stress_stages.py`, `tools/dev/*`)
-- [~] Fase 0 — C de herramientas/tests sin `windows.h` (hecho: `difftest_host.c`, `linkcheck_stub.c`; faltan
-  `tests/{fast_paths,mx_equiv,mx_all}.c`)
+- [x] Fase 0 — `run.py` + tests: sin `.exe`, `flock`, PRIME, cachés en `./build/cache` (`run.py`,
+  `check_game_places.py`, `difftest.py`, `linkcheck.py`, `check_all_shaders.py`, `bntx_layout_check.py`,
+  `check_fast_paths.py`, `build_mx_equiv.py`, `stress_stages.py`, `run_cap_kingdom.py`; `tools/dev/cpuload.py` y
+  `memmap.py` sobre `/proc`, `profnames.py` con `llvm-cxxfilt` del PATH)
+- [x] Fase 0 — C de herramientas/tests sin `windows.h` (`difftest_host.c`, `linkcheck_stub.c`,
+  `tests/{fast_paths,mx_equiv,mx_all}.c` con shaderc enlazado, `layout_probe.c` → `liblayout_probe.so`).
+  Comprobado sin dump: `check_fast_paths.py` PASS; `mx_all`, `mx_equiv` y la sonda de texturas compilan y corren
 - [x] Fase 1 — `runtime/core/plat.h` / `plat.c` (locks, eventos, atómicos, tiempo, hilos, memoria, archivos)
 - [x] Fase 2 — `hostrt.c`: mapeo con mmap, manejador de señales e informe de crash
-- [~] Fase 2 — `boot.c`, `sdklift_rt.c`, `gamedll.c`, `hitch.c` (hechos); falta `game_shim.c` (`__declspec`)
+- [x] Fase 2 — `boot.c`, `sdklift_rt.c`, `gamedll.c`, `hitch.c`, `game_shim.c` (`visibility("default")`)
 - [x] Fase 3 — `os_threads.c`: pthreads, topología P/E, slots con flock, prioridades (nice/SCHED_IDLE)
 - [x] Fase 3 — `smo_nn.c` + `nvn_stub.c`: heap con memfd y vistas con mmap
 - [x] Fase 3 — `nntime.c`, `nnmisc.c`, `nnsdk.c`
@@ -71,14 +73,17 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
 - [x] Fase 4 — `nvn_vk_draw.c`, `nvn_vk_pipelines.c`, `nvn_vk_watchdog.c`, `nvn_misc.c` a `plat.h`
 - [x] Fase 4 — `nvn_gl.c`: quitar el backend OpenGL, conservar el front end; `gfx_options.c`
 - [x] Fase 4 — `vk_shaderc_shim.c` enlazado directo
-- [ ] Fase 4 — `nnhid.c` (teclado SDL, sin XInput), `nnpad_sdl.c` (códigos `VK_*` → `vk_codes.h`)
-- [ ] Fase 5 — `smo_audio.c`, `nnaudio.c`: audio con SDL3
-- [ ] Fase 5 — `nnmovie_ff.c` (FFmpeg) en lugar de `nnmovie_mf.c`; `nnmovie.c`
-- [ ] Fase 5 — `nnfontll.c` (FreeType), `nnpl.c` (fontconfig)
-- [ ] Fase 5 — `nnnet.c`, `nnsocket.inc`, `nnonline.inc` (sockets BSD, getrandom)
-- [ ] Fase 5 — `nnapplet.c` (zenity/xdg-open), `smo_guide.c` (navegador), `nnalbum.c`, `nnservices.c`
-- [ ] Fase 5 — `runtime/game/*` (`smo_nerve.c` sin `__try`, `smo_fast.c`, `smo_selftest.c`) y `libc/nncxxrt.c`
-- [ ] Compilación completa del runtime sin errores con clang (`build/tmp/syncheck.py`, sin dump)
+- [x] Fase 4 — `nnhid.c` (teclado SDL con foco, sin biblioteca XInput; el pad XInput sintético de las pruebas se
+  conserva en la frontera), `nnpad_sdl.c` (códigos `VK_*` → `vk_codes.h`)
+- [x] Fase 5 — `smo_audio.c`, `nnaudio.c`: audio con un stream de SDL3
+- [x] Fase 5 — `nnmovie_ff.c` (FFmpeg: libavformat desde memoria, NV12 por swscale, PCM por swresample);
+  `nnmovie_mf.c` borrado; `nnmovie.c`
+- [x] Fase 5 — `nnfontll.c` (FreeType, sin escalar ni hinting), `nnpl.c` (fontconfig de respaldo)
+- [x] Fase 5 — `nnnet.c`, `nnsocket.inc`, `nnonline.inc` (sockets BSD, getrandom)
+- [x] Fase 5 — `nnapplet.c` (zenity/kdialog, xdg-open), `smo_guide.c` (navegador), `nnalbum.c`, `nnservices.c`
+- [x] Fase 5 — `runtime/game/*` (`smo_nerve.c` con `process_vm_readv`, `smo_fast.c` con `dl_iterate_phdr`,
+  `smo_selftest.c`, `smo_ui.c`) y `libc/nncxxrt.c`
+- [x] Compilación completa del runtime sin errores con clang (`build/tmp/syncheck.py`, sin dump: 50 de 50 archivos)
 - [ ] Fase 6 — barreras de memoria en `recomp.py` + difftest
 - [ ] Fase 7 — README, `docs/*.md`, `.gitignore`
 - [ ] Verificación 1–2: dependencias y `setup.py --dump ./dump --check` (bloqueado: dump cifrado, ver arriba)
