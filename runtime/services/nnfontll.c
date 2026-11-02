@@ -50,8 +50,8 @@
  *   AcquireOtfKerning(table, c1, c2, size) = floor((single1.adv - single1.plc + single2.plc + pair.adv)
  *   / unitsPerEm * size + 0.5); First = single.plc, Last = single.adv - single.plc, scaled the same way.
  *
- * What is NOT the real thing: the outlines come from Windows GDI (GetGlyphOutline, unhinted Bezier outlines
- * at one font unit per pixel, glyph indices from our own cmap lookup) and are scan-converted here with exact
+ * What is NOT the real thing: the outlines come from FreeType (FT_Load_Glyph with FT_LOAD_NO_SCALE | NO_HINTING:
+ * unhinted outlines in font units, glyph indices from our own cmap lookup) and are scan-converted here with exact
  * area coverage. iType's own hinting / grid fitting, its bold algorithm and its exact fixed-point rounding
  * are not reproduced: advances are advanceWidth * pixels / unitsPerEm rounded to 16.16.
  *
@@ -63,6 +63,9 @@
 #include <string.h>
 #include <math.h>
 #include "plat.h"
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#include FT_OUTLINE_H
 #ifndef FONTLL_TEST
 #include "runtime.h"
 #include "hostrt.h"
@@ -90,14 +93,13 @@ typedef struct {
     uint8_t *data;                                /* our own copy */
     const uint8_t *dir;                           /* table directory of the chosen face */
     uint32_t size, hash, face_index;
-    WCHAR face[LF_FACESIZE];
     char name[50];
     int upem, glyphs, hmetrics, cff;
     const uint8_t *head, *hhea, *os2, *hmtx, *cmap, *sub, *kern, *gpos, *nametab;
     uint32_t kern_len, gpos_len, cmap_len;
     int sub_format;
-    HFONT hfont;
-    int gdi;                                      /* 0 not tried, 1 usable, -1 unusable */
+    FT_Face ft;
+    int gdi;                                      /* FreeType face: 0 not tried, 1 usable, -1 unusable */
     volatile int64_t drawn;                        /* glyph maps made from this font (fontll_report) */
     volatile int32_t seen[0x10000 / 32];             /* which characters of the Basic Multilingual Plane were drawn */
     long long last_frame, when[8];                /* frames at which drawing from it began again after a pause */
@@ -119,9 +121,8 @@ typedef struct {
 static Engine g_engines[MAX_ENGINES];
 static FontData g_fontdata[MAX_FONTDATA];
 static int g_fontdata_count;
-static plat_lock_t g_lock;                   /* GDI, the font list and the engine table */
-static HDC g_dc;
-static const MAT2 identity = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
+static plat_lock_t g_lock = PLAT_LOCK_INIT;  /* FreeType, the font list and the engine table */
+static FT_Library g_ft;
 
 static uint32_t be16(const uint8_t *p) { return (uint32_t)p[0] << 8 | p[1]; }
 static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
@@ -166,7 +167,7 @@ static uint32_t file_size(const uint8_t *data) {
 }
 
 /* A string of the name table as ASCII (Windows platform, English preferred). */
-static int name_string(const FontData *f, int id, char *out, int room, WCHAR *wide, int wroom) {
+static int name_string(const FontData *f, int id, char *out, int room, uint16_t *wide, int wroom) {
     const uint8_t *name = f->nametab, *best = NULL;
     if (room) out[0] = 0;
     if (wide && wroom) wide[0] = 0;
@@ -181,7 +182,7 @@ static int name_string(const FontData *f, int id, char *out, int room, WCHAR *wi
     int len = (int)be16(best + 8) / 2, k = 0;
     for (int i = 0; i < len; i++) {
         unsigned ch = be16(strings + be16(best + 10) + i * 2);
-        if (wide && i < wroom - 1) { wide[i] = (WCHAR)ch; wide[i + 1] = 0; }
+        if (wide && i < wroom - 1) { wide[i] = (uint16_t)ch; wide[i + 1] = 0; }
         if (k < room - 1) out[k++] = ch >= 32 && ch < 127 ? (char)ch : '?';
     }
     if (room) out[k] = 0;
@@ -276,7 +277,7 @@ static FontData *font_data(const uint8_t *data, uint32_t index) {
     f->hmetrics = (int)be16(f->hhea + 34);
     pick_cmap(f);
     char family[41];
-    name_string(f, 1, family, sizeof family, f->face, LF_FACESIZE);
+    name_string(f, 1, family, sizeof family, NULL, 0);
     int n = 0;
     for (; family[n]; n++) f->name[n] = family[n] > 32 && family[n] != '?' ? family[n] : '_';
     if (!n) n = snprintf(f->name, sizeof f->name, "font");
@@ -289,14 +290,14 @@ static FontData *font_data(const uint8_t *data, uint32_t index) {
     const char *dump = getenv("SMO_FONTDUMP");
     if (dump) {
         char path[PATH_MAX];
-        snprintf(path, sizeof path, "%s\\%s.%s", dump, f->name, f->cff ? "otf" : "ttf");
+        snprintf(path, sizeof path, "%s/%s.%s", dump, f->name, f->cff ? "otf" : "ttf");
         FILE *out = fopen(path, "wb");
         if (out) { fwrite(f->data, 1, size, out); fclose(out); }
     }
     return f;
 }
 
-/* ---------------------------------------------------------------- outlines (from GDI, in font units) */
+/* ---------------------------------------------------------------- outlines (from FreeType, in font units) */
 typedef struct { double x, y; } Pt;
 typedef struct { Pt *p; int n, cap; int *end; int contours, ccap; } Path;       /* flattened contours */
 
@@ -309,97 +310,80 @@ static void path_close(Path *path) {
     if (path->contours == path->ccap) { path->ccap = path->ccap ? path->ccap * 2 : 16; path->end = realloc(path->end, (size_t)path->ccap * sizeof(int)); }
     path->end[path->contours++] = path->n;
 }
-static double fx(FIXED v) { return v.value + v.fract / 65536.0; }
 
-/* Makes GDI able to draw from this font file; verifies that the face GDI selects really is this file. */
-static int gdi_prepare(FontData *f) {             /* callers hold g_lock */
+/* Opens this font file's face in FreeType (once). */
+static int ft_prepare(FontData *f) {              /* callers hold g_lock */
     if (f->gdi) return f->gdi > 0;
-    uint32_t installed = 0;
     f->gdi = -1;
-    if (!f->face[0] || !AddFontMemResourceEx(f->data, f->size, NULL, &installed)) { printf("nn::fontll: font \"%s\" REJECTED BY GDI: its glyphs will be blank\n", f->name); return 0; }
-    f->hfont = CreateFontW(-f->upem, 0, 0, 0, FW_DONTCARE, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, f->face);
-    if (!f->hfont) return 0;
-    SelectObject(g_dc, f->hfont);
-    WCHAR got[LF_FACESIZE];
-    uint8_t head[54];
-    GetTextFaceW(g_dc, LF_FACESIZE, got);
-    uint32_t n = GetFontData(g_dc, 0x64616568 /* "head" */, 0, head, sizeof head);
-    int same = n == sizeof head && !memcmp(head, f->head, sizeof head) && !lstrcmpiW(got, f->face);
-    if (!same) { printf("nn::fontll: font \"%s\": GDI selected another font (\"%ls\"): its glyphs will be blank\n", f->name, got); return 0; }
+    if (!g_ft && FT_Init_FreeType(&g_ft)) { g_ft = NULL; printf("nn::fontll: FreeType could not start: glyphs will be blank\n"); return 0; }
+    if (FT_New_Memory_Face(g_ft, f->data, (FT_Long)f->size, (FT_Long)f->face_index, &f->ft)) {
+        printf("nn::fontll: font \"%s\" REJECTED BY FreeType: its glyphs will be blank\n", f->name);
+        return 0;
+    }
     f->gdi = 1;
     return 1;
 }
 
+/* FT_Outline_Decompose callbacks: font units -> the engine's matrix, curves flattened as the GDI path was */
+typedef struct { Path *path; double a, b, c, d, pixels, x0, y0; int open; } Walk;
+#define TX(w, px, py) ((px) * (w)->a + (py) * (w)->b)
+#define TY(w, px, py) ((px) * (w)->c + (py) * (w)->d)
+static void walk_to(Walk *w, double x, double y) { path_point(w->path, TX(w, x, y), TY(w, x, y)); w->x0 = x; w->y0 = y; }
+static int ft_move(const FT_Vector *to, void *u) {
+    Walk *w = u;
+    if (w->open) path_close(w->path);
+    w->open = 1;
+    walk_to(w, (double)to->x, (double)to->y);
+    return 0;
+}
+static int ft_line(const FT_Vector *to, void *u) { walk_to(u, (double)to->x, (double)to->y); return 0; }
+static int ft_conic(const FT_Vector *ctl, const FT_Vector *to, void *u) {
+    Walk *w = u;
+    double x0 = w->x0, y0 = w->y0, x1 = (double)ctl->x, y1 = (double)ctl->y, x2 = (double)to->x, y2 = (double)to->y;
+    double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1)) * w->pixels;
+    int steps = 2 + (int)(len / 3.0);
+    if (steps > 32) steps = 32;
+    for (int k = 1; k <= steps; k++) {
+        double t = (double)k / steps, v = 1 - t, px = v * v * x0 + 2 * v * t * x1 + t * t * x2, py = v * v * y0 + 2 * v * t * y1 + t * t * y2;
+        path_point(w->path, TX(w, px, py), TY(w, px, py));
+    }
+    w->x0 = x2; w->y0 = y2;
+    return 0;
+}
+static int ft_cubic(const FT_Vector *c1, const FT_Vector *c2, const FT_Vector *to, void *u) {
+    Walk *w = u;
+    double x0 = w->x0, y0 = w->y0, x1 = (double)c1->x, y1 = (double)c1->y, x2 = (double)c2->x, y2 = (double)c2->y, x3 = (double)to->x, y3 = (double)to->y;
+    double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1) + fabs(x3 - x2) + fabs(y3 - y2)) * w->pixels;
+    int steps = 2 + (int)(len / 3.0);
+    if (steps > 32) steps = 32;
+    for (int k = 1; k <= steps; k++) {
+        double t = (double)k / steps, v = 1 - t;
+        double px = v * v * v * x0 + 3 * v * v * t * x1 + 3 * v * t * t * x2 + t * t * t * x3;
+        double py = v * v * v * y0 + 3 * v * v * t * y1 + 3 * v * t * t * y2 + t * t * t * y3;
+        path_point(w->path, TX(w, px, py), TY(w, px, py));
+    }
+    w->x0 = x3; w->y0 = y3;
+    return 0;
+}
+
 /* Appends the outline of a glyph, transformed by the 16.16 matrix m / unitsPerEm, as polylines (y up). */
 static void glyph_path(FontData *f, uint32_t glyph, const int32_t *m, Path *path) {
-    static uint8_t *buf;
-    static uint32_t cap;
-    GLYPHMETRICS gm;
     plat_lock(&g_lock);
-    if (gdi_prepare(f)) {
-        SelectObject(g_dc, f->hfont);
-        const unsigned fmt = GGO_BEZIER | GGO_UNHINTED | GGO_GLYPH_INDEX;
-        uint32_t size = GetGlyphOutlineW(g_dc, glyph, fmt, &gm, 0, NULL, &identity);
-        if (size != GDI_ERROR && size) {
-            if (size > cap) { cap = size + 4096; buf = realloc(buf, cap); }
-            size = GetGlyphOutlineW(g_dc, glyph, fmt, &gm, size, buf, &identity);
-        }
-        if (size != GDI_ERROR && size) {
-            double a = m[0] / 65536.0 / f->upem, b = m[1] / 65536.0 / f->upem, c2 = m[2] / 65536.0 / f->upem, d = m[3] / 65536.0 / f->upem;
-            double pixels = fabs(a) > fabs(d) ? fabs(a) : fabs(d);
-#define TX(px, py) ((px) * a + (py) * b)
-#define TY(px, py) ((px) * c2 + (py) * d)
-            for (uint32_t at = 0; at + sizeof(TTPOLYGONHEADER) <= size;) {
-                const TTPOLYGONHEADER *ph = (const TTPOLYGONHEADER *)(buf + at);
-                uint32_t end = at + ph->cb;
-                if (ph->cb < sizeof *ph || end > size) break;
-                double x0 = fx(ph->pfxStart.x), y0 = fx(ph->pfxStart.y);
-                path_point(path, TX(x0, y0), TY(x0, y0));
-                for (at += sizeof *ph; at + 4 <= end;) {
-                    const TTPOLYCURVE *pc = (const TTPOLYCURVE *)(buf + at);
-                    int n = pc->cpfx;
-                    if (pc->wType == TT_PRIM_LINE) {
-                        for (int i = 0; i < n; i++) { x0 = fx(pc->apfx[i].x); y0 = fx(pc->apfx[i].y); path_point(path, TX(x0, y0), TY(x0, y0)); }
-                    } else if (pc->wType == TT_PRIM_CSPLINE) {
-                        for (int i = 0; i + 2 < n; i += 3) {
-                            double x1 = fx(pc->apfx[i].x), y1 = fx(pc->apfx[i].y), x2 = fx(pc->apfx[i + 1].x), y2 = fx(pc->apfx[i + 1].y);
-                            double x3 = fx(pc->apfx[i + 2].x), y3 = fx(pc->apfx[i + 2].y);
-                            double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1) + fabs(x3 - x2) + fabs(y3 - y2)) * pixels;
-                            int steps = 2 + (int)(len / 3.0);
-                            if (steps > 32) steps = 32;
-                            for (int k = 1; k <= steps; k++) {
-                                double t = (double)k / steps, u = 1 - t;
-                                double px = u * u * u * x0 + 3 * u * u * t * x1 + 3 * u * t * t * x2 + t * t * t * x3;
-                                double py = u * u * u * y0 + 3 * u * u * t * y1 + 3 * u * t * t * y2 + t * t * t * y3;
-                                path_point(path, TX(px, py), TY(px, py));
-                            }
-                            x0 = x3; y0 = y3;
-                        }
-                    } else {                      /* TT_PRIM_QSPLINE: control points with implied on-curve midpoints */
-                        for (int i = 0; i + 1 < n; i++) {
-                            double x1 = fx(pc->apfx[i].x), y1 = fx(pc->apfx[i].y), x2 = fx(pc->apfx[i + 1].x), y2 = fx(pc->apfx[i + 1].y);
-                            if (i + 2 < n) { x2 = (x1 + x2) / 2; y2 = (y1 + y2) / 2; }
-                            double len = (fabs(x1 - x0) + fabs(y1 - y0) + fabs(x2 - x1) + fabs(y2 - y1)) * pixels;
-                            int steps = 2 + (int)(len / 3.0);
-                            if (steps > 32) steps = 32;
-                            for (int k = 1; k <= steps; k++) {
-                                double t = (double)k / steps, u = 1 - t, px = u * u * x0 + 2 * u * t * x1 + t * t * x2, py = u * u * y0 + 2 * u * t * y1 + t * t * y2;
-                                path_point(path, TX(px, py), TY(px, py));
-                            }
-                            x0 = x2; y0 = y2;
-                        }
-                    }
-                    at += 4 + (uint32_t)n * sizeof(POINTFX);
-                }
-                path_close(path);
-                at = end;
-            }
-#undef TX
-#undef TY
-        }
+    if (ft_prepare(f) && !FT_Load_Glyph(f->ft, glyph, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING | FT_LOAD_NO_BITMAP) &&
+        f->ft->glyph->format == FT_GLYPH_FORMAT_OUTLINE) {
+        Walk w;
+        memset(&w, 0, sizeof w);
+        w.path = path;
+        w.a = m[0] / 65536.0 / f->upem; w.b = m[1] / 65536.0 / f->upem; w.c = m[2] / 65536.0 / f->upem; w.d = m[3] / 65536.0 / f->upem;
+        w.pixels = fabs(w.a) > fabs(w.d) ? fabs(w.a) : fabs(w.d);
+        static const FT_Outline_Funcs funcs = {ft_move, ft_line, ft_conic, ft_cubic, 0, 0};
+        FT_Outline_Decompose(&f->ft->glyph->outline, &funcs, &w);
+        if (w.open) path_close(path);
     }
     plat_unlock(&g_lock);
 }
+#undef TX
+#undef TY
 
 /* ---------------------------------------------------------------- scan conversion (exact area coverage) */
 static void cover_line(float *acc, int w, int h, double x0, double y0, double x1, double y1) {
@@ -1077,8 +1061,6 @@ static const ImportDef fontll_imports[] = {
 };
 
 void register_fontll_imports(void) {
-    plat_lock_init(&g_lock);
-    g_dc = CreateCompatibleDC(NULL);
     register_imports(fontll_imports, (int)(sizeof fontll_imports / sizeof fontll_imports[0]));
 }
 
@@ -1107,12 +1089,11 @@ void fontll_report(FILE *out) {
 }
 
 #else
-/* ---------------------------------------------------------------- offline test: clang -DFONTLL_TEST nnfontll.c -lgdi32
+/* ---------------------------------------------------------------- offline test:
+ * clang -DFONTLL_TEST -Iruntime/core nnfontll.c runtime/core/plat.c $(pkg-config --cflags --libs freetype2) -lm
  * fonttest <font file> <pixels> <text or U+hex ...> [outline n]: metrics, advances, glyph maps as text, kerning. */
 int main(int argc, char **argv) {
     if (argc < 4) { printf("usage: fonttest <font> <pixels> <text|U+xxxx> [outline width] [pgm prefix]\n"); return 1; }
-    plat_lock_init(&g_lock);
-    g_dc = CreateCompatibleDC(NULL);
     FILE *in = fopen(argv[1], "rb");
     if (!in) return 1;
     fseek(in, 0, SEEK_END);
@@ -1146,15 +1127,13 @@ int main(int argc, char **argv) {
     else for (const char *p = argv[3]; *p && n < 256; p++) codes[n++] = (uint8_t)*p;
     for (int i = 0; i < n; i++) {
         uint32_t glyph = map_char(f, codes[i]);
-        GLYPHMETRICS gm;
-        memset(&gm, 0, sizeof gm);
-        gdi_prepare(f);
-        SelectObject(g_dc, f->hfont);
-        GetGlyphOutlineW(g_dc, glyph, GGO_METRICS | GGO_GLYPH_INDEX, &gm, 0, NULL, &identity);
-        WCHAR ch = (WCHAR)codes[i];
-        uint16_t gi = 0xffff;
-        GetGlyphIndicesW(g_dc, &ch, 1, &gi, GGI_MARK_NONEXISTING_GLYPHS);
-        printf("U+%04X glyph %u (GDI says %u)  hmtx advance %d units (GDI at em size: %d) = %.4f px -> i_dx %d", codes[i], glyph, gi, advance_units(f, glyph), gm.gmCellIncX,
+        unsigned gi = 0;
+        long ft_adv = 0;
+        if (ft_prepare(f)) {
+            gi = FT_Get_Char_Index(f->ft, codes[i]);
+            if (!FT_Load_Glyph(f->ft, glyph, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING)) ft_adv = f->ft->glyph->advance.x;
+        }
+        printf("U+%04X glyph %u (FreeType says %u)  hmtx advance %d units (FreeType: %ld) = %.4f px -> i_dx %d", codes[i], glyph, gi, advance_units(f, glyph), ft_adv,
                advance_fixed(&e, f, glyph) / 65536.0, (advance_fixed(&e, f, glyph) + 0x8000) >> 16);
         if (i + 1 < n) printf("  kern with next: table %.3f px, GPOS raw %d units -> %d px", kern_fixed(&e, f, codes[i], codes[i + 1]) / 65536.0, otf_raw(f, list.v, list.n, codes[i], codes[i + 1]),
                               otf_scale(otf_raw(f, list.v, list.n, codes[i], codes[i + 1]), 1.0f / (float)f->upem, (uint32_t)atoi(argv[2])));
