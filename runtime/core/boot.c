@@ -277,13 +277,14 @@ int main(int argc, char **argv) {
     pid_t t_tid = plat_thread_tid(t);
     if (getenv("SMO_PROF")) { g_prof_target = t_tid; plat_thread_detach(plat_thread_start(profiler, NULL, 0)); }
     enum { WAIT_DONE = 0, WAIT_TIMEOUT = 1 };
-    int wr = plat_thread_join(t, seconds > 0 ? (uint32_t)seconds * 1000 : PLAT_INFINITE) ? WAIT_DONE : WAIT_TIMEOUT;
+    int display_wait_thread(plat_thread *t, uint32_t ms);   /* display.c: the window's event loop on this, the main thread */
+    int wr = display_wait_thread(t, seconds > 0 ? (uint32_t)seconds * 1000 : PLAT_INFINITE) ? WAIT_DONE : WAIT_TIMEOUT;
     {   unsigned long long stage_list_started(void);     /* smo_nerve.c: SMO_STAGE_LIST (TEST ONLY): the limit counts from the start of the stage being played */
         for (unsigned long long s; wr == WAIT_TIMEOUT && (s = stage_list_started()) && s + (unsigned long long)seconds * 1000 > plat_ms(); )
-            wr = plat_thread_join(t, (uint32_t)(s + (unsigned long long)seconds * 1000 - plat_ms())) ? WAIT_DONE : WAIT_TIMEOUT;
+            wr = display_wait_thread(t, (uint32_t)(s + (unsigned long long)seconds * 1000 - plat_ms())) ? WAIT_DONE : WAIT_TIMEOUT;
     }
     {   unsigned nvn_gl_held_ms(void);                   /* nvn_gl.c: time the presents were held for shader preparation is not run time */
-        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = plat_thread_join(t, h - done) ? WAIT_DONE : WAIT_TIMEOUT;
+        for (unsigned done = 0, h; wr == WAIT_TIMEOUT && (h = nvn_gl_held_ms()) > done + 50; done = h) wr = display_wait_thread(t, h - done) ? WAIT_DONE : WAIT_TIMEOUT;
     }
     if (wr == WAIT_TIMEOUT) {
         printf("\nstill running after %d s with %d guest thread(s) started: stopping here.\n", seconds, guest_thread_count());

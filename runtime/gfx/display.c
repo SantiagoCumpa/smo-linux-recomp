@@ -1,5 +1,8 @@
-/* Host display: a real window, 60 Hz pacing and the guest's vsync event.
- * The window's contents are drawn by the graphics layer's render thread (nvn_gl.c's front end; Vulkan by default). */
+/* Host display: a real window (SDL3: Wayland or X11), 60 Hz pacing and the guest's vsync event.
+ * The window's contents are drawn by the graphics layer's render thread (nvn_gl.c's front end, Vulkan).
+ * SDL wants its video calls and its event loop on the program's main thread: display_init makes the window there and
+ * boot.c's main thread then runs display_wait_thread, which pumps the window's events while the game runs. Other threads
+ * ask for window changes (title, fullscreen, minimise) through requests the event loop applies. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +10,8 @@
 #include "runtime.h"
 #include "hostrt.h"
 #include "gfx_options.h"
+#include "vk_codes.h"
+#include <SDL3/SDL.h>
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -18,10 +23,10 @@
 void os_init_event(uint64_t key, int autoclear);      /* os_threads.c */
 void os_signal_event(uint64_t key);
 
-static HWND g_hwnd;
+static SDL_Window *g_win;
 static volatile int32_t g_ready;
 static volatile int64_t g_frames;
-void nvn_gl_start(void *hwnd);                        /* nvn_gl.c */
+void nvn_gl_start(void *window);                      /* nvn_gl.c: the SDL_Window */
 void nvn_gl_report(FILE *out);
 void nvn_tl(int ev, int arg);                          /* nvn_gl.c: SMO_FRAMETL timeline */
 static uint64_t g_vsync_event;
@@ -42,7 +47,7 @@ static plat_counter g_freq;
 static int g_old_pacing = -1, g_clockstat;
 static volatile int64_t g_vsync_n;            /* refreshes passed (published after the event was signalled) */
 static volatile int64_t g_vsync_signals, g_vsync_late;
-static plat_rwlock_t g_vsync_lock = PLAT_RWLOCK_INIT;
+static plat_lock_t g_vsync_lock = PLAT_LOCK_INIT;
 static plat_cond_t g_vsync_cv = PLAT_COND_INIT;
 static int64_t g_latch;                       /* refresh at which the last queued frame is shown */
 static volatile int32_t g_latch_pending;        /* a frame was queued and nobody has waited for its refresh yet */
@@ -78,138 +83,176 @@ int oe_exit_request(void);                            /* nnmisc.c */
 static volatile int32_t g_closing;
 int display_closing(void) { return g_closing != 0; }  /* smo_amiibo.c: the menu gives way to the game when the window is being closed */
 
-/* The window's mode (config\graphics.ini, gfx_options.c): windowed, borderless fullscreen, fullscreen (topmost), or the
- * default, a borderless window of the configured size (dragged anywhere to move it). F11, or a double-click in a borderless
- * window, switches between covering the monitor and the window; a window left by a mode that started covering the monitor
- * is the borderless window of the configured size, centred. Called on the window thread. */
+/* The window's mode (config/graphics.ini, gfx_options.c): windowed, borderless fullscreen, fullscreen (on top), or the
+ * default, a borderless window of the configured size. F11, or a double-click, switches between covering the monitor
+ * (SDL's desktop fullscreen) and the window. On the main thread (the event loop). */
 static int g_win_full;                                /* the window covers its monitor now */
-static int g_win_drag;                                /* the window is a borderless window now: its whole area moves it */
-static int g_win_topmost;                             /* graphics.ini fullscreen: covering the monitor means on top */
-static RECT g_win_rect;                               /* the window's rectangle (and style) before it covered the monitor */
-static uint32_t g_win_style;
-static void window_fullscreen(HWND h, int on) {
-    MONITORINFO mi;
-    memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
-    if (on == g_win_full || !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return;
-    if (on) {
-        GetWindowRect(h, &g_win_rect);
-        g_win_style = (uint32_t)GetWindowLongA(h, GWL_STYLE);
-        SetWindowLongA(h, GWL_STYLE, (int32_t)((g_win_style & ~(uint32_t)WS_OVERLAPPEDWINDOW) | WS_POPUP | WS_VISIBLE));
-        SetWindowPos(h, g_win_topmost ? HWND_TOPMOST : HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-        g_win_drag = 0;
-    } else {
-        if (IsRectEmpty(&g_win_rect)) {
-            const GfxOptions *go = gfx_options();
-            int ww = mi.rcWork.right - mi.rcWork.left, wh = mi.rcWork.bottom - mi.rcWork.top;
-            int cw = go->width < ww ? go->width : ww, ch = go->height < wh ? go->height : wh;
-            SetRect(&g_win_rect, mi.rcWork.left + (ww - cw) / 2, mi.rcWork.top + (wh - ch) / 2, mi.rcWork.left + (ww - cw) / 2 + cw, mi.rcWork.top + (wh - ch) / 2 + ch);
-            g_win_style = WS_POPUP | WS_CLIPCHILDREN;
-        }
-        SetWindowLongA(h, GWL_STYLE, (int32_t)(g_win_style | WS_VISIBLE));
-        SetWindowPos(h, HWND_NOTOPMOST, g_win_rect.left, g_win_rect.top, g_win_rect.right - g_win_rect.left, g_win_rect.bottom - g_win_rect.top,
-                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
-        g_win_drag = !(g_win_style & WS_CAPTION);
-    }
+static volatile int32_t g_req_full_toggle, g_req_title, g_req_minimise;   /* requests of other threads, applied by the event loop */
+static volatile int32_t g_focus_flags;                 /* DISPLAY_FOCUSED 1, DISPLAY_MINIMISED 2, DISPLAY_SHOWN 4 */
+static volatile int32_t g_keep_awake;                  /* sources that hold the screen saver off (bit mask) */
+static char g_title_req[192];
+static plat_lock_t g_title_lock = PLAT_LOCK_INIT;
+static volatile int32_t g_win_w = WIDTH, g_win_h = HEIGHT; /* the window's size in pixels */
+static void window_fullscreen(int on) {
+    if (!g_win || on == g_win_full) return;
+    SDL_SetWindowFullscreenMode(g_win, NULL);           /* borderless desktop fullscreen */
+    if (!SDL_SetWindowFullscreen(g_win, on)) { printf("display: fullscreen %s refused: %s\n", on ? "on" : "off", SDL_GetError()); return; }
     g_win_full = on;
-    printf("display: the window %s (F11)\n", on ? "covers its monitor" : g_win_drag ? "is a borderless window" : "has its frame again");
+    printf("display: the window %s (F11)\n", on ? "covers its monitor" : "is a window again");
     fflush(stdout);
 }
 
-void *display_hwnd(void) { return g_hwnd; }
-void display_toggle_fullscreen(void) { if (g_hwnd) window_fullscreen(g_hwnd, !g_win_full); }    /* on the window thread (smo_guide.c) */
-#define WM_SMO_GUIDE (WM_APP + 0x47)                /* smo_guide.c: the Help page in the game window */
-void guide_on_message(HWND hwnd, WPARAM what, LPARAM arg);
-void guide_on_size(void);
+void *display_hwnd(void) { return g_win; }
+void display_toggle_fullscreen(void) { plat_xchg(&g_req_full_toggle, 1); }         /* any thread: applied by the event loop */
+void display_set_title(const char *t) {                                             /* any thread */
+    plat_lock(&g_title_lock);
+    snprintf(g_title_req, sizeof g_title_req, "%s", t);
+    plat_unlock(&g_title_lock);
+    plat_xchg(&g_req_title, 1);
+}
+int display_focus_flags(void) { return g_focus_flags; }
+void display_test_minimise(int on) { plat_xchg(&g_req_minimise, on ? 1 : 2); }
+void display_keep_awake(int source, int on) { if (on) plat_or(&g_keep_awake, 1 << source); else plat_and(&g_keep_awake, ~(1 << source)); }
+void display_size(int *w, int *h) { *w = g_win_w; *h = g_win_h; }
 
-static LRESULT wndproc(HWND h, unsigned m, WPARAM w, LPARAM l) {
-    if (m == WM_SMO_GUIDE) { guide_on_message(h, w, l); return 0; }
-    if (m == WM_SIZE) guide_on_size();
-    if (m == WM_NCHITTEST && g_win_drag) {           /* a borderless window: dragging anywhere moves it */
-        LRESULT r = DefWindowProcA(h, m, w, l);
-        return r == HTCLIENT ? HTCAPTION : r;
+/* ---- keyboard: Windows virtual-key numbers (the configuration's codes) <-> SDL scancodes */
+int vk_to_scancode(int vk) {
+    if (vk >= 'A' && vk <= 'Z') return SDL_SCANCODE_A + (vk - 'A');
+    if (vk >= '1' && vk <= '9') return SDL_SCANCODE_1 + (vk - '1');
+    if (vk == '0') return SDL_SCANCODE_0;
+    if (vk >= VK_F1 && vk < VK_F1 + 12) return SDL_SCANCODE_F1 + (vk - VK_F1);
+    if (vk >= VK_NUMPAD0 + 1 && vk <= VK_NUMPAD0 + 9) return SDL_SCANCODE_KP_1 + (vk - VK_NUMPAD0 - 1);
+    switch (vk) {
+    case VK_NUMPAD0: return SDL_SCANCODE_KP_0;
+    case VK_BACK: return SDL_SCANCODE_BACKSPACE;
+    case VK_TAB: return SDL_SCANCODE_TAB;
+    case VK_RETURN: return SDL_SCANCODE_RETURN;
+    case VK_SHIFT: case VK_LSHIFT: return SDL_SCANCODE_LSHIFT;
+    case VK_RSHIFT: return SDL_SCANCODE_RSHIFT;
+    case VK_CONTROL: case VK_LCONTROL: return SDL_SCANCODE_LCTRL;
+    case VK_RCONTROL: return SDL_SCANCODE_RCTRL;
+    case VK_MENU: case VK_LMENU: return SDL_SCANCODE_LALT;
+    case VK_RMENU: return SDL_SCANCODE_RALT;
+    case VK_ESCAPE: return SDL_SCANCODE_ESCAPE;
+    case VK_SPACE: return SDL_SCANCODE_SPACE;
+    case VK_LEFT: return SDL_SCANCODE_LEFT;
+    case VK_UP: return SDL_SCANCODE_UP;
+    case VK_RIGHT: return SDL_SCANCODE_RIGHT;
+    case VK_DOWN: return SDL_SCANCODE_DOWN;
+    case 0xBC: return SDL_SCANCODE_COMMA;
+    case 0xBE: return SDL_SCANCODE_PERIOD;
+    case 0xBA: return SDL_SCANCODE_SEMICOLON;
+    case 0xBF: return SDL_SCANCODE_SLASH;
+    case 0xDB: return SDL_SCANCODE_LEFTBRACKET;
+    case 0xDD: return SDL_SCANCODE_RIGHTBRACKET;
     }
-    if ((m == WM_NCLBUTTONDBLCLK && w == HTCAPTION && g_win_drag) || (m == WM_LBUTTONDBLCLK && g_win_full)) { window_fullscreen(h, !g_win_full); return 0; }
-    if (m == WM_KEYDOWN && w == VK_F11 && !(l & (1 << 30))) { window_fullscreen(h, !g_win_full); return 0; }
-    if (m == WM_CLOSE) {                             /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
-        plat_xchg(&g_closing, 1);
-        printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
-        if (!oe_exit_request()) report_and_exit(0);
-        return 0;
-    }
-    if (m == WM_ERASEBKGND) return 1;
-    if (m == WM_KEYDOWN && w == VK_F12 && !(l & (1 << 30))) {      /* F12 = the console's Capture button (once per press) */
-        void smo_capture_request(void);
-        smo_capture_request();
-        return 0;
-    }
-    if ((m == WM_KEYDOWN || m == WM_SYSKEYDOWN) && !(l & (1 << 30))) {   /* the amiibo menu's key (controllers.ini [hotkeys], F1 by default) */
-        int nnpad_hotkey_vk(int which); void amiibo_menu_request(void);
-        int vk = nnpad_hotkey_vk(0);
-        if (vk && (int)w == vk) { amiibo_menu_request(); return 0; }
-    }
-    return DefWindowProcA(h, m, w, l);
+    return 0;
+}
+int vk_from_scancode(int sc) {
+    static int16_t table[SDL_SCANCODE_COUNT];
+    static int ready;
+    if (!ready) { for (int vk = 1; vk < 256; vk++) { int s = vk_to_scancode(vk); if (s > 0 && s < SDL_SCANCODE_COUNT && !table[s]) table[s] = (int16_t)vk; } ready = 1; }
+    return sc > 0 && sc < SDL_SCANCODE_COUNT ? table[sc] : 0;
+}
+static volatile uint8_t g_synth_key[256];               /* test keys (SMO_AUTOKEY) */
+int display_key_down(int vk) {
+    if (vk <= 0 || vk > 255) return 0;
+    if (g_synth_key[vk]) return 1;
+    if (!(g_focus_flags & 1)) return 0;                 /* only while the game's window has the keyboard focus */
+    int sc = vk_to_scancode(vk), n = 0;
+    const bool *state = SDL_GetKeyboardState(&n);
+    if (!state || sc <= 0 || sc >= n) return 0;
+    if (vk == VK_SHIFT) return state[SDL_SCANCODE_LSHIFT] || state[SDL_SCANCODE_RSHIFT];
+    if (vk == VK_CONTROL) return state[SDL_SCANCODE_LCTRL] || state[SDL_SCANCODE_RCTRL];
+    if (vk == VK_MENU) return state[SDL_SCANCODE_LALT] || state[SDL_SCANCODE_RALT];
+    return state[sc];
 }
 
 static char g_title[96];
-
-static uint32_t window_thread(void * arg) {
-    (void)arg;
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);   /* smo_guide.c: the WebView2 objects live on this thread */
-    WNDCLASSA wc;
-    memset(&wc, 0, sizeof wc);
-    wc.lpfnWndProc = wndproc;
-    wc.hInstance = GetModuleHandleA(NULL);
-    wc.lpszClassName = "smo_native_window";
-    wc.style = CS_OWNDC | CS_DBLCLKS;
-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-    RegisterClassA(&wc);
-    /* window mode and size from config\graphics.ini (gfx_options.c). borderless window (the default): frameless,
-     * the configured size (at most the primary monitor's work area), centred on it. borderless fullscreen / fullscreen: a
-     * frameless window over the primary monitor (fullscreen: also topmost). F11 switches (window_fullscreen). */
-    const GfxOptions *go = gfx_options();
-    uint32_t style = (go->window_mode ? WS_POPUP : WS_OVERLAPPEDWINDOW) | WS_CLIPCHILDREN;      /* children: the Help page (smo_guide.c) */
-    int cw = go->width, ch = go->height, px = CW_USEDEFAULT, py = CW_USEDEFAULT;
-    if (go->window_mode) {
-        MONITORINFO mi;
-        POINT origin = {0, 0};
-        memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
-        if (GetMonitorInfoA(MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY), &mi)) {
-            if (go->window_mode == 3) {
-                int ww = mi.rcWork.right - mi.rcWork.left, wh = mi.rcWork.bottom - mi.rcWork.top;
-                if (cw > ww) cw = ww;
-                if (ch > wh) ch = wh;
-                px = mi.rcWork.left + (ww - cw) / 2; py = mi.rcWork.top + (wh - ch) / 2;
-            } else { cw = mi.rcMonitor.right - mi.rcMonitor.left; ch = mi.rcMonitor.bottom - mi.rcMonitor.top; px = mi.rcMonitor.left; py = mi.rcMonitor.top; }
+static void window_event(const SDL_Event *e) {
+    switch (e->type) {
+    case SDL_EVENT_QUIT:
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:          /* the exit request: nn::oe decides (nnmisc.c oe_exit_request) whether the game ends now or after its exit-request handling section */
+        if (plat_xchg(&g_closing, 1)) break;
+        printf("\nwindow closed by the user after %lld frames\n", (long long)g_frames);
+        if (!oe_exit_request()) report_and_exit(0);
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED: plat_or(&g_focus_flags, 1); break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST: plat_and(&g_focus_flags, ~1); break;
+    case SDL_EVENT_WINDOW_MINIMIZED: plat_or(&g_focus_flags, 2); break;
+    case SDL_EVENT_WINDOW_RESTORED: case SDL_EVENT_WINDOW_MAXIMIZED: plat_and(&g_focus_flags, ~2); break;
+    case SDL_EVENT_WINDOW_SHOWN: plat_or(&g_focus_flags, 4); break;
+    case SDL_EVENT_WINDOW_HIDDEN: plat_and(&g_focus_flags, ~4); break;
+    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED: plat_xchg(&g_win_w, e->window.data1); plat_xchg(&g_win_h, e->window.data2); break;
+    case SDL_EVENT_WINDOW_ENTER_FULLSCREEN: g_win_full = 1; break;
+    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN: g_win_full = 0; break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (e->button.button == SDL_BUTTON_LEFT && e->button.clicks == 2) window_fullscreen(!g_win_full);
+        break;
+    case SDL_EVENT_KEY_DOWN:
+        if (e->key.repeat) break;
+        if (e->key.scancode == SDL_SCANCODE_F11) { window_fullscreen(!g_win_full); break; }
+        if (e->key.scancode == SDL_SCANCODE_F12) { void smo_capture_request(void); smo_capture_request(); break; }   /* F12 = the console's Capture button */
+        {   /* the amiibo menu's key (controllers.ini [hotkeys], F1 by default) */
+            int nnpad_hotkey_vk(int which); void amiibo_menu_request(void);
+            int vk = nnpad_hotkey_vk(0);
+            if (vk && vk_to_scancode(vk) == (int)e->key.scancode) amiibo_menu_request();
         }
+        break;
     }
-    g_win_full = go->window_mode == 1 || go->window_mode == 2;
-    g_win_drag = go->window_mode == 3;
-    g_win_topmost = go->window_mode == 2;
-    RECT r = {0, 0, cw, ch};
-    AdjustWindowRect(&r, style, 0);
+}
+/* One round of the event loop (main thread): window events, then the requests of other threads. */
+static void display_pump(uint32_t wait_ms) {
+    SDL_Event e;
+    if (SDL_WaitEventTimeout(&e, (int32_t)wait_ms)) {
+        window_event(&e);
+        while (SDL_PollEvent(&e)) window_event(&e);
+    }
+    if (plat_xchg(&g_req_full_toggle, 0)) window_fullscreen(!g_win_full);
+    if (plat_xchg(&g_req_title, 0)) { char t[192]; plat_lock(&g_title_lock); snprintf(t, sizeof t, "%s", g_title_req); plat_unlock(&g_title_lock); SDL_SetWindowTitle(g_win, t); }
+    {   int32_t m = plat_xchg(&g_req_minimise, 0);
+        if (m == 1) SDL_MinimizeWindow(g_win); else if (m == 2) SDL_RestoreWindow(g_win); }
+    {   static int awake;
+        int want = g_keep_awake != 0;
+        if (want != awake) { if (want) SDL_DisableScreenSaver(); else SDL_EnableScreenSaver(); awake = want; } }
+}
+/* boot.c, main thread: runs the event loop until the guest's main thread t ends (1) or ms milliseconds pass (0). */
+int display_wait_thread(plat_thread *t, uint32_t ms) {
+    uint64_t end = ms == PLAT_INFINITE ? UINT64_MAX : plat_ms() + ms;
+    for (;;) {
+        if (plat_thread_join(t, 0)) return 1;
+        uint64_t now = plat_ms();
+        if (now >= end) return 0;
+        display_pump(end - now < 10 ? (uint32_t)(end - now) : 10);
+    }
+}
+
+static void window_create(void) {
+    /* window mode and size from config/graphics.ini (gfx_options.c). borderless window (the default): frameless, the
+     * configured size; borderless fullscreen / fullscreen: covering the monitor (fullscreen: also on top). F11 switches. */
+    const GfxOptions *go = gfx_options();
+    int cw = go->width, ch = go->height;
+    SDL_WindowFlags flags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
+    if (go->window_mode == 3) flags |= SDL_WINDOW_BORDERLESS;
+    if (go->window_mode == 2) flags |= SDL_WINDOW_ALWAYS_ON_TOP;
+    if (go->window_mode == 1 || go->window_mode == 2) flags |= SDL_WINDOW_FULLSCREEN;
     printf("display: window %s, client %dx%d (graphics.ini; F11 switches between covering the monitor and the window)\n",
-           go->window_mode == 2 ? "fullscreen (borderless, topmost)" : go->window_mode == 1 ? "borderless fullscreen" : go->window_mode == 3 ? "borderless window" : "windowed", cw, ch);
-    /* Only the copies a person plays (smo_native.exe, smo_user.exe, or SMO_SHOW=1) get a window on screen;
-     * test copies started under any other name keep theirs off-screen and out of the taskbar, so automated
-     * runs do not cover the desktop. SMO_TITLE names the window. */
-    char exe[PATH_MAX] = "";
-    snprintf(exe, sizeof exe, "%s", plat_exe_path());
-    const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *show = getenv("SMO_SHOW");
-    int visible = show ? atoi(show) != 0 : (!strcasecmp(base, "smo_native.exe") || !strcasecmp(base, "smo_user.exe"));
+           go->window_mode == 2 ? "fullscreen (on top)" : go->window_mode == 1 ? "borderless fullscreen" : go->window_mode == 3 ? "borderless window" : "windowed", cw, ch);
+    /* SMO_SHOW=0 keeps a test copy's window hidden (a hidden Wayland window gets no frame callbacks: presents use the
+     * mailbox mode then, see nvn_vk.c); by default every copy shows its window. SMO_TITLE names the window. */
+    const char *show = getenv("SMO_SHOW");
+    if (show && atoi(show) == 0) flags |= SDL_WINDOW_HIDDEN;
     snprintf(g_title, sizeof g_title, "%s", getenv("SMO_TITLE") ? getenv("SMO_TITLE") : "Super Mario Odyssey (smo-recomp)");
-    if (visible)
-        g_hwnd = CreateWindowExA(go->window_mode == 2 ? WS_EX_TOPMOST : 0, wc.lpszClassName, g_title, style | WS_VISIBLE, px, py, r.right - r.left,
-                                 r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
-    else {
-        g_hwnd = CreateWindowExA(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, wc.lpszClassName, g_title, style, -32000, -32000,
-                                 r.right - r.left, r.bottom - r.top, NULL, NULL, wc.hInstance, NULL);
-        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-    }
+    g_win = SDL_CreateWindow(g_title, cw, ch, flags);
+    if (!g_win) { fprintf(stderr, "display: SDL_CreateWindow failed: %s\n", SDL_GetError()); plat_exit(1); }
+    g_win_full = (flags & SDL_WINDOW_FULLSCREEN) != 0;
+    int pw = cw, ph = ch;
+    SDL_GetWindowSizeInPixels(g_win, &pw, &ph);
+    g_win_w = pw; g_win_h = ph;
+    plat_xchg(&g_focus_flags, (flags & SDL_WINDOW_HIDDEN ? 0 : 4) | (SDL_GetWindowFlags(g_win) & SDL_WINDOW_INPUT_FOCUS ? 1 : 0));
+    SDL_SetWindowMinimumSize(g_win, 320, 180);
+    printf("display: SDL %d.%d.%d, video driver %s\n", SDL_GetVersion() / 1000000, SDL_GetVersion() / 1000 % 1000, SDL_GetVersion() % 1000, SDL_GetCurrentVideoDriver());
     plat_xchg(&g_ready, 1);
-    MSG msg;
-    while (GetMessageA(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageA(&msg); }
-    return 0;
 }
 
 /* Signals the guest's vsync event 60 times per second. */
@@ -220,16 +263,13 @@ static uint32_t vsync_thread(void * arg) {
     if (!old_pacing()) {
         plat_counter t0 = next, now;
         int64_t n = 0;
-        HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        plat_set_thread_name("smo-vsync");
         for (;;) {
             int64_t target = t0.QuadPart + (int64_t)((double)(n + 1) * (double)g_freq.QuadPart / g_rate);      /* no accumulated rounding */
             plat_qpc(&now);
             int64_t left = target - now.QuadPart;
-            if (left > 0) {
-                plat_counter due;
-                due.QuadPart = -((left - g_freq.QuadPart / 2000) * 10000000 / g_freq.QuadPart);
-                if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, 0)) WaitForSingleObject(timer, 100); else plat_sleep_ms((uint32_t)(left * 1000 / g_freq.QuadPart)); }
+            if (left > 0) {                               /* clock_nanosleep to 0.5 ms before the refresh, then a spin */
+                if (left > g_freq.QuadPart / 2000) plat_sleep_until(target - g_freq.QuadPart / 2000);
                 for (plat_qpc(&now); now.QuadPart < target; plat_qpc(&now)) plat_pause();
             }
             int64_t passed = (int64_t)((double)(now.QuadPart - t0.QuadPart) * g_rate / (double)g_freq.QuadPart);   /* >= n + 1; more when this thread was kept off the CPU */
@@ -237,9 +277,9 @@ static uint32_t vsync_thread(void * arg) {
             if (passed > n + 1) plat_xadd(&g_vsync_late, passed - (n + 1));
             n = passed;
             if (g_vsync_event && vsync_signal_ok()) { os_signal_event(g_vsync_event); plat_inc(&g_vsync_signals); }
-            plat_rw_wlock(&g_vsync_lock);
+            plat_lock(&g_vsync_lock);
             plat_xchg(&g_vsync_n, n);
-            plat_rw_wunlock(&g_vsync_lock);
+            plat_unlock(&g_vsync_lock);
             plat_cond_broadcast(&g_vsync_cv);
             nvn_tl(8 /* TL_VSYNC */, (int)(n & 0xffff));
             vsync_test_key();
@@ -258,35 +298,37 @@ static uint32_t vsync_thread(void * arg) {
 static void vsync_test_key(void) {
     {
         /* Test aid: SMO_AUTOKEY=<letter>,<first second>,<every n seconds> presses a key now and then, so a run without a person can get
-         * past "press any button". Only while this window is the foreground window, so the key never reaches another program. */
+         * past "press any button". The key is a synthetic one the game's keyboard reading sees (display_key_down): it never
+         * reaches another program. */
         static int key = -1, first, every, tick, down;
         if (key == -1) {
             const char *e = getenv("SMO_AUTOKEY");
             key = 0;
-            if (e && e[0]) { key = e[0]; first = 30; every = 5; sscanf(e + 1, ",%d,%d", &first, &every); if (every < 1) every = 1; }
+            if (e && e[0]) { key = e[0] >= 'a' && e[0] <= 'z' ? e[0] - 32 : e[0]; first = 30; every = 5; sscanf(e + 1, ",%d,%d", &first, &every); if (every < 1) every = 1; }
         }
         tick++;
-        if (key && down && tick - down >= 8) { keybd_event((uint8_t)key, 0, KEYEVENTF_KEYUP, 0); down = 0; }
-        else if (key && !down && tick >= first * 60 && (tick - first * 60) % (every * 60) == 0 && ((tick % 600 == 0 ? (void)printf("display: test key wanted, window foreground: %d%c", GetForegroundWindow() == g_hwnd, 10) : (void)0), 1) && (GetForegroundWindow() == g_hwnd || (SetForegroundWindow(g_hwnd), GetForegroundWindow() == g_hwnd))) { keybd_event((uint8_t)key, 0, 0, 0); down = tick; printf("display: test key %c pressed at frame tick %d%c", key, tick, 10); }
+        if (key && down && tick - down >= 8) { g_synth_key[key & 255] = 0; down = 0; }
+        else if (key && !down && tick >= first * 60 && (tick - first * 60) % (every * 60) == 0) { g_synth_key[key & 255] = 1; down = tick; printf("display: test key %c pressed at frame tick %d%c", key, tick, 10); }
     }
 }
 
 void hitch_init(void); void hitch_pacing(int on);      /* hitch.c: SMO_HITCH */
 void display_init(void) {
     plat_qpf(&g_freq);
-    /* the console's waits with a time-out (nn::os::TimedWaitEvent, TimedReceiveMessageQueue, timed condition
-     * variables: os_threads.c, plat_cond_wait_ms with whole milliseconds) end at the time asked for. At the
-     * default Windows timer period they ended at the next 15.6 ms tick, so a thread that polls with a 1 ms time-out ran
-     * 64 times per second: the movie player's two feed threads delivered one sample per tick and its pre-roll loop
-     * [game 0x71036f27b4, 125 x 10 ms, holding the player's mutex] ran out every time (1.3 s, main thread blocked).
-     * SMO_TIMER_PERIOD=<ms> (default 1; 0 = leave the system default). */
-    { const char *e = getenv("SMO_TIMER_PERIOD"); int ms = e ? atoi(e) : 1; if (ms > 0) { MMRESULT r = timeBeginPeriod((unsigned)ms); printf("display: system timer period %d ms requested (%s)%c", ms, r == TIMERR_NOERROR ? "ok" : "refused", 10); } }
+    /* the console's waits with a time-out (nn::os::TimedWaitEvent, ...: os_threads.c) end at the time asked for: Linux
+     * timers are precise to tens of microseconds (Windows needed timeBeginPeriod(1) here). The window and SDL's event
+     * loop live on this thread, the main thread (SDL's rule); SMO_SDL_VIDEO=x11 picks XWayland instead of Wayland. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");            /* the crash report owns the signals (hostrt.c) */
+    SDL_SetHint(SDL_HINT_APP_NAME, "Super Mario Odyssey (smo-recomp)");
+    SDL_SetHint(SDL_HINT_APP_ID, "smo-recomp");
+    SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+    if (getenv("SMO_SDL_VIDEO")) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, getenv("SMO_SDL_VIDEO"));
+    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) { fprintf(stderr, "display: SDL_Init failed: %s\n", SDL_GetError()); plat_exit(1); }
     hitch_init();
-    CreateThread(NULL, 0, window_thread, NULL, 0, NULL);
-    while (!g_ready) plat_sleep_ms(1);
-    nvn_gl_start(g_hwnd);
+    window_create();
+    nvn_gl_start(g_win);
     speed_init();
-    CreateThread(NULL, 0, vsync_thread, NULL, 0, NULL);
+    plat_thread_detach(plat_thread_start(vsync_thread, NULL, 0));
     { void nvn_vk_selftest_hook(void); nvn_vk_selftest_hook(); }      /* nvn_vk.c: SMO_RENDERER=vk SMO_VK_SELFTEST=<frames>, then exit */
 }
 
@@ -344,7 +386,7 @@ static void frame_queued(void) {
             snprintf(title, sizeof title, "%s - frame %lld - %lld fps - %.2f ms per frame", g_title, (long long)n, (long long)second_frames, ms);
         } else
         snprintf(title, sizeof title, "%s - frame %lld - %lld fps", g_title, (long long)n, (long long)second_frames);
-        SetWindowTextA(g_hwnd, title);
+        display_set_title(title);
         second_frames = 0;
         second_start = now;
     }
@@ -357,9 +399,9 @@ int display_wait_refresh(void) {
     plat_qpc(&a);
     hitch_pacing(1);
     nvn_tl(6 /* TL_PACE_BEGIN */, (int)(g_latch & 0xffff));
-    plat_rw_wlock(&g_vsync_lock);
-    while (g_vsync_n < g_latch) SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, 100, 0);
-    plat_rw_wunlock(&g_vsync_lock);
+    plat_lock(&g_vsync_lock);
+    while (g_vsync_n < g_latch) plat_cond_wait_ms(&g_vsync_cv, &g_vsync_lock, 100);
+    plat_unlock(&g_vsync_lock);
     nvn_tl(7 /* TL_PACE_END */, (int)(g_vsync_n & 0xffff));
     hitch_pacing(0);
     plat_qpc(&b);
@@ -371,9 +413,9 @@ int display_wait_refresh(void) {
 void display_menu_wait(void) {
     if (old_pacing()) { plat_sleep_ms(16); return; }
     int64_t n = g_vsync_n;
-    plat_rw_wlock(&g_vsync_lock);
-    while (g_vsync_n == n) if (!SleepConditionVariableSRW(&g_vsync_cv, &g_vsync_lock, 100, 0)) break;
-    plat_rw_wunlock(&g_vsync_lock);
+    plat_lock(&g_vsync_lock);
+    while (g_vsync_n == n) if (!plat_cond_wait_ms(&g_vsync_cv, &g_vsync_lock, 100)) break;
+    plat_unlock(&g_vsync_lock);
 }
 /* Before a present: a frame queued earlier that nobody waited for (a caller that does not wait on the window sync). */
 void display_before_present(void) {
@@ -395,17 +437,14 @@ void display_pace(void) {
     next.QuadPart += g_freq.QuadPart * g_interval / 60;
     /* wait until `next` exactly. plat_sleep_ms(ms) cut the wait to whole milliseconds and, at the default 15.6 ms timer period,
      * could overshoot by a frame; a frame that came late was then followed by frames shown early (up to 100 ms of debt).
-     * Now: a high-resolution waitable timer up to 0.5 ms before the deadline, then a spin; a late frame may be made up for
+     * Now: clock_nanosleep up to 0.5 ms before the deadline, then a spin; a late frame may be made up for
      * by at most one refresh interval, as a display that missed a refresh shows the next frame at the next one. */
     int64_t left = next.QuadPart - now.QuadPart, frame_ticks = g_freq.QuadPart * (g_interval ? g_interval : 1) / 60;
     if (!g_interval) next = now;
     else if (left > 0) {
-        static HANDLE timer;
-        plat_counter after, due;
+        plat_counter after;
         hitch_pacing(1);
-        if (!timer) timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
-        due.QuadPart = -((left - g_freq.QuadPart / 2000) * 10000000 / g_freq.QuadPart);          /* relative, 100 ns units */
-        if (due.QuadPart < 0) { if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, 0)) WaitForSingleObject(timer, 100); else plat_sleep_ms((uint32_t)(left * 1000 / g_freq.QuadPart)); }
+        if (left > g_freq.QuadPart / 2000) plat_sleep_until(next.QuadPart - g_freq.QuadPart / 2000);
         for (plat_qpc(&after); after.QuadPart < next.QuadPart; plat_qpc(&after)) plat_pause();
         hitch_pacing(0);
         nvn_pf_pace(after.QuadPart - now.QuadPart);
@@ -416,7 +455,7 @@ void display_pace(void) {
         if (gfx_options()->overlay && second_frames) snprintf(title, sizeof title, "%s - frame %lld - %lld fps - %.2f ms per frame", g_title, (long long)n, (long long)second_frames, (double)(now.QuadPart - second_start.QuadPart) * 1000.0 / (double)g_freq.QuadPart / (double)second_frames);
         else
         snprintf(title, sizeof title, "%s - frame %lld - %lld fps", g_title, (long long)n, (long long)second_frames);
-        SetWindowTextA(g_hwnd, title);
+        display_set_title(title);
         second_frames = 0;
         second_start = now;
     }
