@@ -1,12 +1,12 @@
 /* mx_all.c - every shader stage of the game through the translator, offline (tests/check_all_shaders.py).
  *
- * Reads the stage files tests/check_all_shaders.py writes (build\shaders_all\*.mxs: one NVN stage each, taken out of the
+ * Reads the stage files tests/check_all_shaders.py writes (build/shaders_all/*.mxs: one NVN stage each, taken out of the
  * game's shader containers), runs mx_translate on each with the Vulkan back end's settings (target 1), compiles the text
- * to SPIR-V with the renderer's own compiler (smo_glslang.dll, so run from build\bin), and counts: translated and
+ * to SPIR-V with the renderer's own compiler (runtime/gfx/vk_shaderc_shim.c, linked in), and counts: translated and
  * compiled, not translated (by instruction or feature), refused by the compiler. Prints the first stages of each kind of
  * failure and a summary; exit status = failures.
  *
- *   mx_all.exe <folder of .mxs> [--list]       (--list: one line per stage)
+ *   mx_all <folder of .mxs> [--list]       (--list: one line per stage)
  *
  * Stage file (little endian): "MXS1", u32 stage (0 vertex, 1 fragment, 2 geometry, 3 tess control, 4 tess evaluation,
  * 5 compute), u32 code bytes, u32 constant data bytes, u32 work group x, y, z, u32 shared bytes, u32 local bytes, the
@@ -18,11 +18,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <windows.h>
+#include <dirent.h>
+#include <limits.h>
 #include "mx_translate.h"
+#define MAX_PATH PATH_MAX
 
-typedef int (*GlslFn)(int, const char *, uint32_t **, size_t *, char *, size_t);
-typedef void (*FreeFn)(uint32_t *);
+int smo_glsl_to_spirv(int stage, const char *src, uint32_t **words, size_t *count, char *log, size_t log_size);   /* vk_shaderc_shim.c */
+void smo_spirv_free(uint32_t *words);
+static int name_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
 typedef struct { char what[80]; int count; char first[3][MAX_PATH]; } Fail;
 static Fail g_fail[256];
@@ -36,22 +39,26 @@ static void note(const char *what, const char *file) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) { printf("usage: mx_all.exe <folder of .mxs> [--list]\n"); return 2; }
+    if (argc < 2) { printf("usage: mx_all <folder of .mxs> [--list]\n"); return 2; }
     int list = argc > 2 && !strcmp(argv[2], "--list");
     setvbuf(stdout, NULL, _IONBF, 0);                  /* a stage that crashes the translator: its name is out already */
-    HMODULE m = LoadLibraryA("smo_glslang.dll");
-    GlslFn glsl = m ? (GlslFn)GetProcAddress(m, "smo_glsl_to_spirv") : NULL;
-    FreeFn spv_free = m ? (FreeFn)GetProcAddress(m, "smo_spirv_free") : NULL;
-    if (!glsl || !spv_free) { printf("smo_glslang.dll not found (run from build\\bin)\n"); return 2; }
-    char pat[MAX_PATH];
-    snprintf(pat, sizeof pat, "%s\\*.mxs", argv[1]);
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) { printf("no .mxs files in %s\n", argv[1]); return 2; }
+    DIR *dir = opendir(argv[1]);
+    char **names_ = NULL;
+    size_t nnames = 0, cap = 0;
+    for (struct dirent *de; dir && (de = readdir(dir));) {
+        size_t l = strlen(de->d_name);
+        if (l < 4 || strcmp(de->d_name + l - 4, ".mxs")) continue;
+        if (nnames == cap) { cap = cap ? cap * 2 : 1024; names_ = realloc(names_, cap * sizeof *names_); }
+        names_[nnames++] = strdup(de->d_name);
+    }
+    if (dir) closedir(dir);
+    if (!nnames) { printf("no .mxs files in %s\n", argv[1]); return 2; }
+    qsort(names_, nnames, sizeof *names_, name_cmp);             /* the same order every run */
     int total = 0, ok = 0, by_stage[6] = {0}, ok_stage[6] = {0}, skipped = 0;
-    do {
+    for (size_t ni = 0; ni < nnames; ni++) {
+        struct { const char *cFileName; } fd = {names_[ni]};
         char path[MAX_PATH];
-        snprintf(path, sizeof path, "%s\\%s", argv[1], fd.cFileName);
+        snprintf(path, sizeof path, "%s/%s", argv[1], fd.cFileName);
         FILE *f = fopen(path, "rb");
         if (!f) continue;
         uint32_t hd[9];
@@ -87,7 +94,7 @@ int main(int argc, char **argv) {
                 uint32_t *words = NULL;
                 size_t count = 0;
                 char log[400];
-                if (!glsl(stage, out.glsl, &words, &count, log, sizeof log)) {
+                if (!smo_glsl_to_spirv(stage, out.glsl, &words, &count, log, sizeof log)) {
                     char *nl = strchr(log, '\n');
                     if (nl) *nl = 0;
                     snprintf(what, sizeof what, "compiler: %.60s", log[0] ? log : "(no message)");
@@ -95,15 +102,14 @@ int main(int argc, char **argv) {
                     if (list) printf("COMPILER (%s) ", log);
                     good_all = 0;
                 } else if (list) printf("ok (%d instructions, %zu SPIR-V words) ", out.insns, count);
-                if (words) spv_free(words);
+                if (words) smo_spirv_free(words);
                 free(out.glsl);
             }
         }
         if (good_all) { ok++; ok_stage[stage]++; }
         if (list) printf("\n");
         free(code); free(cdata);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    }
     static const char *names[6] = {"vertex", "fragment", "geometry", "tess control", "tess evaluation", "compute"};
     printf("stages: %d (", total);
     for (int s = 0; s < 6; s++) if (by_stage[s]) printf("%s%s %d of %d ok", s ? ", " : "", names[s], ok_stage[s], by_stage[s]);

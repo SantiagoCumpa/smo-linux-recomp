@@ -429,7 +429,7 @@ def main():
     ap.add_argument('--chain', type=int, default=1, metavar='N',
                     help='up to N stages of one kingdom (and kind) in one run of the game, each changed to by the game itself '
                          '(SMO_STAGE_LIST); 1 = a run per stage')
-    ap.add_argument('--exe-prefix', default='smo_stress', help='the jobs\' exe copies are <prefix>_<job>.exe')
+    ap.add_argument('--exe-prefix', default='smo_stress', help='the jobs\' exe copies are <prefix>_<job>')
     ap.add_argument('--direct', action='store_true',
                     help='start a stage that only a painting leads to directly, not from the painting\'s room (for comparisons)')
     a = ap.parse_args()
@@ -492,14 +492,14 @@ def main():
         return 'warp failed: ' + (w.stdout + w.stderr).strip()[-200:] if w.returncode else None
 
     def game_cmd(name, k, stage, work, shots, seconds, timeout=None):
-        cmd = [PY, os.path.join(REPO, 'scripts', 'run.py'), name, '--exe', '%s_%d.exe' % (a.exe_prefix, k),
+        cmd = [PY, os.path.join(REPO, 'scripts', 'run.py'), name, '--exe', '%s_%d' % (a.exe_prefix, k),
                '--seconds', str(seconds), '--userdata', work,
                '--env', 'SMO_SEQ=' + sequence(stage), '--env', 'SMO_SEQ_EXIT=1', '--env', 'SMO_SPEED=' + a.speed,
                '--env', 'SMO_SHOT_EVERY=500', '--env', 'SMO_SHOT_DIR=' + shots]      # at most one capture a 300-frame window: p99 stays clean
         if timeout:
             cmd += ['--timeout', str(timeout)]
         if a.cache:
-            cmd += ['--env', 'SMO_VK_CACHE=' + caches[k].replace('\\', '/')]
+            cmd += ['--env', 'SMO_VK_CACHE=' + caches[k]]
         if stage['stage'] not in homes:
             cmd += ['--env', 'SMO_START_STAGE=' + stage['stage']]
         ncpu = os.cpu_count() or 0

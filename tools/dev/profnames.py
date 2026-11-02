@@ -3,7 +3,7 @@
     python tools/dev/profnames.py build/run/<name>.log [--functions build/functions/main_functions.tsv]
 
 Prints the log's hostprof: lines with each "guest f_<address>" followed by the function's name from the function list
-(demangled with llvm-cxxfilt when it is found next to clang, e.g. C:/llvm-9.0.0/bin).
+(demangled with llvm-cxxfilt from the PATH or next to clang, package llvm).
 """
 import argparse
 import os
@@ -33,7 +33,8 @@ def load_names(tsv):
 
 
 def demangle(mangled):
-    tool = shutil.which('llvm-cxxfilt') or next((p for p in (r'C:\llvm-9.0.0\bin\llvm-cxxfilt.exe',) if os.path.exists(p)), None)
+    near = os.path.join(os.path.dirname(shutil.which(T.CLANG) or T.CLANG), 'llvm-cxxfilt')
+    tool = shutil.which('llvm-cxxfilt') or (near if os.path.exists(near) else None) or shutil.which('c++filt')
     if not tool or not mangled:
         return {}
     out = subprocess.run([tool], input='\n'.join(mangled), capture_output=True, text=True).stdout.split('\n')

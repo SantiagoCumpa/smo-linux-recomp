@@ -9,8 +9,8 @@
   no dropped list may stay in the index.
 
 The functions are copied out of the runtime sources into build/tmp/fast_paths_extract.h, so the code under test is the
-runtime's own; tests/fast_paths.c holds the reference code and the random cases. Built with clang 9 at -O1, as the
-runtime is. Exit status 0 when everything matches.
+runtime's own; tests/fast_paths.c holds the reference code and the random cases. Built with clang at -O1 (with
+-ffp-contract=off, as the runtime). Exit status 0 when everything matches.
 """
 import os
 import subprocess
@@ -19,7 +19,9 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RT = os.path.join(REPO, 'runtime', 'gfx')
 TMP = os.path.join(REPO, 'build', 'tmp')
-CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+import target as T  # noqa: E402
+CLANG = T.CLANG
 
 
 def cut(text, start, end, what):
@@ -38,13 +40,16 @@ def main():
         cut(gl, 'typedef struct { uint8_t *data; size_t len;', '\n', 'the List record') + '\n',
         'static List *g_lists;\n'
         'static int g_list_count, *g_live, g_live_n;\n'
-        'static LONG64 g_list_reuse_drops, g_list_reuse_events, g_imax_scans;\n'
-        'static SRWLOCK g_list_lock = SRWLOCK_INIT;\n'
+        'static int64_t g_list_reuse_drops, g_list_reuse_events, g_imax_scans;\n'
+        'static plat_rwlock_t g_list_lock = PLAT_RWLOCK_INIT;\n'
         'static struct { uint32_t gen; int restart; } R;\n'
         'static uint8_t *g_mem;\n'
+        'static uint32_t g_wlog_n;\n'                                     # index_max's cache: no host writes logged here
+        'static int64_t g_imax_written;\n'
+        'static int wlog_overlap(uint32_t from, uint64_t lo, uint64_t hi) { (void)from; (void)lo; (void)hi; return 1; }\n'
         '#define P(a) ((void *)(g_mem + (a)))\n',
         cut(gl, '#define CELL_SHIFT', '\nstatic CmdBuf *cb_get', 'the cell index') + '\n',
-        cut(gl, 'typedef struct { uint64_t seg[4][3]; int nseg; LONG64 seq; } Overwrite;', 'static int list_lru_cmp',
+        cut(gl, 'typedef struct { uint64_t seg[4][3]; int nseg; int64_t seq; } Overwrite;', 'static int list_lru_cmp',
             'job_list_overwrite') + '\n',
         cut(vk, 'static uint32_t index_max(uint64_t addr, int count, unsigned t) {', '/* maxv: the highest vertex',
             'index_max') + '\n',
@@ -52,8 +57,9 @@ def main():
     os.makedirs(TMP, exist_ok=True)
     with open(os.path.join(TMP, 'fast_paths_extract.h'), 'w', encoding='utf-8') as f:
         f.write(''.join(parts))
-    exe = os.path.join(TMP, 'fast_paths.exe')
-    r = subprocess.run([CLANG, '-O1', '-w', '-I', TMP, os.path.join(REPO, 'tests', 'fast_paths.c'), '-o', exe],
+    exe = os.path.join(TMP, 'fast_paths')
+    r = subprocess.run([CLANG, '-O1', '-w', '-ffp-contract=off', '-D_GNU_SOURCE', '-I', TMP, '-I', os.path.join(REPO, 'runtime', 'core'),
+                        os.path.join(REPO, 'tests', 'fast_paths.c'), '-o', exe, '-lpthread'],
                        capture_output=True, text=True)
     if r.returncode:
         print((r.stdout + r.stderr)[-4000:])

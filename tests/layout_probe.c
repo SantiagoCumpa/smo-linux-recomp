@@ -1,4 +1,4 @@
-/* layout_probe.dll: the runtime's texture layout (runtime/gfx/tex_decode.c, unchanged) and a Yaz0 decoder, behind a flat C
+/* liblayout_probe.so: the runtime's texture layout (runtime/gfx/tex_decode.c, unchanged) and a Yaz0 decoder, behind a flat C
  * interface for tests/bntx_layout_check.py. Test code only; not part of the game build. */
 #include <stdint.h>
 #include <string.h>
@@ -10,7 +10,7 @@ typedef struct {
     int64_t lvl_offset[TEX_MAX_LEVELS];
 } ProbeOut;
 
-__declspec(dllexport) int probe_layout(int target, int format, int w, int h, int d, int levels, int flags, ProbeOut *o) {
+__attribute__((visibility("default"))) int probe_layout(int target, int format, int w, int h, int d, int levels, int flags, ProbeOut *o) {
     TexLayout L;
     int r = tex_layout(&L, target, format, w, h, d, levels, flags, 0, -1);
     memset(o, 0, sizeof *o);
@@ -22,7 +22,7 @@ __declspec(dllexport) int probe_layout(int target, int format, int w, int h, int
 }
 
 /* Yaz0 -> dst. Returns the decompressed size, or -1 on a malformed stream. */
-__declspec(dllexport) int64_t yaz0_decompress(const uint8_t *src, int64_t n, uint8_t *dst, int64_t cap) {
+__attribute__((visibility("default"))) int64_t yaz0_decompress(const uint8_t *src, int64_t n, uint8_t *dst, int64_t cap) {
     if (n < 16 || memcmp(src, "Yaz0", 4)) return -1;
     int64_t size = ((int64_t)src[4] << 24) | (src[5] << 16) | (src[6] << 8) | src[7];
     if (size > cap) return -1;

@@ -10,21 +10,25 @@
  * driver may contract a multiply-add differently in each.
  * Not tested (counted): stages with images or storage buffers, multisample textures, a text glslang refuses.
  *
- *   build: python tests/build_mx_equiv.py      run: build\bin\mx_equiv.exe <folder of .bin> [max shaders]
+ *   build: python tests/build_mx_equiv.py      run: build/bin/mx_equiv <folder of .bin> [max shaders]
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <math.h>
-#include <windows.h>
+#include <dirent.h>
+#include <fnmatch.h>
+#include <limits.h>
+#define MAX_PATH PATH_MAX
 #include <vulkan/vulkan.h>
 #include "mx_translate.h"
 
-typedef int (*GlslFn)(int, const char *, uint32_t **, size_t *, char *, size_t);
-typedef void (*FreeFn)(uint32_t *);
-static GlslFn g_glsl;
-static FreeFn g_free;
+int smo_glsl_to_spirv(int stage, const char *src, uint32_t **words, size_t *count, char *log, size_t log_size);   /* vk_shaderc_shim.c */
+void smo_spirv_free(uint32_t *words);
+#define g_glsl smo_glsl_to_spirv
+#define g_free smo_spirv_free
+static int name_cmp(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
 #define W 64
 #define H 64
@@ -279,7 +283,7 @@ static int translate(const uint8_t *code, int len, int structured, MxOut *o) {
     MxIn in; memset(&in, 0, sizeof in);
     in.stage = MX_FRAGMENT; in.code = code; in.code_len = len; in.target = 1;
     in.binding_base = 40; in.ssbo_base = 60; in.tex_base = 40; in.image_base = 72; in.wmask_binding = 78;
-    _putenv(structured ? "SMO_MX_NOSTRUCT=" : "SMO_MX_NOSTRUCT=1");
+    if (structured) unsetenv("SMO_MX_NOSTRUCT"); else setenv("SMO_MX_NOSTRUCT", "1", 1);
     memset(o, 0, sizeof *o);
     return mx_translate(&in, o);
 }
@@ -287,18 +291,24 @@ static int translate(const uint8_t *code, int len, int structured, MxOut *o) {
 int main(int argc, char **argv) {
     if (argc < 2) { printf("usage: mx_equiv <folder of vk_prog_*_1.bin> [max]\n"); return 2; }
     int max = argc > 2 ? atoi(argv[2]) : 1 << 30;
-    HMODULE m = LoadLibraryA("smo_glslang.dll");
-    g_glsl = m ? (GlslFn)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_free = m ? (FreeFn)GetProcAddress(m, "smo_spirv_free") : NULL;
-    if (!g_glsl) { printf("smo_glslang.dll not found (run from build\\bin)\n"); return 2; }
     vk_init();
-    char pat[MAX_PATH]; snprintf(pat, sizeof pat, "%s\\vk_prog_*_1.bin", argv[1]);
-    WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
-    if (h == INVALID_HANDLE_VALUE) { printf("no vk_prog_*_1.bin in %s\n", argv[1]); return 2; }
+    DIR *dir = opendir(argv[1]);
+    char **names_ = NULL;
+    size_t nnames = 0, cap = 0;
+    for (struct dirent *de; dir && (de = readdir(dir));) {
+        if (fnmatch("vk_prog_*_1.bin", de->d_name, 0)) continue;
+        if (nnames == cap) { cap = cap ? cap * 2 : 1024; names_ = realloc(names_, cap * sizeof *names_); }
+        names_[nnames++] = strdup(de->d_name);
+    }
+    if (dir) closedir(dir);
+    if (!nnames) { printf("no vk_prog_*_1.bin in %s\n", argv[1]); return 2; }
+    qsort(names_, nnames, sizeof *names_, name_cmp);
     int files = 0, same_text = 0, untranslated = 0, skipped = 0, notbuilt = 0, tested = 0, equal = 0, different = 0;
     long long inv_total = 0;
-    do {
+    for (size_t ni = 0; ni < nnames; ni++) {
+        struct { const char *cFileName; } fd = {names_[ni]};
         if (files >= max) break;
-        char path[MAX_PATH]; snprintf(path, sizeof path, "%s\\%s", argv[1], fd.cFileName);
+        char path[MAX_PATH]; snprintf(path, sizeof path, "%s/%s", argv[1], fd.cFileName);
         FILE *f = fopen(path, "rb"); if (!f) continue;
         fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
         uint8_t *code = malloc((size_t)len); fread(code, 1, (size_t)len, f); fclose(f);
@@ -315,7 +325,7 @@ int main(int argc, char **argv) {
             char *ca = to_compute(a.glsl, &inmask, intype), *cb = to_compute(b.glsl, &inmask, intype);
             if (getenv("MX_EQUIV_DUMP")) {                     /* the four texts of each tested stage, for a failing build */
                 const char *t[4] = {a.glsl, b.glsl, ca, cb}, *sfx[4] = {"frag_struct", "frag_switch", "comp_struct", "comp_switch"};
-                for (int k = 0; k < 4; k++) { char pp[MAX_PATH]; snprintf(pp, sizeof pp, "%s\\%s.%s.glsl", getenv("MX_EQUIV_DUMP"), fd.cFileName, sfx[k]); FILE *df = fopen(pp, "wb"); if (df) { fputs(t[k], df); fclose(df); } }
+                for (int k = 0; k < 4; k++) { char pp[MAX_PATH]; snprintf(pp, sizeof pp, "%s/%s.%s.glsl", getenv("MX_EQUIV_DUMP"), fd.cFileName, sfx[k]); FILE *df = fopen(pp, "wb"); if (df) { fputs(t[k], df); fclose(df); } }
             }
             Res r; memset(&r, 0, sizeof r);
             g_seed = 0x9e3779b9u ^ (uint32_t)files;
@@ -358,8 +368,7 @@ int main(int argc, char **argv) {
         }
     next:
         free(a.glsl); free(b.glsl); free(code);
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    }
     printf("mx_equiv: %d fragment stages read; %d translate to the same text in both forms (no jumps or not structured), %d not translated;\n"
            "  %d skipped (images, storage buffers or multisample textures), %d could not be built as compute;\n"
            "  %d TESTED over %lld invocations: %d equivalent, %d DIFFERENT\n", files, same_text, untranslated, skipped, notbuilt, tested, inv_total, equal, different);

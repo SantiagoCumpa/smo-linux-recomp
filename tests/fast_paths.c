@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <windows.h>
+#include "plat.h"
 #include <emmintrin.h>
 #include "fast_paths_extract.h"
 
@@ -102,7 +102,7 @@ int main(void) {
     int cap = 20000;
     g_lists = calloc((size_t)cap, sizeof *g_lists); g_live = malloc(sizeof *g_live * (size_t)cap);
     int *fin = calloc((size_t)cap, sizeof *fin), *freel = malloc(sizeof *freel * (size_t)cap), nfree = 0;
-    LONG64 seq = 0, ov = 0, ended = 0, diff = 0, stale = 0;
+    int64_t seq = 0, ov = 0, ended = 0, diff = 0, stale = 0;
     for (int it = 0; it < 300000; it++) {
         if (it % 10000 == 9999) stale += index_check();
         int op = (int)(rnd() % 10);
@@ -117,7 +117,7 @@ int main(void) {
             l->live_pos = g_live_n; g_live[g_live_n++] = i;
         } else if (op < 8) {                                      /* a recording over command memory */
             Overwrite w;
-            w.nseg = 1 + (int)(rnd() % 4); w.seq = seq + 1 - (LONG64)(rnd() % 3);
+            w.nseg = 1 + (int)(rnd() % 4); w.seq = seq + 1 - (int64_t)(rnd() % 3);
             for (int j = 0; j < 4; j++) rand_piece(w.seg[j], rnd() % 3000 == 0);
             for (int k = 0; k < g_live_n; k++) { fin[g_live[k]] = g_lists[g_live[k]].finalized; ended -= fin[g_live[k]] != 0; }
             overwrite_ref(fin, &w);

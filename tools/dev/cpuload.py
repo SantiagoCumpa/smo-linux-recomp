@@ -6,12 +6,10 @@
             between them (about 1 GB/s of memory traffic per worker), as a browser or a build would be. 0 = no load.
 --seconds S stop after S seconds (default: until killed).
 --log FILE  every --every seconds one line (to FILE, else to the console): seconds since the start, the CPU use of the
-            whole system in cores, the game's (smo_*.exe), the load's and the four busiest other processes, in % of one core.
-Windows only (the log reads process times with the Win32 API).
+            whole system in cores, the game's (smo_*), the load's and the four busiest other processes, in % of one core.
+Linux (the log reads /proc/stat and /proc/<pid>/stat).
 """
 import argparse
-import ctypes
-import ctypes.wintypes as wt
 import multiprocessing
 import os
 import sys
@@ -29,40 +27,32 @@ def worker(seed):
         src[x & 0xffff] = x & 0xff
 
 
-k32 = ctypes.WinDLL('kernel32', use_last_error=True) if os.name == 'nt' else None
-psapi = ctypes.WinDLL('psapi', use_last_error=True) if os.name == 'nt' else None
-
-
-def ft(f):
-    return (f.dwHighDateTime << 32) | f.dwLowDateTime
+TICK = os.sysconf('SC_CLK_TCK')
+UNIT = 1e7 / TICK                                        # clock ticks -> 100 ns units (the log's arithmetic)
 
 
 def system_busy():
-    idle, kern, user = wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
-    k32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user))
-    return ft(kern) + ft(user) - ft(idle)                # 100 ns units summed over all logical CPUs
+    """Busy time of all logical CPUs together, in 100 ns units (/proc/stat: user nice system idle iowait irq softirq steal)."""
+    with open('/proc/stat') as f:
+        v = [int(x) for x in f.readline().split()[1:9]]
+    return (sum(v) - v[3] - v[4]) * UNIT
 
 
 def processes():
-    """{pid: (name, cpu time in 100 ns)}"""
-    pids = (wt.DWORD * 8192)()
-    got = wt.DWORD()
-    psapi.EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(got))
+    """{pid: (name, cpu time in 100 ns)} from /proc/<pid>/stat (utime + stime)."""
     out = {}
-    for pid in pids[:got.value // 4]:
-        h = k32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
-        if not h:
+    for d in os.listdir('/proc'):
+        if not d.isdigit():
             continue
         try:
-            c, e, kt, ut = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
-            if not k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(kt), ctypes.byref(ut)):
-                continue
-            name = ctypes.create_unicode_buffer(520)
-            n = wt.DWORD(520)
-            k32.QueryFullProcessImageNameW(h, 0, name, ctypes.byref(n))
-            out[pid] = (os.path.basename(name.value).lower().replace('.exe', '') or '?', ft(kt) + ft(ut))
-        finally:
-            k32.CloseHandle(h)
+            with open('/proc/%s/stat' % d) as f:
+                st = f.read()
+        except OSError:
+            continue
+        r = st.rfind(')')
+        name = st[st.find('(') + 1:r].lower() or '?'
+        f = st[r + 2:].split()
+        out[int(d)] = (name, (int(f[11]) + int(f[12])) * UNIT)
     return out
 
 
@@ -81,7 +71,7 @@ def log_loop(path, every, until, own):
         game = sum(u for name, u in use.values() if name.startswith('smo_'))
         load = sum(u for pid, (name, u) in use.items() if pid in own)
         others = sorted(((u, name) for pid, (name, u) in use.items()
-                         if not name.startswith('smo_') and pid not in own and name not in ('idle', 'system idle process')), reverse=True)[:4]
+                         if not name.startswith('smo_') and pid not in own ), reverse=True)[:4]
         line = 't+%.0fs system %.2f cores | game %.0f%% | load %.0f%% | %s' % (
             w1 - t0, (s1 - s0) / span, game, load, ', '.join('%s %.0f' % (n, u) for u, n in others))
         if fp:

@@ -53,7 +53,7 @@ def main():
     ap.add_argument('--cache', help='SMO_VK_CACHE: a stage cache folder from an earlier run')
     ap.add_argument('--shots', type=int, default=0)
     ap.add_argument('--check-only', action='store_true', help='only read an existing log')
-    ap.add_argument('--exe', default='smo_test.exe', help="the test copy's name (runs side by side need different ones)")
+    ap.add_argument('--exe', default='smo_test', help="the test copy's name (runs side by side need different ones)")
     ap.add_argument('--env', action='append', default=[], help='more switches for the run (scripts/run.py --env)')
     a = ap.parse_args()
     log = os.path.join(RUN, a.name + '.log')

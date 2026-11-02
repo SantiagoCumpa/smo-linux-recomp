@@ -7,7 +7,7 @@ Reference: the BNTX texture containers in the RomFS (inside Yaz0-compressed SARC
 alignment, block height (texture layout word, bits 0..2) and the offset of every mip level. For each texture the same
 parameters go through tex_layout and every field is compared. Formats are mapped only where the block size is certain
 (R8, RG8, RGB565, RGBA8, BGRA8, BC1..BC7, all ASTC footprints); other formats are counted as unmapped, not guessed.
-Needs build/test/layout_probe.dll (built here with clang from tests/layout_probe.c + runtime/gfx/tex_decode.c).
+Needs build/test/liblayout_probe.so (built here with clang from tests/layout_probe.c + runtime/gfx/tex_decode.c).
 """
 import argparse
 import collections
@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.join(REPO, 'tools'))
 import target as T  # noqa: E402
 ROMFS = T.build('romfs')
 OUT = os.path.join(REPO, 'build', 'test')
-CLANG = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
+CLANG = T.CLANG
 
 # BNTX surface type (high byte of the format word) -> a NVN format with the same block size and footprint
 NVN_FOR_TYPE = {0x02: 0x01, 0x07: 0x3C, 0x09: 0x0D, 0x0B: 0x25, 0x0C: 0x25,
@@ -38,10 +38,10 @@ class ProbeOut(ctypes.Structure):
 
 def build_probe():
     os.makedirs(OUT, exist_ok=True)
-    dll = os.path.join(OUT, 'layout_probe.dll')
+    dll = os.path.join(OUT, 'liblayout_probe.so')
     srcs = [os.path.join(REPO, 'tests', 'layout_probe.c'), T.runtime('gfx', 'tex_decode.c')]
     if not os.path.exists(dll) or os.path.getmtime(dll) < max(os.path.getmtime(s) for s in srcs):
-        r = subprocess.run([CLANG, '-shared', '-O2', '-w'] + T.runtime_includes() + srcs + ['-o', dll],
+        r = subprocess.run([CLANG, '-shared', '-fPIC', '-O2', '-w', '-ffp-contract=off'] + T.runtime_includes() + srcs + ['-o', dll],
                            capture_output=True, text=True)
         if r.returncode:
             raise SystemExit(r.stdout + r.stderr)
