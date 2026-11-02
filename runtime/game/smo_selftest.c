@@ -3,12 +3,15 @@
  * SMO_IMPORT_SELFTEST=1: run right after every handler is registered (boot.c), before the game starts; each check
  * calls the handler the game would reach (host code or lifted sdk.elf code, through import_lookup) with known inputs
  * and compares the result. Prints one line per group and exits with the number of failures.
- * The web part prepares the Help page's copy for a web browser (in %TEMP%, from the document under ..\manual) without
+ * The web part prepares the Help page's copy for a web browser (in build/tmp, from the document under ../manual) without
  * opening it (SMO_WEB_NOOPEN); it is skipped, and says so, when the document is not there. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "plat.h"
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include "runtime.h"
 #include "hostrt.h"
 
@@ -83,29 +86,26 @@ static void test_os(Ctx *c) {
 
 static void test_fs(Ctx *c) {
     int before = g_bad;
-    char tmp[PATH_MAX], path[PATH_MAX];
-    GetTempPathA(sizeof tmp, tmp);
-    snprintf(path, sizeof path, "%ssmo-recomp-selftest.bin", tmp);
-    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-    if (h == INVALID_HANDLE_VALUE) { check("fs", "temporary file", 0); return; }
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%ssmo-recomp-selftest.bin", plat_temp_dir());
+    int h = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (h < 0) { check("fs", "temporary file", 0); return; }
     uint8_t data[100], back[50];
-    uint32_t n = 0;
+    struct stat st;
     memset(data, 0xab, sizeof data);
-    WriteFile(h, data, sizeof data, &n, NULL);
-    plat_counter sz;
+    if (write(h, data, sizeof data) != (ssize_t)sizeof data) check("fs", "temporary file written", 0);
     args(c, P(h), 10, 0, 0); call(c, "_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl");
     check("fs", "SetFileSize(10) = success", c->x[0] == 0);
-    check("fs", "the file is 10 bytes", GetFileSizeEx(h, &sz) && sz.QuadPart == 10);
+    check("fs", "the file is 10 bytes", !fstat(h, &st) && st.st_size == 10);
     args(c, P(h), 50, 0, 0); call(c, "_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl");
-    check("fs", "SetFileSize(50): 50 bytes", c->x[0] == 0 && GetFileSizeEx(h, &sz) && sz.QuadPart == 50);
-    OVERLAPPED ov = {0};
+    check("fs", "SetFileSize(50): 50 bytes", c->x[0] == 0 && !fstat(h, &st) && st.st_size == 50);
     memset(back, 0x55, sizeof back);
-    ReadFile(h, back, sizeof back, &n, &ov);
+    ssize_t n = pread(h, back, sizeof back, 0);
     int grown_zero = n == 50;
     for (int i = 10; i < 50; i++) grown_zero &= back[i] == 0;
     check("fs", "the 10 bytes kept and the 40 new ones zero", grown_zero && back[0] == 0xab && back[9] == 0xab);
     args(c, P(h), 0, 0, 0); call(c, "_ZN2nn2fs9FlushFileENS0_10FileHandleE"); check("fs", "FlushFile = success", c->x[0] == 0);
-    CloseHandle(h);
+    close(h);
     unlink(path);
     printf("  nn::fs (SetFileSize, FlushFile): %s\n", g_bad == before ? "ok" : "FAILED");
 }
@@ -212,26 +212,26 @@ static void test_diag_time_oe(Ctx *c) {
     printf("  nn::diag (symbols, backtrace), nn::time state, nn::oe (screenshot orientation, inactivity time): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
-static uint64_t newest_write(const char *dir) {          /* the newest last-write time in a folder, its own entry included */
-    char pattern[PATH_MAX];
-    WIN32_FIND_DATAA fd;
-    uint64_t newest = 0;
-    snprintf(pattern, sizeof pattern, "%s\\*", dir);
-    HANDLE h = FindFirstFileA(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    do {
-        uint64_t t = ((uint64_t)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+static uint64_t newest_write(const char *dir) {          /* the newest modification time in a folder, its own entry included */
+    uint64_t newest = plat_file_mtime(dir);
+    DIR *d = opendir(dir);
+    if (!d) return 0;
+    char p[PATH_MAX];
+    for (struct dirent *e; (e = readdir(d));) {
+        if (!strcmp(e->d_name, "..")) continue;
+        snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+        uint64_t t = plat_file_mtime(p);
         if (t > newest) newest = t;
-    } while (FindNextFileA(h, &fd));
-    FindClose(h);
+    }
+    closedir(d);
     return newest;
 }
 static void test_web(Ctx *c) {
     int before = g_bad;
     const char *env = getenv("SMO_MANUAL");
     char probe[PATH_MAX];
-    snprintf(probe, sizeof probe, "%s\\html-document\\htmlcontents.htdocs\\html\\USen\\index.html", env && env[0] ? env : "..\\manual");
-    if (GetFileAttributesA(probe) == INVALID_FILE_ATTRIBUTES) { printf("  nn::web Help: SKIPPED (no extracted document: scripts\\setup.py --only manual)\n"); return; }
+    snprintf(probe, sizeof probe, "%s/html-document/htmlcontents.htdocs/html/USen/index.html", env && env[0] ? env : "../manual");
+    if (access(probe, F_OK)) { printf("  nn::web Help: SKIPPED (no Help pages: manual/ in the dump, scripts/setup.py --redo import)\n"); return; }
     static uint8_t arg[0x2100], ret[0x1100];
     static const uint64_t app = 0x0100000000010000ull;
     static const char doc[] = "htmlcontents.htdocs/html/USen/index.html?selftest=1";
@@ -243,22 +243,20 @@ static void test_web(Ctx *c) {
     args(c, P(arg), 0, 0, 0); call(c, "_ZN2nn3web36ShowOfflineHtmlPageArgWithPlayReport20SetPlayReportEnabledEb");
     args(c, P(ret), 0, 0, 0); call(c, "_ZN2nn3web26OfflineHtmlPageReturnValueC1Ev");
     char page_dir[PATH_MAX], js_dir[PATH_MAX];
-    snprintf(page_dir, sizeof page_dir, "%s\\html-document\\htmlcontents.htdocs\\html\\USen", env && env[0] ? env : "..\\manual");
-    snprintf(js_dir, sizeof js_dir, "%s\\html-document\\htmlcontents.htdocs\\js", env && env[0] ? env : "..\\manual");
+    snprintf(page_dir, sizeof page_dir, "%s/html-document/htmlcontents.htdocs/html/USen", env && env[0] ? env : "../manual");
+    snprintf(js_dir, sizeof js_dir, "%s/html-document/htmlcontents.htdocs/js", env && env[0] ? env : "../manual");
     uint64_t page_was = newest_write(page_dir), js_was = newest_write(js_dir);
-    SetEnvironmentVariableA("SMO_WEB_NOOPEN", "1");
-    _putenv("SMO_WEB_NOOPEN=1");
+    setenv("SMO_WEB_NOOPEN", "1", 1);
     args(c, P(ret), P(arg), 0, 0); call(c, "_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS0_22ShowOfflineHtmlPageArgE");
     check("web", "ShowOfflineHtmlPage = success", c->x[0] == 0);
-    _putenv("SMO_WEB_NOOPEN=");
+    unsetenv("SMO_WEB_NOOPEN");
     args(c, P(ret), 0, 0, 0); call(c, "_ZNK2nn3web26OfflineHtmlPageReturnValue20GetOfflineExitReasonEv"); check("web", "exit reason: closed by the player (0)", (uint32_t)c->x[0] == 0);
     args(c, P(ret), 0, 0, 0); call(c, "_ZNK2nn3web26OfflineHtmlPageReturnValue10GetLastUrlEv");
     check("web", "GetLastUrl answers a URL", c->x[0] == P(ret) + 8 && !strncmp((const char *)(uintptr_t)c->x[0], "http", 4));
-    /* the web browser's copy: in %TEMP%\smo-recomp-help, a <base> naming the page's own folder, then window.nx, inside
+    /* the web browser's copy: in build/tmp/smo-recomp-help (plat_temp_dir), a <base> naming the page's own folder, then window.nx, inside
      * <head>; nothing written next to the document (the dump is read in place) */
-    char tmp[PATH_MAX] = "", copy[PATH_MAX];
-    GetTempPathA(sizeof tmp, tmp);
-    snprintf(copy, sizeof copy, "%ssmo-recomp-help\\index.html", tmp);
+    char copy[PATH_MAX];
+    snprintf(copy, sizeof copy, "%ssmo-recomp-help/index.html", plat_temp_dir());
     FILE *fp = fopen(copy, "rb");
     char head[8192] = {0};
     if (fp) { fread(head, 1, sizeof head - 1, fp); fclose(fp); }
@@ -346,10 +344,10 @@ static void test_sdk7(Ctx *c) {
 
 int smo_import_selftest(void) {
     Ctx *c = plat_aligned_alloc(sizeof *c, 16);
-    uint8_t *stack = VirtualAlloc(NULL, 8 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint8_t *stack = plat_alloc(NULL, 8 << 20, PLAT_RW);
     memset(c, 0, sizeof *c);
     c->x[31] = P(stack + (8 << 20) - 0x1000);
-    c->tpidr = P(VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    c->tpidr = P(plat_alloc(NULL, 0x10000, PLAT_RW));
     printf("SMO import self-test (functions added for the offline docked game)\n");
     test_libc(c);
     test_os(c);
