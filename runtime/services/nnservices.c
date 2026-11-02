@@ -345,19 +345,44 @@ static void pt_once(Ctx *c) {
 static void pt_key_create(Ctx *c) { uint64_t key = c->x[0]; handler("_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE")(c); (void)key; c->x[0] = 0; }
 static void pt_getspecific(Ctx *c) { c->x[0] &= 0xffffffffu; handler("_ZN2nn2os11GetTlsValueENS0_7TlsSlotE")(c); }
 static void pt_setspecific(Ctx *c) { c->x[0] &= 0xffffffffu; handler("_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm")(c); c->x[0] = 0; }
+/* Memory blocks handed out here: munmap needs the size, and FreeAddressRegion gives only the address */
+#define MEMBLK_MAX 4096
+static struct { uintptr_t at; size_t size; } g_memblk[MEMBLK_MAX];
+static plat_lock_t g_memblk_lock = PLAT_LOCK_INIT;
+static size_t memblk_take(uintptr_t at) {                 /* the size of a block given out here (forgotten), or 0 */
+    size_t size = 0;
+    plat_lock(&g_memblk_lock);
+    for (int i = 0; i < MEMBLK_MAX; i++) if (g_memblk[i].at == at) { size = g_memblk[i].size; g_memblk[i].at = 0; break; }
+    plat_unlock(&g_memblk_lock);
+    return size;
+}
 static void os_AllocateMemoryBlock(Ctx *c) {
-    void *p = VirtualAlloc(NULL, (size_t)c->x[1], MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    if (p) wr64(c->x[0], P(p));
+    size_t size = (size_t)c->x[1];
+    void *p = size ? plat_alloc(NULL, size, PLAT_RW) : NULL;
+    if (p) {
+        plat_lock(&g_memblk_lock);
+        for (int i = 0; i < MEMBLK_MAX; i++) if (!g_memblk[i].at) { g_memblk[i].at = (uintptr_t)p; g_memblk[i].size = size; break; }
+        plat_unlock(&g_memblk_lock);
+        wr64(c->x[0], P(p));
+    }
     c->x[0] = p ? 0 : 0x1003;
 }
-static void os_FreeMemoryBlock(Ctx *c) { VirtualFree((void *)(uintptr_t)c->x[0], 0, MEM_RELEASE); }
+static void os_FreeMemoryBlock(Ctx *c) {                  /* (address, size) */
+    size_t known = memblk_take((uintptr_t)c->x[0]);
+    plat_release((void *)(uintptr_t)c->x[0], known ? known : (size_t)c->x[1]);
+}
 static void os_SetMemoryPermission(Ctx *c) {
-    uint32_t old, prot = (uint32_t)c->x[2] == 3 ? PAGE_READWRITE : (uint32_t)c->x[2] == 1 ? PAGE_READONLY : PAGE_NOACCESS;
-    if ((uint32_t)c->x[2] != 0 && (uint32_t)c->x[2] != 1 && (uint32_t)c->x[2] != 3) guest_trap("nn::os::SetMemoryPermission: invalid permission", c->x[30] - 4);
-    if (!VirtualProtect((void *)(uintptr_t)c->x[0], (size_t)c->x[1], prot, &old)) guest_trap("nn::os::SetMemoryPermission: VirtualProtect failed", c->x[0]);
+    uint32_t perm = (uint32_t)c->x[2];
+    int prot = perm == 3 ? PLAT_RW : perm == 1 ? PLAT_R : PLAT_NONE;
+    if (perm != 0 && perm != 1 && perm != 3) guest_trap("nn::os::SetMemoryPermission: invalid permission", c->x[30] - 4);
+    if (!plat_protect((void *)(uintptr_t)c->x[0], (size_t)c->x[1], prot)) guest_trap("nn::os::SetMemoryPermission: mprotect failed", c->x[0]);
 }
 static void os_SetMemoryAttribute(Ctx *c) { (void)c; }
-static void os_FreeAddressRegion2(Ctx *c) { VirtualFree((void *)(uintptr_t)c->x[0], 0, MEM_RELEASE); c->x[0] = 0; }
+static void os_FreeAddressRegion2(Ctx *c) {
+    size_t size = memblk_take((uintptr_t)c->x[0]);
+    if (size) plat_release((void *)(uintptr_t)c->x[0], size);
+    c->x[0] = 0;
+}
 static void os_IsVammEnabled(Ctx *c) { c->x[0] = 1; }
 static void install_mem_overrides(void) {
     sdk_host_override("pthread_once", pt_once);
@@ -404,7 +429,7 @@ static int mem_selftest(Ctx *c) {
              sa_realloc = sdk_lifted("_ZN2nn3mem17StandardAllocator10ReallocateEPvm"), sa_fin = sdk_lifted("_ZN2nn3mem17StandardAllocator8FinalizeEv");
     if (!sa_ctor || !sa_init || !sa_alloc || !sa_free || !sa_total || !sa_realloc || !sa_fin) { printf("  FAIL mem: StandardAllocator is not lifted\n"); return bad + 1; }
     for (int mode = 0; mode < 2; mode++) {                       /* 0: on a buffer, as the game does; 1: buffer-less (virtual address memory) */
-        uint8_t *sa = plat_aligned_alloc(0x400, 16), *buf = mode ? NULL : VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        uint8_t *sa = plat_aligned_alloc(0x400, 16), *buf = mode ? NULL : plat_alloc(NULL, 0x100000, PLAT_RW);
         memset(sa, 0, 0x400);
         c->x[0] = P(sa); sa_ctor(c);
         c->x[0] = P(sa); c->x[1] = P(buf); c->x[2] = 0x100000; sa_init(c);
@@ -434,10 +459,10 @@ static int mem_selftest(Ctx *c) {
 
 static void selftest(void) {
     Ctx *c = plat_aligned_alloc(sizeof *c, 16);
-    uint8_t *stack = VirtualAlloc(NULL, 8 << 20, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint8_t *stack = plat_alloc(NULL, 8 << 20, PLAT_RW);
     memset(c, 0, sizeof *c);
     c->x[31] = P(stack + (8 << 20) - 0x1000);
-    c->tpidr = P(VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));   /* the thread's own block: lifted libc keeps errno there */
+    c->tpidr = P(plat_alloc(NULL, 0x10000, PLAT_RW));   /* the thread's own block: lifted libc keeps errno there */
     int bad = 0;
     printf("SDK self-test (lifted sdk.elf code + offline service answers)\n");
     if (!sdk_image_ready()) { printf("  sdk.elf is not loaded: nothing can be tested\n"); fflush(stdout); plat_exit(99); }
