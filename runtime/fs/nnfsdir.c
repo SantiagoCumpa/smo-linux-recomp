@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include "plat.h"
 #include "sdklift.h"
 
@@ -37,6 +39,7 @@ typedef struct { uint32_t magic; int count, pos; HostEntry *entries; } HostDir;
 int fs_dir_roots(const char *guest, char roots[2][PATH_MAX], uint32_t *result);   /* nnfs.c: mount table + save data journal view */
 int fs_dir_hidden(const char *guest_dir, const char *name);
 
+static int entry_cmp(const void *a, const void *b) { return strcasecmp(((const HostEntry *)a)->name, ((const HostEntry *)b)->name); }
 static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *out, const char *path, int mode) -> Result */
     uint64_t out = A0;
     int mode = (int)A2;
@@ -50,22 +53,21 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
     int cap = 0;
     d->magic = DIR_MAGIC;
     for (int r = 0; r < nroots; r++) {
-        snprintf(pattern, sizeof pattern, "%s\\*", roots[r]);
-        WIN32_FIND_DATAW fd;
-        wchar_t wpattern[PATH_MAX + 4];
-        MultiByteToWideChar(CP_ACP, 0, pattern, -1, wpattern, PATH_MAX + 4);
-        HANDLE h = FindFirstFileW(wpattern, &fd);
-        if (h == INVALID_HANDLE_VALUE) continue;
-        do {
-            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
-            int is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0, dup = 0;
+        DIR *dh = opendir(roots[r]);
+        if (!dh) continue;
+        struct dirent *de;
+        while ((de = readdir(dh))) {
+            if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+            struct stat st;
+            snprintf(pattern, sizeof pattern, "%s/%s", roots[r], de->d_name);
+            if (stat(pattern, &st)) continue;
+            int is_dir = S_ISDIR(st.st_mode), dup = 0;
             char name[0x301];
             memset(name, 0, sizeof name);
-            if (!WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1, name, 0x300, NULL, NULL)) continue;
+            if (strlen(de->d_name) > 0x300) continue;
+            strcpy(name, de->d_name);                        /* UTF-8 already */
             if (r == nroots - 1 && nroots == 2) {            /* committed folder under a working folder: skip what the working state replaced or deleted */
-                char ansi[PATH_MAX];
-                WideCharToMultiByte(CP_ACP, 0, fd.cFileName, -1, ansi, sizeof ansi, NULL, NULL);
-                if (fs_dir_hidden((const char *)(uintptr_t)A1, ansi)) continue;
+                if (fs_dir_hidden((const char *)(uintptr_t)A1, de->d_name)) continue;
             }
             for (int k = 0; k < d->count && !dup; k++) dup = strcasecmp(d->entries[k].name, name) == 0;
             if (dup) continue;
@@ -77,11 +79,14 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
             memset(e, 0, sizeof *e);
             memcpy(e->name, name, sizeof e->name);
             e->is_file = !is_dir;
-            e->size = is_dir ? 0 : (int64_t)(((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
+            e->size = is_dir ? 0 : (int64_t)st.st_size;
             d->count++;
-        } while (FindNextFileW(h, &fd));
-        FindClose(h);
+        }
+        closedir(dh);
     }
+    /* readdir order depends on the file system: the entries are sorted by name without regard to case (the order NTFS
+     * listed them in), so every run and every PC sees the same order */
+    if (d->count > 1) qsort(d->entries, (size_t)d->count, sizeof(HostEntry), entry_cmp);
     if (nroots == 2) {                                       /* drop the entries the open mode does not ask for */
         int n = 0;
         for (int k = 0; k < d->count; k++) if (d->entries[k].is_file ? (mode & 2) : (mode & 1)) d->entries[n++] = d->entries[k];
@@ -132,18 +137,19 @@ void register_nnfsdir_imports(void) {
 }
 
 int nnfsdir_selftest(Ctx *c) {
-    /* a scratch mount under %TEMP% (never the user's save data): two files and one folder, listed with each mode */
+    /* a scratch mount under <exe folder>/../tmp (never the user's save data): two files and one folder, listed with each mode */
     int ok = 1;
     char base[PATH_MAX], p[PATH_MAX];
     uint32_t fs_mount_plain(const char *name, const char *host_dir);
-    GetTempPathA(PATH_MAX - 64, base);
-    snprintf(base + strlen(base), 64, "smo_fsdir_selftest_%lu", (unsigned long)getpid());
+    snprintf(base, sizeof base - 64, "%s/../tmp", plat_exe_dir());
+    plat_mkdirs(base);
+    snprintf(base + strlen(base), 64, "/smo_fsdir_selftest_%lu", (unsigned long)getpid());
     plat_mkdir(base);
-    snprintf(p, sizeof p, "%s\\d", base); plat_mkdir(p);
-    snprintf(p, sizeof p, "%s\\d\\sub", base); plat_mkdir(p);
-    snprintf(p, sizeof p, "%s\\d\\a.bin", base);
+    snprintf(p, sizeof p, "%s/d", base); plat_mkdir(p);
+    snprintf(p, sizeof p, "%s/d/sub", base); plat_mkdir(p);
+    snprintf(p, sizeof p, "%s/d/a.bin", base);
     FILE *f = fopen(p, "wb"); if (f) { fwrite("12345", 1, 5, f); fclose(f); }
-    snprintf(p, sizeof p, "%s\\d\\b.bin", base);
+    snprintf(p, sizeof p, "%s/d/b.bin", base);
     f = fopen(p, "wb"); if (f) fclose(f);
     ok = fs_mount_plain("sdkselftest", base) == 0;
     static const int expect[4] = {0, 1, 2, 3};
@@ -175,11 +181,11 @@ int nnfsdir_selftest(Ctx *c) {
     uint64_t handle = 1;
     c->x[0] = P(&handle); c->x[1] = P("sdkselftest:/missing"); c->x[2] = 3; fs_OpenDirectory(c);
     ok = ok && c->x[0] == RESULT_PATH_NOT_FOUND && handle == 0;
-    snprintf(p, sizeof p, "%s\\d\\a.bin", base); !unlink(p);
-    snprintf(p, sizeof p, "%s\\d\\b.bin", base); !unlink(p);
-    snprintf(p, sizeof p, "%s\\d\\sub", base); !rmdir(p);
-    snprintf(p, sizeof p, "%s\\d", base); !rmdir(p);
-    !rmdir(base);
+    snprintf(p, sizeof p, "%s/d/a.bin", base); unlink(p);
+    snprintf(p, sizeof p, "%s/d/b.bin", base); unlink(p);
+    snprintf(p, sizeof p, "%s/d/sub", base); rmdir(p);
+    snprintf(p, sizeof p, "%s/d", base); rmdir(p);
+    rmdir(base);
     printf("  fs: OpenDirectory / ReadDirectory (modes 1, 2, 3; 0x310-byte entries): %s\n", ok ? "ok" : "FAILED");
     return !ok;
 }

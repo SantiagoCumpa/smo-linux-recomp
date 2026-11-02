@@ -106,7 +106,7 @@ static void test_fs(Ctx *c) {
     check("fs", "the 10 bytes kept and the 40 new ones zero", grown_zero && back[0] == 0xab && back[9] == 0xab);
     args(c, P(h), 0, 0, 0); call(c, "_ZN2nn2fs9FlushFileENS0_10FileHandleE"); check("fs", "FlushFile = success", c->x[0] == 0);
     CloseHandle(h);
-    !unlink(path);
+    unlink(path);
     printf("  nn::fs (SetFileSize, FlushFile): %s\n", g_bad == before ? "ok" : "FAILED");
 }
 
@@ -202,7 +202,7 @@ static void test_diag_time_oe(Ctx *c) {
         check("capture", "turned picture saved, 2 x 3", r == 0 && n == 54 + 2 * 3 * 4 && bw == 2 && bh == 3);
         check("capture", "pixels where a clockwise turn puts them", n == 54 + 24 && PX(1, 0)[2] == 10 && PX(0, 2)[2] == 10 + 40 * 5 && PX(0, 0)[2] == 10 + 40 * 3);
         #undef PX
-        if (path[0]) !unlink(path);
+        if (path[0]) unlink(path);
     }
     args(c, 0, 0, 0, 0); call(c, "_ZN2nn2oe29SetScreenShotImageOrientationENS_5album16ImageOrientationE");
     args(c, 1, 0, 0, 0); call(c, "_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb");

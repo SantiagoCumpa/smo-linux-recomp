@@ -1354,7 +1354,7 @@ static GLuint shd_compile_save(GLenum type, const char *src, const char *path, G
                 head[0] = fmt; head[1] = (uint32_t)got;
                 int good = fwrite(head, 4, 2, f) == 2 && fwrite(data, 1, (size_t)got, f) == (size_t)got;
                 fclose(f);
-                if (good && plat_rename_replace(tmp, path)) *saved = 1; else !unlink(tmp);
+                if (good && plat_rename_replace(tmp, path)) *saved = 1; else unlink(tmp);
             }
         }
         free(data);
@@ -1863,7 +1863,7 @@ static GLuint pair_link(const char *vs, const char *fs, const char *path, int *s
                 head[0] = fmt; head[1] = (uint32_t)got;
                 int good = fwrite(head, 4, 2, f) == 2 && fwrite(data, 1, (size_t)got, f) == (size_t)got;
                 fclose(f);
-                if (good && plat_rename_replace(tmp, path)) *saved = 1; else !unlink(tmp);
+                if (good && plat_rename_replace(tmp, path)) *saved = 1; else unlink(tmp);
             }
         }
         free(data);

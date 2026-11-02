@@ -900,7 +900,7 @@ int nnpad_selftest(const NnHidHooks *h) {
     uint64_t btn; int32_t st[4]; uint32_t attr;
     GetTempPathA(PATH_MAX, path); strcat(path, "smo_pad_selftest\\controllers.ini");
     make_dirs(path);
-    !unlink(path);
+    unlink(path);
     _putenv_s("SMO_CONFIG", path);
     _putenv_s("SMO_KEYBOARD_PLAYER", "0");
     _putenv_s("SMO_PAD_LAYOUT", "");
