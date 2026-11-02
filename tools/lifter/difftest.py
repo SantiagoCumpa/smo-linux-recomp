@@ -6,8 +6,8 @@ state: once by Unicorn, once by the C code recomp.py generates. Final registers,
 
     python tools/lifter/difftest.py sample   collect sample words from the listed functions -> samples.json
     python tools/lifter/difftest.py gen      generate difftest_gen.c + tests.json from the samples
-    python tools/lifter/difftest.py build    compile difftest.exe with clang (LLVM_ROOT, default C:/llvm-9.0.0)
-    python tools/lifter/difftest.py check    run difftest.exe and Unicorn, compare; exit code 1 on any failure
+    python tools/lifter/difftest.py build    compile difftest with clang (from the PATH, or LLVM_ROOT/bin)
+    python tools/lifter/difftest.py check    run difftest and Unicorn, compare; exit code 1 on any failure
     python tools/lifter/difftest.py show <i> registers that differ for one test
     python tools/lifter/difftest.py all      sample + gen + build + check
 Working files live in build/difftest/.
@@ -40,8 +40,7 @@ T = recomp._T                    # tools/target.py: where the modules and the bu
 WORK = T.build('difftest')
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = os.path.join(recomp._REPO, 'runtime', 'core')
-LLVM = os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0')
-HOST_EXE = os.environ.get('DIFFTEST_EXE') or os.path.join(WORK, 'difftest.exe')
+HOST_EXE = os.environ.get('DIFFTEST_EXE') or os.path.join(WORK, 'difftest')
 
 REGION, REGION_SIZE = 0x7200000000, 0x400000
 CODE, DATA = REGION + 0x200000, REGION + 0x300000
@@ -298,9 +297,9 @@ def cmd_gen():
 
 
 def cmd_build():
-    clang = os.path.join(LLVM, 'bin', 'clang.exe')
+    clang = T.CLANG
     host = os.path.join(HERE, 'difftest_host.c')
-    cmd = [clang, '-O0', '-w', '-fno-strict-aliasing', '-I', RUNTIME, 'difftest_gen.c', host, '-o', HOST_EXE]
+    cmd = [clang, '-O0', '-w', '-fno-strict-aliasing', '-ffp-contract=off', '-I', RUNTIME, 'difftest_gen.c', host, '-lm', '-o', HOST_EXE]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode:
         print(r.stdout[-3000:], r.stderr[-3000:])

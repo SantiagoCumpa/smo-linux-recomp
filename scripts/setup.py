@@ -12,24 +12,27 @@ Nothing of the game is stored in the repository: every step derives its files fr
 by git). Steps run in this order and are resumable: a step whose output exists is skipped (--redo <step> repeats it,
 --from <step> repeats it and everything after it); compile, tables and link always run, and only rebuild what changed.
 
-    deps       check Python packages, clang, the Vulkan SDK, SDL3 and the WebView2 SDK
+    deps       check Python packages, clang, lld, pkg-config and the system libraries (Arch packages)
     import     your dump -> build/dump (modules as ELF, versions); RomFS and Help read in place  (tools/extract/extract.py)
     functions  every function of each module, with exact boundaries                            (tools/extract/functions.py)
     lift       AArch64 -> C for every function -> build/lift/main                              (tools/lifter/recomp.py)
     compile    the lifted C -> objects (clang -O2, incremental)                                (tools/lifter/build_main.py)
     tables     generated headers and tables                                     (tools/lifter/gen_tables.py, gen_sdktest.py)
     sdk        the system-library functions that are lifted too                                 (tools/lifter/sdklift.py)
-    link       host runtime + game library -> build/bin/smo_native.exe                          (tools/lifter/build_exe.py)
+    link       host runtime + game library -> build/bin/smo_native                              (tools/lifter/build_exe.py)
     check      differential test against Unicorn and link check (only with --only check or --check; minutes)
 
 Other commands:  --status (what is done)   --steps (list)   --only <step>
-Tool locations: LLVM_ROOT (clang 9, default C:/llvm-9.0.0), VULKAN_HEADERS (default the Vulkan SDK's Include folder),
-SDL3_ROOT (default deps/SDL3-*), WEBVIEW2_ROOT (default deps/webview2-*). Then start the game with scripts/run.py.
+Linux only. Tools: clang and ld.lld from the PATH (or LLVM_ROOT/bin); libraries through pkg-config (sdl3, vulkan,
+shaderc, ffmpeg, freetype2, fontconfig): sudo pacman -S clang lld sdl3 vulkan-headers vulkan-icd-loader shaderc ffmpeg
+freetype2 fontconfig. Python packages in ./.venv (python -m venv .venv; .venv/bin/pip install lz4 capstone unicorn numpy
+Pillow). Then start the game with scripts/run.py.
 """
 import argparse
 import glob
 import importlib
 import os
+import shutil
 import subprocess
 import sys
 
@@ -57,16 +60,20 @@ def check_deps(a):
         except ImportError:
             print('  missing Python package %s (pip install %s)' % (mod, pip))
             ok = False
-    clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
-    vkh = os.environ.get('VULKAN_HEADERS') or next(iter(sorted(glob.glob('C:/VulkanSDK/*/Include'))), '')
-    sdl = os.environ.get('SDL3_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'SDL3-*')))), '')
-    wv2 = os.environ.get('WEBVIEW2_ROOT') or next(iter(sorted(glob.glob(os.path.join(REPO, 'deps', 'webview2-*')))[-1:]), '')
-    wv2 = os.path.join(wv2, 'build', 'native', 'include', 'WebView2.h') if wv2 else ''
-    for what, path in (('clang 9 (LLVM_ROOT)', clang), ('Vulkan SDK headers (VULKAN_HEADERS)', vkh), ('SDL3 (SDL3_ROOT or deps/SDL3-*)', sdl),
-                       ('WebView2 SDK (WEBVIEW2_ROOT)', wv2)):
-        found = bool(path) and os.path.exists(path)
-        print('  %-38s %s' % (what, path if found else 'NOT FOUND'))
-        ok &= found
+    for what, prog, pkg in (('clang', T.CLANG, 'clang'), ('ld.lld', 'ld.lld', 'lld'), ('pkg-config', 'pkg-config', 'pkgconf')):
+        path = shutil.which(prog)
+        print('  %-38s %s' % (what, path or 'NOT FOUND (sudo pacman -S %s)' % pkg))
+        ok &= bool(path)
+    if shutil.which('pkg-config'):
+        for mod, pkg in (('sdl3', 'sdl3'), ('vulkan', 'vulkan-headers vulkan-icd-loader'), ('shaderc', 'shaderc'),
+                         ('libavcodec', 'ffmpeg'), ('libavformat', 'ffmpeg'), ('libavutil', 'ffmpeg'), ('libswscale', 'ffmpeg'),
+                         ('libswresample', 'ffmpeg'), ('freetype2', 'freetype2'), ('fontconfig', 'fontconfig')):
+            r = subprocess.run(['pkg-config', '--modversion', mod], capture_output=True, text=True)
+            print('  %-38s %s' % (mod, r.stdout.strip() if r.returncode == 0 else 'NOT FOUND (sudo pacman -S %s)' % pkg))
+            ok &= r.returncode == 0
+        if not os.path.exists('/usr/include/vulkan/vulkan.h'):
+            print('  %-38s %s' % ('vulkan/vulkan.h', 'NOT FOUND (sudo pacman -S vulkan-headers)'))
+            ok = False
     if a.dump and not os.path.isdir(a.dump):
         print('  dump folder %s does not exist' % a.dump)
         ok = False
@@ -93,7 +100,7 @@ STEPS = [
      lambda a: [[PY, tool('lifter', 'gen_tables.py')], [PY, tool('lifter', 'gen_sdktest.py')]]),
     ('sdk', 'gen/sdklift_gen.c', lambda: exists('gen', 'sdklift_report.txt'),
      lambda a: [[PY, tool('lifter', 'sdklift.py'), 'gen']]),
-    ('link', 'bin/smo_native.exe', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
+    ('link', 'bin/smo_native', None, lambda a: [[PY, tool('lifter', 'build_exe.py')]]),
     ('check', 'difftest + linkcheck', None,
      lambda a: [[PY, tool('lifter', 'difftest.py'), 'all'], [PY, tool('lifter', 'linkcheck.py')]]),
 ]
@@ -146,7 +153,7 @@ def main():
                     raise SystemExit('[%s] failed (exit code %d); fix the cause and run setup again, it resumes here' % (name, r.returncode))
     if 'link' in todo:
         print('\nBuilt: %s. Start the game with: python scripts/run.py <run name> --seconds 300'
-              % os.path.relpath(T.build('bin', 'smo_native.exe'), REPO))
+              % os.path.relpath(T.exe_path(), REPO))
 
 
 if __name__ == '__main__':

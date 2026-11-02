@@ -12,6 +12,6 @@ void stx_diag(Ctx *c, uint64_t a, uint64_t e, uint64_t s, uint64_t v, int bits)
 { (void)c; (void)a; (void)e; (void)s; (void)v; (void)bits; }
 
 /* exported so the linker keeps the whole table (and with it every lifted function) */
-__declspec(dllexport) const FnEntry *linkcheck_table(void) { return fn_table; }
-__declspec(dllexport) int linkcheck_count(void) { return fn_table_count; }
-__declspec(dllexport) const DynSym *linkcheck_syms(void) { return dyn_syms; }
+__attribute__((visibility("default"))) const FnEntry *linkcheck_table(void) { return fn_table; }
+__attribute__((visibility("default"))) int linkcheck_count(void) { return fn_table_count; }
+__attribute__((visibility("default"))) const DynSym *linkcheck_syms(void) { return dyn_syms; }

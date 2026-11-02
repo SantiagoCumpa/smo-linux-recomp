@@ -3,7 +3,7 @@
     python tools/lifter/difftest_mutation.py
 
 Copies build/difftest/difftest_gen.c, plants one deliberate bug in four tests (one per kind: an arithmetic operator,
-a branch condition, a trap removed, an FP min/max swapped), builds that copy as build/difftest/mutant/difftest.exe and
+a branch condition, a trap removed, an FP min/max swapped), builds that copy as build/difftest/mutant/difftest and
 runs `difftest.py check` against it. Passes only if exactly the four mutated tests are reported different.
 The real tests, their generated code and the reference are not modified.
 """
@@ -49,8 +49,8 @@ def main():
         print('mutated %-8s test #%d  %s' % (kind, i, tests[i]['key']))
     os.makedirs(MUT, exist_ok=True)
     open(os.path.join(MUT, 'difftest_gen.c'), 'w').write('\n'.join(lines))
-    clang = os.path.join(os.environ.get('LLVM_ROOT', 'C:/llvm-9.0.0'), 'bin', 'clang.exe')
-    exe = os.path.join(MUT, 'difftest.exe')
+    clang = difftest.T.CLANG
+    exe = os.path.join(MUT, 'difftest')
     r = subprocess.run([clang, '-O0', '-w', '-fno-strict-aliasing', '-I', os.path.join(recomp._REPO, 'runtime', 'core'),
                         os.path.join(MUT, 'difftest_gen.c'), os.path.join(HERE, 'difftest_host.c'), '-o', exe],
                        capture_output=True, text=True)

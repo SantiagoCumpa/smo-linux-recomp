@@ -1,4 +1,4 @@
-/* Host side of the exe / smo_game.dll split (see game_shim.c).
+/* Host side of the smo_native / libsmo_game.so split (see game_shim.c).
  *
  * build_exe.py compiles every host file with
  *     -Dfn_table=(*game_fn_table_p) -Dfn_table_count=(*game_fn_table_count_p)
@@ -22,7 +22,7 @@ typedef struct {
     const int *sym_count;
 } GameTables;
 
-__declspec(dllimport) void game_bind(const GameHost *h, GameTables *t);
+void game_bind(const GameHost *h, GameTables *t);
 
 #undef fn_table
 #undef fn_table_count

@@ -1,40 +1,47 @@
-"""Name the host function at an offset of an exe, from the MSVC-format linker map build_exe.py writes.
+"""Name the host function at an offset of an executable or shared library (Linux, ELF), from its symbol table.
 
-    python tools/lifter/mapaddr.py <exe.map> <offset hex> [<offset hex> ...]
+    python tools/lifter/mapaddr.py <smo_native | libsmo_game.so | their .map> <offset hex> [<offset hex> ...]
 
-Offsets are what a crash report prints ("in smo_test.exe at offset 0x...": relative to the module base).
+Offsets are what a crash report prints ("smo_native+0x...": relative to the module's load base, from dladdr). The
+symbols are read with `nm` (build_exe.py links with -g1, unstripped); a .map path names the binary beside it.
 """
-import re
+import os
+import subprocess
 import sys
 
 
 def load(path):
-    base, syms = 0x140000000, []
-    for line in open(path, encoding='latin-1'):
-        m = re.match(r'\s*Preferred load address is ([0-9a-fA-F]+)', line)
-        if m:
-            base = int(m.group(1), 16)
-        m = re.match(r'\s*[0-9a-fA-F]{4}:[0-9a-fA-F]{8}\s+(\S+)\s+([0-9a-fA-F]{16})\s+[f ]\s*(\S*)', line)
-        if m:
-            syms.append((int(m.group(2), 16), m.group(1), m.group(3)))
+    """(base, [(address, name, '')...] sorted). base is 0: ELF symbol values of a PIE/shared object are offsets."""
+    if path.endswith('.map'):
+        path = path[:-4]
+    syms = []
+    if os.path.exists(path):
+        r = subprocess.run(['nm', '--defined-only', '-C', path], capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            parts = line.split(' ', 2)
+            if len(parts) == 3 and parts[1] in 'tTwW':
+                try:
+                    syms.append((int(parts[0], 16), parts[2], ''))
+                except ValueError:
+                    pass
     syms.sort()
-    return base, syms
+    return 0, syms
+
+
+def name_at(syms, addr):
+    best = None
+    for s in syms:
+        if s[0] <= addr:
+            best = s
+        else:
+            break
+    return '%s+0x%x' % (best[1], addr - best[0]) if best else '?'
 
 
 def main():
     base, syms = load(sys.argv[1])
     for off in sys.argv[2:]:
-        a = base + int(off, 16)
-        best = None
-        for s in syms:
-            if s[0] <= a:
-                best = s
-            else:
-                break
-        if best:
-            print('0x%s -> %s+0x%x  (%s)' % (off, best[1], a - best[0], best[2]))
-        else:
-            print('0x%s -> ?' % off)
+        print('0x%s -> %s' % (off, name_at(syms, base + int(off, 16))))
 
 
 if __name__ == '__main__':

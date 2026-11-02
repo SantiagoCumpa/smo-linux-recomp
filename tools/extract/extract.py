@@ -14,7 +14,7 @@ version in control.nacp, and the RomFS and Help folders by what they contain.
 Writes, all under build/ (ignored by git):
     dump/update/exefs/<name>, elf/<name>.elf, control.nacp   the program; its modules converted to ELF
     dump/version.json                                        what was found: versions, build ids, SHA-256 of modules
-    romfs, manual                                            directory junctions to your dump's folders (read in place)
+    romfs, manual                                            symbolic links to your dump's folders (read in place)
     sysdata/fonts/<name>.ttf                                 the shared fonts, unwrapped (when given)
 """
 import argparse
@@ -89,21 +89,17 @@ def write_exefs(files, dst):
 
 
 def link_folder(link, target):
-    """build/<link> becomes a directory junction to the dump's folder (no copy). A junction already there is replaced;
-    a real folder is left alone (it was copied there before): delete it to read the dump in place."""
-    if os.path.isdir(link) and not os.path.isjunction(link):
+    """build/<link> becomes a symbolic link to the dump's folder (no copy). A link already there is replaced; a real
+    folder is left alone (it was copied there before): delete it to read the dump in place."""
+    if os.path.islink(link):
+        os.unlink(link)                                # removes the link only, never what it points to
+    elif os.path.isdir(link):
         if any(os.scandir(link)):
             print('  %s is a folder of its own, not a link to your dump: left as it is (delete it to use %s)' % (link, target))
             return
         os.rmdir(link)
-    elif os.path.isjunction(link):
-        os.rmdir(link)                                 # removes the junction only, never what it points to
     os.makedirs(os.path.dirname(link), exist_ok=True)
-    try:
-        import _winapi
-        _winapi.CreateJunction(os.path.abspath(target), link)
-    except (ImportError, OSError):
-        subprocess.run(['cmd', '/c', 'mklink', '/J', link, os.path.abspath(target)], check=True, capture_output=True)
+    os.symlink(os.path.abspath(target), link, target_is_directory=True)
     print('  %s -> %s' % (link, target))
 
 
