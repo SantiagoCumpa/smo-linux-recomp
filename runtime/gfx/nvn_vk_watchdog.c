@@ -6,23 +6,21 @@
  *   - what the renderer was doing (frames, present attempts, failures, queues of the workers);
  *   - our locks (g_sh_lock, g_gpl_lock): the thread that owns each;
  *   - every wait of ours that was entered through WD_SLEEP (function, line, how long);
- *   - EVERY thread of the process: its name (guest thread name / render / main), whether it used CPU in the last 300 ms,
- *     and its call stack: host functions by name when <exe name>.map is next to the exe (the link step writes it; without
- *     it: module + offset), functions of the lifted game as "guest f_<address>", system and driver DLLs by nearest export.
+ *   - EVERY thread of the process (/proc/self/task): its name (guest thread name / render / main / the kernel's name),
+ *     whether it used CPU in the last 300 ms, and its call stack (taken by a signal the thread answers itself:
+ *     plat_thread_backtrace): module + offset (tools/lifter/mapaddr.py names them from the binary's symbols), a name when
+ *     the dynamic linker knows one, and functions of the lifted game as "guest f_<address>".
  * The report is repeated after 4x the time (5 s, 20 s, 80 s, ...), at most 6 times a run; a line says when frames come back.
- * It only reads: nothing is unblocked or killed. Threads are suspended one at a time for the few microseconds of the unwind;
- * nothing is printed or allocated while one is suspended. */
+ * It only reads: nothing is unblocked or killed. A thread blocked in the kernel answers the signal and goes back to its wait
+ * (system calls restart). */
 const char *guest_thread_name_of(uint32_t tid);       /* os_threads.c */
 int display_menu_held(void);                       /* display.c */
 extern volatile int32_t g_guest_frozen;               /* hostrt.c */
 /* fn_table / fn_table_count (runtime.h; -Dfn_table=(*game_fn_table_p)): the lifted game's functions, by guest address */
 static volatile int32_t g_wd_quit;
-static HANDLE g_wd_thread;
+static plat_thread *g_wd_thread;
 static FILE *g_wd_fp;
 static uint32_t g_wd_main_tid;
-typedef struct { uint32_t rva; char name[68]; } WdSym;
-static WdSym *g_wd_sym;
-static int g_wd_nsym, g_wd_map_tried;
 static void wdp(const char *fmt, ...) {
     char b[1400];
     va_list ap;
@@ -30,112 +28,67 @@ static void wdp(const char *fmt, ...) {
     fputs(b, stdout);
     if (g_wd_fp) fputs(b, g_wd_fp);
 }
-static int wd_sym_cmp(const void *a, const void *b) { const WdSym *x = a, *y = b; return x->rva < y->rva ? -1 : x->rva > y->rva; }
-static void wd_map_load(void) {                    /* the linker's map of this exe, if it is there: "<exe without .exe>.map" */
-    char path[PATH_MAX + 8], ln[1024], t1[64], t2[512], t3[64];
-    unsigned long long base = 0x140000000ull;
-    g_wd_map_tried = 1;
-    uint32_t n = snprintf(path, sizeof path, "%s", plat_exe_path());
-    if (n < 5) return;
-    strcpy(path + n - 4, ".map");
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return;
-    int cap = 0;
-    while (fgets(ln, sizeof ln, fp)) {
-        const char *p = strstr(ln, "Preferred load address is ");
-        if (p) { base = strtoull(p + 26, NULL, 16); continue; }
-        if (sscanf(ln, " %63s %511s %63s", t1, t2, t3) != 3 || strlen(t1) != 13 || t1[4] != ':' || strlen(t3) != 16) continue;
-        unsigned long long va = strtoull(t3, NULL, 16);
-        if (va <= base || va - base > 0x7fffffffull) continue;
-        if (g_wd_nsym == cap) { cap = cap ? cap * 2 : 8192; g_wd_sym = realloc(g_wd_sym, (size_t)cap * sizeof *g_wd_sym); if (!g_wd_sym) { g_wd_nsym = 0; break; } }
-        g_wd_sym[g_wd_nsym].rva = (uint32_t)(va - base);
-        snprintf(g_wd_sym[g_wd_nsym].name, sizeof g_wd_sym[0].name, "%s", t2);
-        g_wd_nsym++;
-    }
-    fclose(fp);
-    if (g_wd_nsym) qsort(g_wd_sym, (size_t)g_wd_nsym, sizeof *g_wd_sym, wd_sym_cmp);
-}
-static void wd_export(HMODULE m, uint32_t rva, char *out, size_t n) {      /* the nearest exported name at or below rva */
-    const uint8_t *b = (const uint8_t *)m;
-    const IMAGE_DOS_HEADER *dh = (const IMAGE_DOS_HEADER *)b;
-    out[0] = 0;
-    if (dh->e_magic != IMAGE_DOS_SIGNATURE) return;
-    const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)(b + dh->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.NumberOfRvaAndSizes < 1) return;
-    IMAGE_DATA_DIRECTORY dd = nt->OptionalHeader.DataDirectory[0];
-    if (!dd.VirtualAddress || !dd.Size) return;
-    const IMAGE_EXPORT_DIRECTORY *ed = (const IMAGE_EXPORT_DIRECTORY *)(b + dd.VirtualAddress);
-    const uint32_t *fn = (const uint32_t *)(b + ed->AddressOfFunctions), *nm = (const uint32_t *)(b + ed->AddressOfNames);
-    const uint16_t *od = (const uint16_t *)(b + ed->AddressOfNameOrdinals);
-    uint32_t best = 0;
-    const char *bn = NULL;
-    for (uint32_t i = 0; i < ed->NumberOfNames; i++) {
-        uint32_t f = od[i] < ed->NumberOfFunctions ? fn[od[i]] : 0;
-        if (!f || f > rva || f < best || (f >= dd.VirtualAddress && f < dd.VirtualAddress + dd.Size)) continue;
-        best = f; bn = (const char *)(b + nm[i]);
-    }
-    if (bn) snprintf(out, n, "%.60s+0x%x", bn, (unsigned)(rva - best));
+/* The module of an address (dladdr), the game library's lifted functions by fn_table. */
+static int wd_in_game(uint64_t pc) {
+    Dl_info a, b;
+    return dladdr((void *)(uintptr_t)pc, &a) && dladdr((void *)&fn_table[0], &b) && a.dli_fbase == b.dli_fbase;
 }
 static void wd_addr(uint64_t pc, char *out, size_t n) {
-    HMODULE m = NULL, exe = GetModuleHandleA(NULL), game = NULL;
-    char mod[PATH_MAX] = "", sym[96] = "";
-    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)(uintptr_t)pc, &m) || !m) { snprintf(out, n, "%llx (in no module)", (unsigned long long)pc); return; }
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)(uintptr_t)&fn_table[0], &game);
-    GetModuleFileNameA(m, mod, sizeof mod);
-    const char *bn = strrchr(mod, '\\');
-    bn = bn ? bn + 1 : mod;
-    uint32_t rva = (uint32_t)(pc - (uint64_t)(uintptr_t)m);
-    if (m == exe) {
-        if (!g_wd_map_tried) wd_map_load();
-        int lo = 0, hi = g_wd_nsym - 1, at = -1;
-        while (lo <= hi) { int mid = (lo + hi) / 2; if (g_wd_sym[mid].rva <= rva) { at = mid; lo = mid + 1; } else hi = mid - 1; }
-        if (at >= 0) snprintf(sym, sizeof sym, "%s+0x%x", g_wd_sym[at].name, (unsigned)(rva - g_wd_sym[at].rva));
-    } else if (m == game) {
+    Dl_info di;
+    char sym[160] = "";
+    if (!dladdr((void *)(uintptr_t)pc, &di) || !di.dli_fname) { snprintf(out, n, "%llx (in no module)", (unsigned long long)pc); return; }
+    const char *bn = strrchr(di.dli_fname, '/');
+    bn = bn ? bn + 1 : di.dli_fname;
+    uint64_t off = pc - (uint64_t)(uintptr_t)di.dli_fbase;
+    if (wd_in_game(pc)) {
         uint64_t best = 0, guest = 0;
         for (int i = 0; i < fn_table_count; i++) { uint64_t f = (uint64_t)(uintptr_t)fn_table[i].fn; if (f <= pc && f > best) { best = f; guest = fn_table[i].addr; } }
         if (best && pc - best < 0x400000) snprintf(sym, sizeof sym, "guest f_%llx (host +0x%x)", (unsigned long long)guest, (unsigned)(pc - best));
-    } else wd_export(m, rva, sym, sizeof sym);
-    snprintf(out, n, "%s+0x%x%s%s%s", bn, (unsigned)rva, sym[0] ? " [" : "", sym, sym[0] ? "]" : "");
-}
-/* The return addresses of another thread (suspended by the caller). Unwind data that cannot be read ends the walk. */
-static int wd_walk(CONTEXT *ctx, uint64_t *pcs, int max) {
-    int n = 0;
-    __try {
-        while (n < max && ctx->Rip) {
-            uint64_t base = 0, ef = 0;
-            void *hd = NULL;
-            pcs[n++] = ctx->Rip;
-            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(ctx->Rip, &base, NULL);
-            if (!rf) { ctx->Rip = *(const uint64_t *)(uintptr_t)ctx->Rsp; ctx->Rsp += 8; }      /* a leaf function: the return address is at the stack pointer */
-            else RtlVirtualUnwind(0 /* UNW_FLAG_NHANDLER */, base, ctx->Rip, rf, ctx, &hd, &ef, NULL);
-        }
-    } __except (1) { }
-    return n;
+    } else if (di.dli_sname) snprintf(sym, sizeof sym, "%.100s+0x%llx", di.dli_sname, (unsigned long long)(pc - (uint64_t)(uintptr_t)di.dli_saddr));
+    snprintf(out, n, "%s+0x%llx%s%s%s", bn, (unsigned long long)off, sym[0] ? " [" : "", sym, sym[0] ? "]" : "");
 }
 static const char *wd_tname(uint32_t tid, char *buf, size_t n) {
-    const char *g = tid == g_render_tid ? "render (host)" : tid == g_wd_main_tid ? "the process's first thread (boot.c main: waits for the game)" : guest_thread_name_of(tid);
+    const char *g = tid == g_render_tid ? "render (host)" : tid == g_wd_main_tid ? "the process's first thread (boot.c main: the window's event loop)" : guest_thread_name_of(tid);
     if (g) return g;
-    for (int i = 0; i < g_pw_nthread; i++) if (g_pw_thread[i] && GetThreadId(g_pw_thread[i]) == tid) { snprintf(buf, n, "shader worker %d (host)", i); return buf; }
-    return "host thread";
+    for (int i = 0; i < g_pw_nthread; i++) if (g_pw_tid[i] && (uint32_t)g_pw_tid[i] == tid) { snprintf(buf, n, "shader worker %d (host)", i); return buf; }
+    char path[64], comm[32] = "";
+    snprintf(path, sizeof path, "/proc/self/task/%u/comm", tid);
+    FILE *f = fopen(path, "r");
+    if (f) { if (!fgets(comm, sizeof comm, f)) comm[0] = 0; fclose(f); comm[strcspn(comm, "\n")] = 0; }
+    snprintf(buf, n, "host thread \"%s\"", comm);
+    return buf;
 }
 static void wd_owner(const char *name, plat_lock_t *cs) {
-    char tb[48];
-    uint32_t o = (uint32_t)(uintptr_t)cs->OwningThread;
-    if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %ld, lock count %ld\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), (long)cs->RecursionCount, (long)cs->LockCount);
+    char tb[64];
+    uint32_t o = (uint32_t)cs->__data.__owner;
+    if (o) wdp("  lock %s: OWNED by thread %lu (%s), recursion %u\n", name, (unsigned long)o, wd_tname(o, tb, sizeof tb), (unsigned)cs->__data.__count);
     else wdp("  lock %s: free\n", name);
 }
+/* the threads of this process: /proc/self/task */
+static int wd_tasks(uint32_t *tids, int max) {
+    DIR *d = opendir("/proc/self/task");
+    int n = 0;
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && n < max) if (e->d_name[0] >= '0' && e->d_name[0] <= '9') tids[n++] = (uint32_t)strtoul(e->d_name, NULL, 10);
+    closedir(d);
+    return n;
+}
+static int wd_nice(uint32_t tid) { errno = 0; int v = getpriority(PRIO_PROCESS, tid); return errno ? 0 : v; }
 static void wd_dump(double stall_s, int64_t tries_since) {
-    static struct { uint32_t tid; uint64_t cpu0, cpu1, born; int prio, nfr; uint64_t pc[28]; } th[400];
-    char path[PATH_MAX + 16], tb[48], ab[400];
+    static struct { uint32_t tid; uint64_t cpu0, cpu1; int prio, nfr; uint64_t pc[28]; } th[400];
+    char path[PATH_MAX + 16], tb[64], ab[400];
     plat_counter fq; plat_qpf(&fq);
-    SYSTEMTIME st; GetLocalTime(&st);
-    uint32_t me = plat_tid(), pid = getpid(), n = snprintf(path, sizeof path, "%s", plat_exe_path());
+    time_t now_t = time(NULL);
+    struct tm st; localtime_r(&now_t, &st);
+    uint32_t me = plat_tid(), pid = getpid();
     int nt = 0;
-    if (n > 4) { strcpy(path + n - 4, "_freeze.txt"); g_wd_fp = fopen(path, "ab"); }
-    wdp("\nnvn_vk_watchdog: ======== NO FRAME PRESENTED FOR %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", stall_s, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, (unsigned long)pid, (long long)nvn_front_frame_next());
+    snprintf(path, sizeof path, "%s_freeze.txt", plat_exe_path());
+    g_wd_fp = fopen(path, "ab");
+    wdp("\nnvn_vk_watchdog: ======== NO FRAME PRESENTED FOR %.1f s ======== %04d-%02d-%02d %02d:%02d:%02d, process %lu, game frame %lld\n", stall_s, st.tm_year + 1900, st.tm_mon + 1, st.tm_mday, st.tm_hour, st.tm_min, st.tm_sec, (unsigned long)pid, (long long)nvn_front_frame_next());
     wdp("  presents: %lld frames reached the window so far; present attempts since the last one that did: %lld (%s); frames not presented %lld, failed Vulkan calls %lld, swapchain made again %lld times; window %s\n",
         (long long)g_vk_frames, (long long)tries_since, tries_since ? "the game still presents but nothing reaches the window: see the failures" : "none: the game's present never came, or the render thread is held",
-        (long long)g_vk_skipped, (long long)g_vk_errors, (long long)g_vk_recreated, IsIconic((HWND)nvn_front_hwnd()) ? "MINIMISED" : "not minimised");
+        (long long)g_vk_skipped, (long long)g_vk_errors, (long long)g_vk_recreated, display_focus_flags() & 2 ? "MINIMISED" : "not minimised");
     wdp("  render thread %lu, place in its present: %s; %s; scene near: %s\n", (unsigned long)g_render_tid, g_wd_where == 1 ? "the loading barrier (waits for the workers, at most 20 s)" : g_wd_where == 2 ? "vkAcquireNextImageKHR" : g_wd_where == 3 ? "blit and submit" : g_wd_where == 4 ? "vkQueuePresentKHR" : "not in a present",
         g_in_scene ? "the last frame drew a scene (compute dispatches)" : "the last frame drew no scene", scene_recent() ? "yes" : "no");
     wdp("  workers: %d threads; foreground jobs %lld queued / %lld done, background %lld / %lld; loading-barrier holds %lld (time-outs %lld)\n",
@@ -152,42 +105,30 @@ static void wd_dump(double stall_s, int64_t tries_since) {
         }
         if (!any) wdp("  waits of ours (stage / library / pipeline being made by another thread, queues): none entered\n");
     }
+    g_wd_main_tid = pid;                           /* the process's first thread has the process's id */
     for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, twice, 300 ms apart: who is running and who is blocked */
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        THREADENTRY32 te;
-        te.dwSize = sizeof te;
-        if (snap == INVALID_HANDLE_VALUE) break;
-        for (int ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        static uint32_t tids[400];
+        int nn = wd_tasks(tids, 400);
+        for (int k = 0; k < nn; k++) {
+            if (tids[k] == me) continue;
             int i;
-            for (i = 0; i < nt && th[i].tid != te.th32ThreadID; i++) {}
-            if (i == nt) { if (pass || nt == 400) continue; th[nt].tid = te.th32ThreadID; th[nt].cpu0 = th[nt].cpu1 = 0; th[nt].nfr = 0; th[nt].prio = 0; th[nt].born = ~0ull; nt++; }
-            HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
-            FILETIME c, e, k, u;
-            if (!h) continue;
-            if (GetThreadTimes(h, &c, &e, &k, &u)) { uint64_t cpu = (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime); if (pass) th[i].cpu1 = cpu; else th[i].cpu0 = th[i].cpu1 = cpu; th[i].born = ((uint64_t)c.dwHighDateTime << 32) | c.dwLowDateTime; }
-            th[i].prio = GetThreadPriority(h);
-            CloseHandle(h);
+            for (i = 0; i < nt && th[i].tid != tids[k]; i++) {}
+            if (i == nt) { if (pass || nt == 400) continue; th[nt].tid = tids[k]; th[nt].cpu0 = th[nt].cpu1 = 0; th[nt].nfr = 0; th[nt].prio = 0; nt++; }
+            uint64_t cpu = plat_thread_cpu_ns((pid_t)tids[k]);
+            if (pass) th[i].cpu1 = cpu; else th[i].cpu0 = th[i].cpu1 = cpu;
+            th[i].prio = wd_nice(tids[k]);
         }
-        CloseHandle(snap);
         if (!pass) plat_sleep_ms(300);
     }
-    for (int i = 0; i < nt; i++) {                 /* the stacks: one thread suspended at a time, nothing else done meanwhile */
-        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, th[i].tid);
-        static CONTEXT ctx;
-        if (!h) continue;
-        if (SuspendThread(h) != (uint32_t)-1) {
-            memset(&ctx, 0, sizeof ctx);
-            ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-            if (GetThreadContext(h, &ctx)) th[i].nfr = wd_walk(&ctx, th[i].pc, 28);
-            ResumeThread(h);
-        }
-        CloseHandle(h);
+    for (int i = 0; i < nt; i++) {                 /* the stacks: each thread records its own when signalled */
+        uintptr_t pcs[28];
+        int np = plat_thread_backtrace((pid_t)th[i].tid, pcs, 28);
+        for (int f = 0; f < np; f++) th[i].pc[f] = pcs[f];
+        th[i].nfr = np;
     }
-    { uint64_t first = ~0ull; for (int i = 0; i < nt; i++) if (th[i].born < first) { first = th[i].born; g_wd_main_tid = th[i].tid; } }      /* the process's first thread runs the guest's main thread (boot.c) */
     wdp("  threads: %d (the watchdog's own not listed); \"cpu\" = CPU time used in 300 ms: 0.0 means blocked or idle\n", nt);
     for (int i = 0; i < nt; i++) {
-        wdp("  thread %lu  %s  priority %d  cpu %.1f ms of 300\n", (unsigned long)th[i].tid, wd_tname(th[i].tid, tb, sizeof tb), th[i].prio, (double)(th[i].cpu1 - th[i].cpu0) / 10000.0);
+        wdp("  thread %lu  %s  nice %d  cpu %.1f ms of 300\n", (unsigned long)th[i].tid, wd_tname(th[i].tid, tb, sizeof tb), th[i].prio, (double)(th[i].cpu1 - th[i].cpu0) / 1e6);
         for (int f = 0; f < th[i].nfr; f++) { wd_addr(th[i].pc[f], ab, sizeof ab); wdp("      %2d  %s\n", f, ab); }
     }
     wdp("nvn_vk_watchdog: ======== end of the report%s%s ========\n\n", g_wd_fp ? "; also appended to " : "", g_wd_fp ? path : "");
@@ -210,7 +151,7 @@ static uint32_t wd_main(void *arg) {
         }
         double s = (double)(tk() - b) / (double)fq.QuadPart;
         if (s < next || dumps >= 6) continue;
-        if (IsIconic((HWND)nvn_front_hwnd()) && g_wd_try != try0) { next = s + limit; continue; }      /* a minimised window: presents are skipped, the game runs */
+        if ((display_focus_flags() & 2) && g_wd_try != try0) { next = s + limit; continue; }      /* a minimised window: presents are skipped, the game runs */
         if (display_menu_held()) { next = s + limit; continue; }       /* the game is held on purpose (the Help page, smo_guide.c) */
         if (g_guest_frozen) { next = s + limit; continue; }            /* stopped on purpose (graphics.ini unfocused = pause, nnmisc.c oe_watch) */
         dumps++;
@@ -222,50 +163,43 @@ static uint32_t wd_main(void *arg) {
 /* SMO_HOSTPROF=<start s>,<seconds>[,<threads>] (debug aid): samples the stacks of the busiest threads (default 4, by CPU
  * time in half a second at the start) about every millisecond for that long, then prints per thread the functions met
  * most often: "self" when the sampled pc is in the function, "total" when the function is anywhere on the stack, in % of
- * the thread's samples. Names as in the watchdog's report: this exe's functions by the linker map, the lifted game's as
- * "guest f_<address>" (tools/dev/profnames.py adds their names from the function list), other modules by nearest
- * export. A thread is suspended only for the few microseconds of its unwind; nothing is allocated or printed meanwhile. */
+ * the thread's samples. Names as in the watchdog's report: module + offset (and a dynamic symbol when there is one), the
+ * lifted game's as "guest f_<address>" (tools/dev/profnames.py adds their names from the function list). Each sample is
+ * a signal the thread answers with its own backtrace (plat_thread_backtrace). */
 #define HP_SLOTS 32768
 #define HP_DEPTH 160
 typedef struct { uint64_t key; unsigned self, total; } HpEnt;
-typedef struct { uint32_t tid; HANDLE h; unsigned samples, used, waits, wused; HpEnt *t, *w; char name[80]; double cpu_ms; } HpThread;
-static uint64_t hp_mod_end(HMODULE m) {           /* end address of a loaded module (its SizeOfImage) */
-    const IMAGE_DOS_HEADER *dh = (const IMAGE_DOS_HEADER *)m;
-    if (!m || dh->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    const IMAGE_NT_HEADERS64 *nt = (const IMAGE_NT_HEADERS64 *)((const uint8_t *)m + dh->e_lfanew);
-    return (uint64_t)(uintptr_t)m + nt->OptionalHeader.SizeOfImage;
-}
+typedef struct { uint32_t tid; unsigned samples, used, waits, wused; HpEnt *t, *w; char name[80]; double cpu_ms; } HpThread;
 static int hp_cmp_self(const void *a, const void *b) { const HpEnt *x = a, *y = b; return x->self < y->self ? 1 : x->self > y->self ? -1 : 0; }
 static int hp_cmp_total(const void *a, const void *b) { const HpEnt *x = a, *y = b; return x->total < y->total ? 1 : x->total > y->total ? -1 : 0; }
-static uint64_t hp_func(uint64_t pc) {             /* the start of the function holding pc (pc itself in code without unwind data) */
-    uint64_t base = 0;
-    PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(pc, &base, NULL);
-    return rf ? base + rf->BeginAddress : pc;
+static uint64_t hp_func(uint64_t pc) {             /* the start of the function holding pc (pc itself when not known) */
+    if (wd_in_game(pc)) {
+        uint64_t best = 0;
+        for (int i = 0; i < fn_table_count; i++) { uint64_t f = (uint64_t)(uintptr_t)fn_table[i].fn; if (f <= pc && f > best) best = f; }
+        return best && pc - best < 0x400000 ? best : pc;
+    }
+    Dl_info di;
+    return dladdr((void *)(uintptr_t)pc, &di) && di.dli_saddr ? (uint64_t)(uintptr_t)di.dli_saddr : pc;
+}
+static int hp_in_libc(uint64_t pc) {                /* a thread blocked in a system call samples inside libc */
+    Dl_info di;
+    return dladdr((void *)(uintptr_t)pc, &di) && di.dli_fname && strstr(di.dli_fname, "libc.so");
 }
 static void hp_window(double secs, int want) {
-    uint32_t pid = getpid(), me = plat_tid();
+    uint32_t me = plat_tid();
     static struct { uint32_t tid; uint64_t c0, c1; } th[512];
     int nt = 0;
     for (int pass = 0; pass < 2; pass++) {         /* CPU time of every thread, half a second apart */
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-        THREADENTRY32 te;
-        te.dwSize = sizeof te;
-        if (snap == INVALID_HANDLE_VALUE) return;
-        for (int ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
-            if (te.th32OwnerProcessID != pid || te.th32ThreadID == me) continue;
+        static uint32_t tids[512];
+        int nn = wd_tasks(tids, 512);
+        for (int k = 0; k < nn; k++) {
+            if (tids[k] == me) continue;
             int i;
-            for (i = 0; i < nt && th[i].tid != te.th32ThreadID; i++) {}
-            if (i == nt) { if (pass || nt == 512) continue; th[nt].tid = te.th32ThreadID; th[nt].c0 = th[nt].c1 = 0; nt++; }
-            HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, te.th32ThreadID);
-            FILETIME c, x, k, u;
-            if (!h) continue;
-            if (GetThreadTimes(h, &c, &x, &k, &u)) {
-                uint64_t cpu = (((uint64_t)k.dwHighDateTime << 32) | k.dwLowDateTime) + (((uint64_t)u.dwHighDateTime << 32) | u.dwLowDateTime);
-                if (pass) th[i].c1 = cpu; else th[i].c0 = cpu;
-            }
-            CloseHandle(h);
+            for (i = 0; i < nt && th[i].tid != tids[k]; i++) {}
+            if (i == nt) { if (pass || nt == 512) continue; th[nt].tid = tids[k]; th[nt].c0 = th[nt].c1 = 0; nt++; }
+            uint64_t cpu = plat_thread_cpu_ns((pid_t)tids[k]);
+            if (pass) th[i].c1 = cpu; else th[i].c0 = cpu;
         }
-        CloseHandle(snap);
         if (!pass) plat_sleep_ms(500);
     }
     static HpThread hp[8];
@@ -275,45 +209,36 @@ static void hp_window(double secs, int want) {
         int best = -1;
         for (int i = 0; i < nt; i++) if (th[i].c1 > th[i].c0 && (best < 0 || th[i].c1 - th[i].c0 > th[best].c1 - th[best].c0)) best = i;
         if (best < 0) break;
-        HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, th[best].tid);
-        if (h && (hp[n].t = calloc(HP_SLOTS, sizeof(HpEnt))) != NULL && (hp[n].w = calloc(HP_SLOTS, sizeof(HpEnt))) != NULL) {
+        if ((hp[n].t = calloc(HP_SLOTS, sizeof(HpEnt))) != NULL && (hp[n].w = calloc(HP_SLOTS, sizeof(HpEnt))) != NULL) {
             char tb[80];
-            hp[n].tid = th[best].tid; hp[n].h = h;
-            hp[n].cpu_ms = (double)(th[best].c1 - th[best].c0) / 10000.0;
+            hp[n].tid = th[best].tid;
+            hp[n].cpu_ms = (double)(th[best].c1 - th[best].c0) / 1e6;
             snprintf(hp[n].name, sizeof hp[n].name, "%s", wd_tname(hp[n].tid, tb, sizeof tb));
             n++;
-        } else if (h) CloseHandle(h);
+        }
         th[best].c1 = th[best].c0;
     }
-    HANDLE tm = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
     plat_counter fq, t0, now;
     plat_qpf(&fq);
     plat_qpc(&t0);
     printf("hostprof: sampling %d threads for %.0f s\n", n, secs);
     fflush(stdout);
     static uint64_t pcs[HP_DEPTH], seen[HP_DEPTH];
-    static CONTEXT ctx;
-    /* a sample whose pc is in ntdll or win32u is a thread blocked in a system call: it is also counted under the
-     * innermost function of the lifted game on its stack ("waits under"), to see what the game was waiting for */
-    HMODULE m_nt = GetModuleHandleA("ntdll.dll"), m_w32 = GetModuleHandleA("win32u.dll"), m_game = NULL;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (const char *)(uintptr_t)&fn_table[0], &m_game);
-    uint64_t nt0 = (uint64_t)(uintptr_t)m_nt, nt1 = hp_mod_end(m_nt), w0 = (uint64_t)(uintptr_t)m_w32, w1 = hp_mod_end(m_w32);
-    uint64_t g0 = (uint64_t)(uintptr_t)m_game, g1 = hp_mod_end(m_game);
+    static uintptr_t raw[HP_DEPTH];
+    /* a sample whose pc is in libc is a thread blocked in a system call: it is also counted under the innermost function
+     * of the lifted game on its stack ("waits under"), to see what the game was waiting for */
     for (;;) {
         plat_qpc(&now);
         if ((double)(now.QuadPart - t0.QuadPart) / (double)fq.QuadPart >= secs || g_wd_quit) break;
         for (int i = 0; i < n; i++) {
             int np = 0, ns = 0;
-            if (SuspendThread(hp[i].h) == (uint32_t)-1) continue;
-            memset(&ctx, 0, sizeof ctx);
-            ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-            if (GetThreadContext(hp[i].h, &ctx)) np = wd_walk(&ctx, pcs, HP_DEPTH);
-            ResumeThread(hp[i].h);
+            np = plat_thread_backtrace((pid_t)hp[i].tid, raw, HP_DEPTH);
+            for (int f = 0; f < np; f++) pcs[f] = raw[f];
             if (!np) continue;
             hp[i].samples++;
-            if ((pcs[0] >= nt0 && pcs[0] < nt1) || (pcs[0] >= w0 && pcs[0] < w1)) {
+            if (hp_in_libc(pcs[0])) {
                 uint64_t key = 0;
-                for (int f = 1; f < np && !key; f++) if (pcs[f] >= g0 && pcs[f] < g1) key = hp_func(pcs[f]);
+                for (int f = 1; f < np && !key; f++) if (wd_in_game(pcs[f])) key = hp_func(pcs[f]);
                 if (!key) key = 1;                 /* no game function on the stack (a host thread's own wait) */
                 unsigned h = (unsigned)((key >> 4) * 2654435761u) % HP_SLOTS;
                 while (hp[i].w[h].key && hp[i].w[h].key != key) h = (h + 1) % HP_SLOTS;
@@ -336,9 +261,8 @@ static void hp_window(double secs, int want) {
                 if (f == 0) hp[i].t[h].self++;
             }
         }
-        if (tm) { plat_counter due; due.QuadPart = -10000; SetWaitableTimer(tm, &due, 0, NULL, NULL, 0); WaitForSingleObject(tm, 20); } else plat_sleep_ms(1);
+        plat_sleep_ns(1000000);
     }
-    if (tm) CloseHandle(tm);
     for (int i = 0; i < n; i++) {
         HpEnt *e = calloc(hp[i].used ? hp[i].used : 1, sizeof *e);
         int m = 0;
@@ -373,7 +297,6 @@ static void hp_window(double secs, int want) {
         free(e);
         free(hp[i].t);
         free(hp[i].w);
-        CloseHandle(hp[i].h);
     }
     fflush(stdout);
 }
@@ -403,8 +326,7 @@ static void hp_start(void) {
     static int done;
     if (done || !getenv("SMO_HOSTPROF")) return;
     done = 1;
-    HANDLE t = CreateThread(NULL, 0, hp_main, NULL, 0, NULL);
-    if (t) { SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL); CloseHandle(t); }
+    plat_thread_detach(plat_thread_start(hp_main, NULL, 0));
 }
 static void wd_start(void) {
     static double limit = 5.0;
@@ -413,11 +335,10 @@ static void wd_start(void) {
     if (e) limit = atof(e);
     if (limit <= 0) { printf("nvn_vk_watchdog: off (SMO_VK_WATCHDOG=0)\n"); return; }
     if (limit < 1) limit = 1;
-    g_wd_thread = CreateThread(NULL, 0, wd_main, &limit, 0, NULL);
-    if (g_wd_thread) SetThreadPriority(g_wd_thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    g_wd_thread = plat_thread_start(wd_main, &limit, 0);
     printf("nvn_vk_watchdog: on: a report of every thread (locks, waits, call stacks) is written to the log and to <exe>_freeze.txt when no frame reaches the window for %.0f s (SMO_VK_WATCHDOG=<seconds>, 0 = off)\n", limit);
 }
 static void wd_stop(void) {
     g_wd_quit = 1;
-    if (g_wd_thread) { WaitForSingleObject(g_wd_thread, 3000); CloseHandle(g_wd_thread); g_wd_thread = NULL; }
+    if (g_wd_thread) { if (!plat_thread_join(g_wd_thread, 3000)) plat_thread_detach(g_wd_thread); g_wd_thread = NULL; }
 }

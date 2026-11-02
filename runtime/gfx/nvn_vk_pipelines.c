@@ -1098,13 +1098,15 @@ static int compute_pipe_ensure(VStage *v) {
 }
 
 /* ---------------------------------------------------------------- the workers */
-static HANDLE g_pw_thread[16], g_pw_gate;
+static plat_thread *g_pw_thread[16];
+static pid_t g_pw_tid[16];
+static plat_event *g_pw_gate;
 /* the render thread is about to wait for something a worker is making, and that worker may run below normal priority
  * (pw_main): every worker back to normal priority (each sets its own again at its next job). */
 static int g_pw_nthread;
 static void workers_boost(void) {
     if (plat_tid() != g_render_tid) return;
-    for (int i = 0; i < g_pw_nthread; i++) if (g_pw_thread[i]) SetThreadPriority(g_pw_thread[i], THREAD_PRIORITY_NORMAL);
+    for (int i = 0; i < g_pw_nthread; i++) if (g_pw_tid[i]) plat_set_nice(g_pw_tid[i], 0);    /* refused without RLIMIT_NICE once lowered: then they stay low */
     g_boosts++;
 }
 static int g_pw_nthread, g_pw_n, g_pw_waited;
@@ -1324,15 +1326,15 @@ static uint32_t pw_main(void *arg) {
     }
     plat_xchg(&g_pw_t1, tk());
     if (plat_dec(&g_pw_left) == 0) plat_event_set(g_pw_gate);
-    int prio = THREAD_PRIORITY_NORMAL;
+    int prio = 0;                                  /* nice value */
     for (;;) {                                     /* 2. what the game hands over while it runs */
         {   /* while a scene is drawn the workers run BELOW the game's threads (measured by ssbu-recomp in Super Smash Bros. Ultimate: 16
              * workers at normal priority kept the CPU 80% busy and the main thread's frames took 32-40 ms).
              * SMO_VK_WORKER_PRIO=0 keeps them at normal priority. */
             static int on = -1;
             if (on < 0) on = !(getenv("SMO_VK_WORKER_PRIO") && !atoi(getenv("SMO_VK_WORKER_PRIO")));
-            int want = on && g_in_scene ? THREAD_PRIORITY_BELOW_NORMAL : THREAD_PRIORITY_NORMAL;
-            if (want != prio) { SetThreadPriority(GetCurrentThread(), want); prio = want; }
+            int want = on && g_in_scene ? 5 : 0;      /* nice 5: about a third of the weight of a game thread */
+            if (want != prio && plat_set_nice(0, want)) prio = want;
         }
         plat_lock(&g_sh_lock);
         while (!g_jq_head && !g_bq_head && !g_workers_quit) plat_cond_wait_ms(&g_jq_cv, &g_sh_lock, PLAT_INFINITE);
@@ -1410,10 +1412,7 @@ void nvn_vk_program_set(void *prog) {
     SSrc s[3];
     {   static volatile int32_t first;                /* the process before any stage, library or pipeline of the game exists (nvn_vk_mem lines follow every 300 frames) */
         if (!first && plat_xchg(&first, 1) == 0) {
-            PROCESS_MEMORY_COUNTERS_EX pm;
-            memset(&pm, 0, sizeof pm); pm.cb = sizeof pm;
-            K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
-            printf("nvn_vk_mem: the game hands its first program over (frame %lld): working set %llu MB, private bytes %llu MB\n", (long long)nvn_front_frame_next(), (unsigned long long)(pm.WorkingSetSize >> 20), (unsigned long long)(pm.PrivateUsage >> 20));
+            printf("nvn_vk_mem: the game hands its first program over (frame %lld): resident %llu MB, private %llu MB\n", (long long)nvn_front_frame_next(), (unsigned long long)(plat_rss_bytes() >> 20), (unsigned long long)(plat_private_bytes() >> 20));
         }
     }
     if (p->st[2].state) { static int nl; if (nl++ < 20) printf("nvn_vk: program #%d has a geometry stage (%d bytes): its stages and pipelines are made at its first draw\n", p->serial, p->st[2].code_len); }
@@ -1485,9 +1484,8 @@ static void prewarm_start(void) {
     plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
     plat_mkdir(vkc_dir()); plat_mkdir(vkc_file("spv")); plat_mkdir(vkc_file("stage"));
     if (getenv("SMO_VK_CACHE")) printf("nvn_vk: cache folder %s (SMO_VK_CACHE)\n", vkc_dir());
-    {   HMODULE m = LoadLibraryA("smo_glslang.dll");
-        g_glsl_to_spirv = m ? (void *)GetProcAddress(m, "smo_glsl_to_spirv") : NULL; g_spirv_free = m ? (void *)GetProcAddress(m, "smo_spirv_free") : NULL;
-        if (!g_glsl_to_spirv || !g_spirv_free) vkd_fail("smo_glslang.dll cannot be loaded (the link step writes it beside the exe)");
+    {   int smo_glsl_to_spirv(int, const char *, uint32_t **, size_t *, char *, size_t); void smo_spirv_free(uint32_t *);   /* vk_shaderc_shim.c */
+        g_glsl_to_spirv = smo_glsl_to_spirv; g_spirv_free = smo_spirv_free;
     }
     /* The pipeline cache object costs its entries in the driver's memory: about 640 MB of a game's working set in the Sand
      * Kingdom, the same whether read from the file or filled while the game hands its programs over, and destroying
@@ -1505,12 +1503,9 @@ static void prewarm_start(void) {
         FILE *fp = fopen(g_pcache_path, "rb");
         if (fp) { fseeko(fp, 0, SEEK_END); long long n = ftello(fp); fseeko(fp, 0, SEEK_SET); if (n > 0 && (data = malloc((size_t)n)) && fread(data, 1, (size_t)n, fp) == (size_t)n) { ci.initialDataSize = (size_t)n; ci.pInitialData = data; } fclose(fp); }
         tp1 = tk();
-        PROCESS_MEMORY_COUNTERS_EX pm0, pm1;
-        memset(&pm0, 0, sizeof pm0); pm0.cb = sizeof pm0; pm1 = pm0;
-        K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm0, sizeof pm0);
+        int64_t priv0 = (int64_t)plat_private_bytes(), rss0 = (int64_t)plat_rss_bytes();
         if (vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; VKC(vkCreatePipelineCache(V.device, &ci, NULL, &g_pcache)); }
-        K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm1, sizeof pm1);
-        printf("nvn_vk_mem: the driver took the pipeline cache in with %+lld MB private bytes, %+lld MB working set\n", ((long long)pm1.PrivateUsage - (long long)pm0.PrivateUsage) >> 20, ((long long)pm1.WorkingSetSize - (long long)pm0.WorkingSetSize) >> 20);
+        printf("nvn_vk_mem: the driver took the pipeline cache in with %+lld MB private, %+lld MB resident\n", (long long)((int64_t)plat_private_bytes() - priv0) >> 20, (long long)((int64_t)plat_rss_bytes() - rss0) >> 20);
         /* what the whole-file read costs at every start (file read, then the driver taking the data) */
         printf("nvn_vk: pipeline cache %s: %llu KB read (file read %.0f ms, driver took it in %.0f ms: start-up time on the thread that creates the device)\n", g_pcache_path, (unsigned long long)(ci.initialDataSize >> 10), (double)(tp1 - tp0) * 1000.0 / (double)pfq.QuadPart, (double)(tk() - tp1) * 1000.0 / (double)pfq.QuadPart);
         free(data);
@@ -1532,16 +1527,14 @@ static void prewarm_start(void) {
         for (int i = 0; i < g_pw_n; i++) if (g_pw_rec[i].magic == PIPEREC_MAGIC && (!kept || memcmp(&g_pw_rec[kept - 1], &g_pw_rec[i], sizeof(PipeRec)))) g_pw_rec[kept++] = g_pw_rec[i];
         g_pw_n = kept;
     } else printf(ahead ? "nvn_vk: no ../cache/vk/pipes.bin: a first run on this PC; stages and pipelines are made when the game hands its programs over\n" : "nvn_vk: SMO_VK_PREWARM=0: the pipeline list of earlier runs is not read\n");
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
-    g_pw_nthread = (int)si.dwNumberOfProcessors - 2;
+    g_pw_nthread = plat_cpu_count() - 2;
     if (g_pw_nthread < 1) g_pw_nthread = 1;
     if (g_pw_nthread > 16) g_pw_nthread = 16;
     if (getenv("SMO_VK_WORKERS") && atoi(getenv("SMO_VK_WORKERS")) > 0 && atoi(getenv("SMO_VK_WORKERS")) <= 16) g_pw_nthread = atoi(getenv("SMO_VK_WORKERS"));
     g_pw_gate = plat_event_new(1, 0);
     g_pw_left = g_pw_nthread;
     g_pw_t0 = tk();
-    for (int i = 0; i < g_pw_nthread; i++) g_pw_thread[i] = CreateThread(NULL, 0, pw_main, NULL, 0, NULL);
+    for (int i = 0; i < g_pw_nthread; i++) { g_pw_thread[i] = plat_thread_start(pw_main, NULL, 0); g_pw_tid[i] = g_pw_thread[i] ? plat_thread_tid(g_pw_thread[i]) : 0; }
     g_handover_on = !(getenv("SMO_VK_HANDOVER") && !atoi(getenv("SMO_VK_HANDOVER")));
     printf("nvn_vk: %d pipelines listed in ../cache/vk/pipes.bin; %d worker threads; programs are handed to them when the game sets their shaders: %s; key prediction: %s\n", g_pw_n, g_pw_nthread,
            g_handover_on ? "yes" : "no (SMO_VK_HANDOVER=0)", g_predict ? "blind (SMO_VK_PREDICT=1)" : g_scan_on ? "look-ahead of every batch" : D.has_eds3 ? "none (SMO_VK_LOOKAHEAD=0)" : "none (blend state is part of the key on this GPU)");
@@ -1654,13 +1647,13 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
  * first, on the render thread: about 1 ms a frame in New Donk City). It only queues stages and pipelines for the workers;
  * what it reads that the replay may change at the same time (a texture's VTex being made) can at worst make a guess that is
  * not needed. scan_async_wait() before the batch's job returns: the lists stay valid while it reads them. */
-static struct { HANDLE thread, go, done; const uint64_t *handles; int count, busy; Scan s; } SA;
+static struct { plat_thread *thread; plat_event *go, *done; const uint64_t *handles; int count, busy; Scan s; } SA;
 static int mt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_MT"); on = e && atoi(e) > 0; } return on; }
 static uint32_t scan_thread(void *arg) {
     (void)arg;
     os_pin_host_thread();
     for (;;) {
-        WaitForSingleObject(SA.go, PLAT_INFINITE);
+        plat_event_wait(SA.go, PLAT_INFINITE);
         int64_t ts = tk();
         for (int i = 0; i < SA.count; i++) scan_list(SA.handles[i], 0, &SA.s);
         g_tm[9] += tk() - ts;
@@ -1669,18 +1662,18 @@ static uint32_t scan_thread(void *arg) {
     return 0;
 }
 static void scan_async_start(const uint64_t *handles, int count) {
-    if (!SA.thread) { SA.go = plat_event_new(0, 0); SA.done = plat_event_new(0, 0); SA.thread = CreateThread(NULL, 0, scan_thread, NULL, 0, NULL); }
+    if (!SA.thread) { SA.go = plat_event_new(0, 0); SA.done = plat_event_new(0, 0); SA.thread = plat_thread_start(scan_thread, NULL, 0); }
     scan_begin(&SA.s);
     SA.handles = handles; SA.count = count; SA.busy = 1;
     plat_event_set(SA.go);
 }
-static void scan_async_wait(void) { if (SA.busy) { WaitForSingleObject(SA.done, PLAT_INFINITE); SA.busy = 0; } }
+static void scan_async_wait(void) { if (SA.busy) { plat_event_wait(SA.done, PLAT_INFINITE); SA.busy = 0; } }
 static void prewarm_wait(void) {                   /* render thread, before its first batch */
     if (g_pw_waited) return;
     g_pw_waited = 1;
     plat_counter fq; plat_qpf(&fq);
     int64_t t0 = tk();
-    WaitForSingleObject(g_pw_gate, PLAT_INFINITE);
+    plat_event_wait(g_pw_gate, PLAT_INFINITE);
     printf("nvn_vk: pipelines made ahead: %lld of %d listed (%lld stages from their records, %lld entries without their stage files) in %.0f ms on %d threads; the first batch waited %.0f ms for them\n",
            (long long)g_pw_pipes, g_pw_n, (long long)g_pw_stages, (long long)g_pw_failed, (double)(g_pw_t1 - g_pw_t0) * 1000.0 / (double)fq.QuadPart, g_pw_nthread, (double)(tk() - t0) * 1000.0 / (double)fq.QuadPart);
     fflush(stdout);
@@ -1725,8 +1718,12 @@ static void workers_stop(void) {
     g_handover_on = 0; g_workers_quit = 1;
     plat_cond_broadcast(&g_jq_cv);
     plat_unlock(&g_sh_lock);
-    WaitForMultipleObjects((uint32_t)g_pw_nthread, g_pw_thread, 1, 60000);
-    for (int i = 0; i < g_pw_nthread; i++) CloseHandle(g_pw_thread[i]);
+    uint64_t until = plat_ms() + 60000;
+    for (int i = 0; i < g_pw_nthread; i++) {
+        uint64_t now = plat_ms();
+        if (g_pw_thread[i] && !plat_thread_join(g_pw_thread[i], now < until ? (uint32_t)(until - now) : 0)) plat_thread_detach(g_pw_thread[i]);
+        g_pw_thread[i] = NULL; g_pw_tid[i] = 0;
+    }
     g_pw_nthread = 0;
     pipelines_report();
 }
@@ -1742,9 +1739,9 @@ static void pcache_save(void) {
     int one = 0, ok = 0;
     if (!g_pcache) return;
     int64_t t0 = tk();
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    if (GetFileAttributesExA(g_pcache_path, GetFileExInfoStandard, &fa) && (fa.nFileSizeLow || fa.nFileSizeHigh)) {
-        n = (size_t)(((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow);
+    int64_t fsize = plat_file_size(g_pcache_path);
+    if (fsize > 0) {
+        n = (size_t)fsize;
         n += n / 8 + (64u << 20);
         if ((data = malloc(n)) != NULL) { if (vkGetPipelineCacheData(V.device, g_pcache, &n, data) == VK_SUCCESS) one = 1; else { free(data); data = NULL; } }
     }

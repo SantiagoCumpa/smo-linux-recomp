@@ -550,7 +550,7 @@ static uint64_t g_hm_end;                          /* the heap is queued for imp
 static plat_rwlock_t g_hj_lock = PLAT_RWLOCK_INIT;
 static struct { uint64_t lo, hi; HSpan *s; int state; } g_hj[HM_MAX];      /* imports for the import thread; state: 0 queued, 1 being made, 2 made (s; NULL: failed) */
 static int g_hj_n;
-static HANDLE g_hj_ev;
+static plat_event *g_hj_ev;
 static int64_t g_hm_b, g_hm_ring_b, g_hm_waits, g_hm_wait_tk, g_hm_submits;
 static volatile int64_t g_hm_fail, g_hm_make_tk, g_hm_made;
 static PFN_vkGetMemoryHostPointerPropertiesEXT vkGetMemoryHostPointerPropertiesEXT_;
@@ -589,7 +589,7 @@ static uint32_t hm_thread(void *arg) {
     (void)arg;
     os_pin_host_thread();
     for (;;) {
-        WaitForSingleObject(g_hj_ev, PLAT_INFINITE);
+        plat_event_wait(g_hj_ev, PLAT_INFINITE);
         for (;;) {
             int k = -1;
             plat_rw_wlock(&g_hj_lock);
@@ -616,7 +616,7 @@ static void hm_init(void) {
     vkGetMemoryHostPointerPropertiesEXT_ = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(V.device, "vkGetMemoryHostPointerPropertiesEXT");
     if (!vkGetMemoryHostPointerPropertiesEXT_) { g_hm_on = 0; printf("nvn_vk: no vkGetMemoryHostPointerPropertiesEXT: guest memory is streamed\n"); return; }
     g_hj_ev = plat_event_new(0, 0);
-    CloseHandle(CreateThread(NULL, 0, hm_thread, NULL, 0, NULL));
+    plat_thread_detach(plat_thread_start(hm_thread, NULL, 0));
 }
 static void hm_batch_begin(void) {      /* the heap's pieces to import, and those made since */
     uint64_t base, size;
@@ -845,7 +845,7 @@ static int64_t g_texbar, g_texbar_split, g_texbar_skip;
 static int g_vtxcheck = -1, g_vtxgrow = -1;
 static int64_t g_vtx_over, g_fr_vtxover, g_vtx_capped, g_imax_scans, g_imax_written;      /* index_max: scans, scans of a cached range a logged host write overlapped */
 static uint64_t g_vneed[16];                       /* bytes of each vertex stream the next draw reads (0: not known) */
-int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset);      /* smo_nn.c: inside the game's committed heap? */
+int smo_heap_section_offset(uint64_t addr, uint64_t size, int *section, uint64_t *offset);      /* smo_nn.c: inside the game's committed heap? */
 static unsigned vattr_size(int nf) {               /* bytes of one vertex attribute of NVN format nf (as vertex_vkfmt maps it) */
     static const uint8_t w[12] = {8, 8, 8, 8, 16, 16, 16, 16, 16, 32, 32, 32};
     if (nf >= 0x01 && nf <= 0x30) return (unsigned)((nf - 1) / 12 + 1) * w[(nf - 1) % 12] / 8;
@@ -919,7 +919,7 @@ static void vtx_need(uint64_t maxv, uint64_t maxi, int indexed) {
         uint64_t need = last * R.vstream[st].stride + (a >> 14) + vattr_size((int)(a & 0xff));
         if (need <= R.vbuf[st].size || need <= g_vneed[st]) continue;
         if (need > R.vbuf[st].size + (16u << 20)) { g_vtx_capped++; continue; }
-        { HANDLE hs; uint64_t ho; if (!smo_heap_section_offset(R.vbuf[st].addr, need, &hs, &ho)) { g_vtx_capped++; continue; } }      /* the bytes past the range must be the game's memory (smo_nn.c) */
+        { int hs; uint64_t ho; if (!smo_heap_section_offset(R.vbuf[st].addr, need, &hs, &ho)) { g_vtx_capped++; continue; } }      /* the bytes past the range must be the game's memory (smo_nn.c) */
         g_vneed[st] = need;
     }
     for (int st = 0; st < 16; st++) {
@@ -3716,17 +3716,30 @@ static void vk_menu(void *arg) {
 /* Process memory every 300 frames (tools/dev/memmap.py names the allocations): working set (pages in memory; the guest
  * heap's pages count once per address they are mapped at), its private part, private bytes (commit of private memory)
  * and the commit of pagefile-backed sections (the guest memory heap), next to the Vulkan memory this file allocated. */
-typedef struct { uint32_t cb, faults; size_t peak_ws, ws, qpp, qp, qpnp, qnp, pagefile, peak_pagefile, priv, priv_ws, shared_commit; } MemCounters;
+typedef struct { uint64_t ws, peak_ws, priv, shm; } MemCounters;
+static void mem_counters(MemCounters *m) {        /* /proc/self/status: VmRSS, VmHWM, RssAnon, RssShmem (the heap's memfd) */
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    unsigned long long kb;
+    memset(m, 0, sizeof *m);
+    if (!f) return;
+    while (fgets(line, sizeof line, f)) {
+        if (sscanf(line, "VmRSS: %llu", &kb) == 1) m->ws = kb << 10;
+        else if (sscanf(line, "VmHWM: %llu", &kb) == 1) m->peak_ws = kb << 10;
+        else if (sscanf(line, "RssAnon: %llu", &kb) == 1) m->priv = kb << 10;
+        else if (sscanf(line, "RssShmem: %llu", &kb) == 1) m->shm = kb << 10;
+    }
+    fclose(f);
+}
 static void mem_report(int64_t frame) {
     MemCounters m;
-    memset(&m, 0, sizeof m); m.cb = sizeof m;
-    if (!K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, sizeof m)) { m.cb = (uint32_t)offsetof(MemCounters, priv_ws); K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&m, m.cb); }
+    mem_counters(&m);
     int64_t host = 0;
     for (int b = 0; b < g_nblk; b++) if (g_blk[b] && g_blk[b]->map) host += (int64_t)g_blk[b]->size;
     plat_counter fq; plat_qpf(&fq);
-    printf("nvn_vk_mem: frame %lld: working set %llu MB (private %llu MB, peak %llu MB), private bytes %llu MB, section commit %llu MB | Vulkan memory %lld MB (host-visible %lld MB) | shader modules made %lld, released %lld (%.0f ms in vkDestroyShaderModule), made again %lld\n",
-           (long long)frame, (unsigned long long)(m.ws >> 20), (unsigned long long)(m.priv_ws >> 20), (unsigned long long)(m.peak_ws >> 20), (unsigned long long)(m.priv >> 20),
-           (unsigned long long)(m.shared_commit >> 20), (long long)(g_mem_total >> 20), (long long)(host >> 20), (long long)R.modules, (long long)g_mod_released,
+    printf("nvn_vk_mem: frame %lld: resident %llu MB (peak %llu MB), anonymous %llu MB, shared (heap memfd) %llu MB | Vulkan memory %lld MB (host-visible %lld MB) | shader modules made %lld, released %lld (%.0f ms in vkDestroyShaderModule), made again %lld\n",
+           (long long)frame, (unsigned long long)(m.ws >> 20), (unsigned long long)(m.peak_ws >> 20), (unsigned long long)(m.priv >> 20),
+           (unsigned long long)(m.shm >> 20), (long long)(g_mem_total >> 20), (long long)(host >> 20), (long long)R.modules, (long long)g_mod_released,
            (double)g_mod_destroy_tk * 1000.0 / (double)fq.QuadPart, (long long)g_mod_again);
     fflush(stdout);
 }
@@ -3737,11 +3750,11 @@ static void vk_present(void *arg) { vk_present2(arg, 0); }
  * that finds all ASHOT_N buffers busy is left out ("shot: frame <n> left out"). */
 #define ASHOT_N 8
 static struct { VkBuffer buf; VMem mem; uint64_t size, serial; volatile int32_t state; int w, h, bgr; char path[300]; } g_ashot[ASHOT_N];
-static HANDLE g_ashot_ev;
+static plat_event *g_ashot_ev;
 static uint32_t ashot_thread(void * arg) {                 /* state 2 (copied) -> BMP file -> state 0 (free) */
     (void)arg;
     for (;;) {
-        WaitForSingleObject(g_ashot_ev, PLAT_INFINITE);
+        plat_event_wait(g_ashot_ev, PLAT_INFINITE);
         for (int i = 0; i < ASHOT_N; i++) {
             if (g_ashot[i].state != 2) continue;
             int w = g_ashot[i].w, h = g_ashot[i].h, bgr = g_ashot[i].bgr;
@@ -3769,7 +3782,7 @@ static int ashot_take(VTex *vt, const char *path) {             /* 1: the copy i
     if (vt->bpb != 4 || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) return 0;
     for (i = 0; i < ASHOT_N && g_ashot[i].state != 0; i++) {}
     if (i == ASHOT_N) return 0;
-    if (!g_ashot_ev) { g_ashot_ev = plat_event_new(0, 0); CloseHandle(CreateThread(NULL, 0, ashot_thread, NULL, 0, NULL)); }
+    if (!g_ashot_ev) { g_ashot_ev = plat_event_new(0, 0); plat_thread_detach(plat_thread_start(ashot_thread, NULL, 0)); }
     if (g_ashot[i].size != size) {                              /* CPU-cached memory when there is some: the thread reads it */
         if (g_ashot[i].buf) { vkDestroyBuffer(V.device, g_ashot[i].buf, NULL); vmem_free(g_ashot[i].mem); }
         VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -3905,8 +3918,9 @@ swap: ;
     if (!g_sem[g_isem][0]) { VkSemaphoreCreateInfo smi = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}; VKC(vkCreateSemaphore(V.device, &smi, NULL, &g_sem[g_isem][0])); VKC(vkCreateSemaphore(V.device, &smi, NULL, &g_sem[g_isem][1])); }
     VkSemaphore acq = g_sem[g_isem][0], rend = g_sem[g_isem][1];
     if (V.swapchain) {      /* the window changed size (F11, display.c): a driver need not say so with OUT_OF_DATE / SUBOPTIMAL */
-        RECT rc;
-        if (GetClientRect(V.hwnd, &rc) && rc.right > 0 && rc.bottom > 0 && ((uint32_t)rc.right != V.extent.width || (uint32_t)rc.bottom != V.extent.height)) {
+        int ww = 0, wh = 0;
+        display_size(&ww, &wh);
+        if (ww > 0 && wh > 0 && ((uint32_t)ww != V.extent.width || (uint32_t)wh != V.extent.height)) {
             cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated);
         }
     }

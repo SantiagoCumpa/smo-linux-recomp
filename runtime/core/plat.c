@@ -13,6 +13,7 @@
 #include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/random.h>
+#include <sys/resource.h>
 #include <sys/sysinfo.h>
 
 /* ---- locks ---- */
@@ -344,6 +345,19 @@ uint64_t plat_rss_bytes(void) {
     if (f) { if (fscanf(f, "%lu %lu", &total, &rss) != 2) rss = 0; fclose(f); }
     return (uint64_t)rss * (uint64_t)sysconf(_SC_PAGESIZE);
 }
+
+uint64_t plat_private_bytes(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    char line[256];
+    unsigned long long kb, total = 0;
+    if (!f) return 0;
+    while (fgets(line, sizeof line, f))
+        if ((sscanf(line, "RssAnon: %llu", &kb) == 1) || (sscanf(line, "RssShmem: %llu", &kb) == 1)) total += kb;
+    fclose(f);
+    return (uint64_t)total << 10;
+}
+
+int plat_set_nice(pid_t tid, int nice) { return setpriority(PRIO_PROCESS, (id_t)(tid ? tid : gettid()), nice) == 0; }
 
 uint64_t plat_total_memory(void) {
     struct sysinfo si;

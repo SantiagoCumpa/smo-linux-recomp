@@ -157,6 +157,8 @@ static inline void *plat_aligned_alloc(size_t size, size_t align) {
 static inline void plat_aligned_free(void *p) { free(p); }
 int plat_readable(const void *addr, size_t n);              /* n bytes can be read without a fault */
 uint64_t plat_rss_bytes(void);
+uint64_t plat_private_bytes(void);                          /* resident anonymous + shared memory (RssAnon + RssShmem) */
+int plat_set_nice(pid_t tid, int nice);                     /* tid 0: this thread; 1 when the kernel took it */
 uint64_t plat_total_memory(void);
 
 /* ---- files and paths ---- */

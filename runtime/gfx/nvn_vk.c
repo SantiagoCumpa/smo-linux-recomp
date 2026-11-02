@@ -20,15 +20,23 @@
  *                             exit, which the tests require to be 0) and skip it: a player sees a wrong picture for that
  *                             operation instead of a closed game. (=warn, the earlier switch for the default, is accepted.)
  *
- * Vulkan declarations: the Khronos headers of the Vulkan SDK. The loader is vulkan-1.dll. */
+ * Vulkan declarations: the Khronos headers (Arch: vulkan-headers). The loader is libvulkan.so.1 (vulkan-icd-loader); the
+ * surface comes from SDL (SDL_Vulkan_CreateSurface: Wayland or X11). On a hybrid laptop the discrete GPU is preferred
+ * (scripts/run.py also sets the PRIME offload variables). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <dlfcn.h>
+#include <sys/resource.h>
 #include "plat.h"
-/* the Khronos headers of the Vulkan SDK (VULKAN_HEADERS, -I in build_exe.py) */
-#define VK_USE_PLATFORM_WIN32_KHR
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+void display_size(int *w, int *h);                        /* display.c: the window's size in pixels */
+int display_focus_flags(void);                             /* display.c: 2 = minimised */
 #include "nvn_front.h"
 #include "gfx_options.h"
 #include "hostrt.h"          /* the fn_table declaration nvn_vk_watchdog.c's watchdog uses */
@@ -59,7 +67,6 @@ void display_before_present(void);
     X(void, vkGetPhysicalDeviceProperties, (VkPhysicalDevice, VkPhysicalDeviceProperties *)) \
     X(void, vkGetPhysicalDeviceQueueFamilyProperties, (VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties *)) \
     X(VkResult, vkEnumerateDeviceExtensionProperties, (VkPhysicalDevice, const char *, uint32_t *, VkExtensionProperties *)) \
-    X(VkResult, vkCreateWin32SurfaceKHR, (VkInstance, const VkWin32SurfaceCreateInfoKHR *, const VkAllocationCallbacks *, VkSurfaceKHR *)) \
     X(void, vkDestroySurfaceKHR, (VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *)) \
     X(VkResult, vkGetPhysicalDeviceSurfaceSupportKHR, (VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32 *)) \
     X(VkResult, vkGetPhysicalDeviceSurfaceCapabilitiesKHR, (VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR *)) \
@@ -98,8 +105,8 @@ static void (VKAPI_PTR *vkDestroyDebugUtilsMessengerEXT)(VkInstance, VkDebugUtil
 
 /* ---------------------------------------------------------------- state (render thread only, except the counters) */
 static struct {
-    HWND hwnd;
-    HMODULE loader;
+    SDL_Window *window;
+    void *loader;
     VkInstance instance;
     VkDebugUtilsMessengerEXT messenger;
     VkPhysicalDevice gpu;
@@ -193,7 +200,7 @@ static int swapchain_create(void) {
     VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.gpu, V.surface, &caps);
     if (r != VK_SUCCESS) vk_fatal("vkGetPhysicalDeviceSurfaceCapabilitiesKHR", r);
     VkExtent2D ext = caps.currentExtent;
-    if (ext.width == 0xffffffffu) { RECT rc; GetClientRect(V.hwnd, &rc); ext.width = (uint32_t)rc.right; ext.height = (uint32_t)rc.bottom; }
+    if (ext.width == 0xffffffffu) { int w = 0, h = 0; display_size(&w, &h); ext.width = (uint32_t)w; ext.height = (uint32_t)h; }   /* Wayland: the surface takes the swapchain's size */
     if (ext.width < caps.minImageExtent.width) ext.width = caps.minImageExtent.width;
     if (ext.height < caps.minImageExtent.height) ext.height = caps.minImageExtent.height;
     if (caps.maxImageExtent.width && ext.width > caps.maxImageExtent.width) ext.width = caps.maxImageExtent.width;
@@ -226,13 +233,13 @@ static int swapchain_create(void) {
 
 /* ---------------------------------------------------------------- start */
 static void *vk_sym(const char *name) {
-    void *p = (void *)GetProcAddress(V.loader, name);
-    if (!p) { printf("nvn_vk: vulkan-1.dll does not export %s\n", name); fflush(stdout); plat_exit(5); }
+    void *p = dlsym(V.loader, name);
+    if (!p) { printf("nvn_vk: libvulkan.so.1 does not export %s\n", name); fflush(stdout); plat_exit(5); }
     return p;
 }
 
 /* The NVIDIA driver keeps the pipeline libraries it compiles in its own shader disk cache, one cache per executable in one
- * folder for the whole PC (%LOCALAPPDATA%\NVIDIA\GLCache) with one size limit: once that is full it stores nothing new,
+ * folder for the whole user (~/.cache/nvidia/GLCache) with one size limit: once that is full it stores nothing new,
  * and every start compiles again what its cache lacks (measured with a full one: 123 s of worker time and 19 s of held
  * loading screens at each start of a played copy; with a folder that had room, the second start took 5 s and 27 ms).
  * The pipeline cache file does not hold them (it did not grow while thousands were compiled). So the driver gets a
@@ -243,38 +250,38 @@ static void *vk_sym(const char *name) {
 static const char *vkc_dir(void);                  /* nvn_vk_pipelines.c */
 static void nv_cache_dir(void) {
     const char *off = getenv("SMO_VK_NVCACHE"), *set = getenv("__GL_SHADER_DISK_CACHE_PATH"), *own = getenv("SMO_VK_CACHE");
-    char rel[260], dir[260], exe[PATH_MAX] = "";
-    snprintf(exe, sizeof exe, "%s", plat_exe_path());
-    const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe;
+    char rel[PATH_MAX], dir[PATH_MAX];
+    const char *base = plat_exe_name();
     if (off && !atoi(off)) { printf("nvn_vk: SMO_VK_NVCACHE=0: the driver's shader disk cache stays in its own folder\n"); return; }
     if (set && set[0]) { printf("nvn_vk: the driver's shader disk cache: %s (__GL_SHADER_DISK_CACHE_PATH)\n", set); return; }
-    if (!(own && own[0]) && strcasecmp(base, "smo_native.exe") && strcasecmp(base, "smo_user.exe")) {
+    if (!(own && own[0]) && strcmp(base, "smo_native") && strcmp(base, "smo_user")) {
         printf("nvn_vk: the driver's shader disk cache stays in its own folder (a test copy without SMO_VK_CACHE)\n");
         return;
     }
     snprintf(rel, sizeof rel, "%s/nv", vkc_dir());
-    if (!_fullpath(dir, rel, sizeof dir)) return;
-    plat_mkdir(vkc_dir());
-    plat_mkdir(dir);
-    SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_PATH", dir);
-    if (!getenv("__GL_SHADER_DISK_CACHE_SIZE")) SetEnvironmentVariableA("__GL_SHADER_DISK_CACHE_SIZE", "8589934592");      /* 8 GB, in bytes */
+    plat_mkdirs(rel);
+    if (!realpath(rel, dir)) return;
+    setenv("__GL_SHADER_DISK_CACHE_PATH", dir, 1);
+    setenv("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1", 0);
+    if (!getenv("__GL_SHADER_DISK_CACHE_SIZE")) setenv("__GL_SHADER_DISK_CACHE_SIZE", "8589934592", 1);      /* 8 GB, in bytes */
     printf("nvn_vk: the driver's shader disk cache: %s (the game's own; SMO_VK_NVCACHE=0: the driver's folder)\n", dir);
 }
 
 /* Render thread, once. Returns 1; any failure prints its cause and ends the process with code 5 (as the OpenGL path does). */
-int nvn_vk_init(void *hwnd) {
+int nvn_vk_init(void *window) {
     static const char *const k_wanted[] = {"VK_KHR_swapchain", "VK_EXT_extended_dynamic_state3", "VK_EXT_vertex_input_dynamic_state", "VK_KHR_push_descriptor", "VK_EXT_custom_border_color",
                                            "VK_EXT_conservative_rasterization", "VK_EXT_external_memory_host", "VK_EXT_depth_clip_control", "VK_EXT_provoking_vertex", "VK_EXT_4444_formats",
                                            "VK_EXT_index_type_uint8", "VK_EXT_full_screen_exclusive", "VK_EXT_blend_operation_advanced", "VK_KHR_pipeline_library"};
     VkResult r;
-    V.hwnd = hwnd;
+    V.window = window;
     nv_cache_dir();                                /* before the driver is loaded */
-    V.loader = LoadLibraryA("vulkan-1.dll");
-    if (!V.loader) { printf("nvn_vk: vulkan-1.dll cannot be loaded (error %lu): no Vulkan driver on this PC\n", GetLastError()); fflush(stdout); plat_exit(5); }
+    if (!SDL_Vulkan_LoadLibrary(NULL)) printf("nvn_vk: SDL_Vulkan_LoadLibrary: %s\n", SDL_GetError());
+    V.loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!V.loader) { printf("nvn_vk: libvulkan.so.1 cannot be loaded (%s): install vulkan-icd-loader and a Vulkan driver (nvidia-utils / vulkan-intel)\n", dlerror()); fflush(stdout); plat_exit(5); }
 #define X(ret, name, args) name = vk_sym(#name);
     VKF(X)
 #undef X
-    vkEnumerateInstanceVersion = (void *)GetProcAddress(V.loader, "vkEnumerateInstanceVersion");
+    vkEnumerateInstanceVersion = dlsym(V.loader, "vkEnumerateInstanceVersion");
     uint32_t loader_version = VK_MAKE_API_VERSION(0, 1, 0, 0);
     if (vkEnumerateInstanceVersion) vkEnumerateInstanceVersion(&loader_version);
 
@@ -283,10 +290,14 @@ int nvn_vk_init(void *hwnd) {
     uint32_t niext = 128;
     r = vkEnumerateInstanceExtensionProperties(NULL, &niext, iext);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkEnumerateInstanceExtensionProperties", r);
-    const char *exts[4], *layers[1];
-    uint32_t next = 0, nlayers = 0;
-    exts[next++] = "VK_KHR_surface"; exts[next++] = "VK_KHR_win32_surface";
-    if (!has_name(iext, niext, "VK_KHR_surface") || !has_name(iext, niext, "VK_KHR_win32_surface")) { printf("nvn_vk: the Vulkan loader has no VK_KHR_surface / VK_KHR_win32_surface\n"); fflush(stdout); plat_exit(5); }
+    const char *exts[16], *layers[1];
+    uint32_t next = 0, nlayers = 0, nsdl = 0;
+    const char *const *sdl_exts = SDL_Vulkan_GetInstanceExtensions(&nsdl);     /* VK_KHR_surface + the window system's */
+    for (uint32_t i = 0; sdl_exts && i < nsdl && next < 14; i++) {
+        if (!has_name(iext, niext, sdl_exts[i])) { printf("nvn_vk: the Vulkan loader has no %s (needed for the window)\n", sdl_exts[i]); fflush(stdout); plat_exit(5); }
+        exts[next++] = sdl_exts[i];
+    }
+    if (!next) { printf("nvn_vk: SDL names no Vulkan surface extensions: %s\n", SDL_GetError()); fflush(stdout); plat_exit(5); }
     { const char *e = getenv("SMO_VK_VALIDATE"); V.validate = e && atoi(e) != 0; }
     if (V.validate) {
         static VkLayerProperties lp[64];
@@ -319,11 +330,7 @@ int nvn_vk_init(void *hwnd) {
         printf("nvn_vk: validation layer on (VK_LAYER_KHRONOS_validation); messages are printed as vk-validation:\n");
     }
 
-    VkWin32SurfaceCreateInfoKHR si;
-    memset(&si, 0, sizeof si);
-    si.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR; si.hinstance = GetModuleHandleA(NULL); si.hwnd = hwnd;
-    r = vkCreateWin32SurfaceKHR(V.instance, &si, NULL, &V.surface);
-    if (r != VK_SUCCESS) vk_fatal("vkCreateWin32SurfaceKHR", r);
+    if (!SDL_Vulkan_CreateSurface(V.window, V.instance, NULL, &V.surface)) { printf("nvn_vk: SDL_Vulkan_CreateSurface: %s\n", SDL_GetError()); fflush(stdout); plat_exit(5); }
 
     /* device: discrete > integrated > virtual > other; needs one queue family with graphics + compute that can present to the window */
     VkPhysicalDevice gpus[16];
@@ -340,7 +347,8 @@ int nvn_vk_init(void *hwnd) {
             char name[256], w[64];
             vkGetPhysicalDeviceProperties(gpus[i], &p);
             snprintf(name, sizeof name, "%s", p.deviceName); snprintf(w, sizeof w, "%s", want);
-            _strlwr(name); _strlwr(w);
+            for (char *q = name; *q; q++) *q = (char)tolower((unsigned char)*q);
+            for (char *q = w; *q; q++) *q = (char)tolower((unsigned char)*q);
             if (strstr(name, w)) forced = (int)i;
         }
         printf("nvn_vk: graphics.ini gpu = %s: %s\n", want, forced >= 0 ? "taken as the device with that number / the first device with that name" : "no device has that name, the preferred one is used");
