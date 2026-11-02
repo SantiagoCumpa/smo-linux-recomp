@@ -1,7 +1,7 @@
 # Debugging aids
 
 The runtime's switches are environment variables with the `SMO_` prefix; pass them to a run with
-`scripts\run.py <run name> --env NAME=VALUE`. Everything a run prints goes to `build\run\<run name>.log`.
+`scripts\run.py <run name> --env NAME=VALUE`. Everything a run prints goes to `build/run\<run name>.log`.
 
 ## The log at a glance
 
@@ -47,13 +47,12 @@ The end of every log has the counts that tell whether a run was healthy:
   (the lightning), at least 60 frames apart.
 - `SMO_AMIIBO_SHOT_DIR=<folder>` saves the first three different pictures of each opening of the amiibo menu as
   `amiibo_menu_<opening>_<n>.png` (the menu's frames are not game frames, so `SMO_SHOT` does not see them).
-- `SMO_GUIDE_SHOT=<file.png>` saves the Help page as shown in the game window (`runtime/game/smo_guide.c`, WebView2) 1.5 s
-  after it loaded and 0.8 s after each pad action, as `<file>_2.png`, `_3.png`, ... (at most 8); `SMO_SHOT` does not see
-  it either. The log says what the guide does (`guide:`).
+- `SMO_GUIDE_SHOT=<file.png>` belonged to the Windows build's Help in the game window (WebView2); on Linux the Help
+  opens in the web browser (`runtime/game/smo_guide.c`) and there is nothing to capture.
 
 ## Shaders
 
-- Translated stages are cached in `build\cache\vk` (`SMO_VK_CACHE=<folder>` uses another one; an empty folder forces
+- Translated stages are cached in `build/cache\vk` (`SMO_VK_CACHE=<folder>` uses another one; an empty folder forces
   every stage to be translated again). The NVIDIA driver keeps the pipeline libraries it compiles in its own disk
   cache, one per executable name; the played copies and runs with `SMO_VK_CACHE` give it the folder `nv` inside the
   stage cache (`__GL_SHADER_DISK_CACHE_PATH`, read when the driver loads; one already set is kept), so the PC-wide one
@@ -65,12 +64,12 @@ The end of every log has the counts that tell whether a run was healthy:
   `SMO_VK_DUMP_MINBYTES=<n>` (stages whose GLSL is at least n bytes) or `SMO_VK_DUMP_SERIAL=<n>` (one program; serials
   change from run to run, but not between runs of the same sequence) it writes `vk_prog_*.bin` for the equivalence
   harness, the latter also when the program is handed over (its stages may come from the cache).
-  `tools\dev\mxdis.py <file.bin>` names the instructions of a dump.
+  `tools/dev/mxdis.py <file.bin>` names the instructions of a dump.
 - `SMO_MX_NOSTRUCT=1` translates with the old `switch(pc)` control flow instead of structured blocks;
   `SMO_MX_MUTATE=1` plants a known bug, to check that the equivalence harness catches it.
-- Equivalence harness: `tests\build_mx_equiv.py`, then from `build\bin`: `mx_equiv.exe <folder of vk_prog_*.bin> [max]`.
-- `tests\check_all_shaders.py` takes every shader stage out of the game's shader archives (agl `.sharcb`, g3d `.bfsha`,
-  the effect `.ptcl`, nested archives, `main` and `sdk`) into `build\shaders_all`, translates each with the Vulkan back
+- Equivalence harness: `tests/build_mx_equiv.py`, then `build/bin/mx_equiv <folder of vk_prog_*.bin> [max]`.
+- `tests/check_all_shaders.py` takes every shader stage out of the game's shader archives (agl `.sharcb`, g3d `.bfsha`,
+  the effect `.ptcl`, nested archives, `main` and `sdk`) into `build/shaders_all`, translates each with the Vulkan back
   end's settings and compiles it with the renderer's compiler; `--list` adds a line per stage, `--extract-only` stops
   after the extraction. A geometry stage is checked for point, line and triangle input.
 - `SMO_VK_GS_DEBUG=<mode>` for draws with a geometry stage: `1` measures them (`nvn_vk_gs:` lines: the GPU's pipeline
@@ -93,10 +92,10 @@ The end of every log has the counts that tell whether a run was healthy:
   textures used after their image went (what the GPU had drawn into one is lost then; it should stay 0, and
   `nvn_vk_tex:` lines name them). With `SMO_TEXLOG=1` every release of a slot and every freed image is logged too.
 - Flicker that shows in single frames: save every frame of a stretch (`SMO_SHOT_EVERY=1 SMO_SHOT_FROM=<a> SMO_SHOT_TO=<b>
-  SMO_SHOT_DIR=<folder>`), then `tools\dev\flicker.py <folder>` lists the frames where a region of the picture is brighter
+  SMO_SHOT_DIR=<folder>`), then `tools/dev/flicker.py <folder>` lists the frames where a region of the picture is brighter
   or darker than in both neighbours, and saves them side by side. To see what such a frame drew differently, run the same
   stretch again with `SMO_VK_PASSSHOT=<a>-<b> SMO_VK_PASSSHOT_LOGONLY=1 SMO_VK_FRAMELOG=<a>-<b>` (every draw logged,
-  no pass pictures; a lot of log) and `tools\dev\drawdiff.py build\run\<name>.log <frame>`: the draws the frame has that
+  no pass pictures; a lot of log) and `tools/dev/drawdiff.py build/run\<name>.log <frame>`: the draws the frame has that
   neither neighbour has, and the ones it lacks.
 - `SMO_VK_FRAMELOG=<first>-<last>`: one `nvn_vk_frame:` line per frame (draws, draws left out and why, conditional
   renders, render passes, texture barriers, stream ring wraps and kilobytes streamed).
@@ -134,28 +133,31 @@ The end of every log has the counts that tell whether a run was healthy:
   own). `SMO_VK_MT=1` (off by default) runs the look-ahead over a batch on a thread of its own beside the replay. The
   build: `RECOMP_OPT` (lifted code) and `RECOMP_HOST_OPT` (runtime), both `-O2` by default; `RECOMP_ARCH` adds target
   flags (e.g. `-march=znver2`: the objects then run on that CPU family and later ones only). A change of them recompiles
-  nothing by itself: `tools\lifter\build_main.py --force`, or delete `build\obj\host`.
+  nothing by itself: `tools/lifter/build_main.py --force`, or delete `build/obj/host`.
 - `nvn_vk_frames:` at exit counts the frames that drew a scene, i.e. had compute dispatches (in the Cap Kingdom run 40,164
   of 42,589; the others are boot and loading frames). Within 600 frames of such a frame the renderer does not hold the
   game's threads for its workers and makes only cheap textures ahead of their use; in a frame that draws a scene its
   workers run below normal priority.
 - `SMO_HOSTPROF=<start s>,<seconds>[,<threads>][;<start s>,<seconds>[,<threads>] ...]` samples the stacks of the
   busiest threads (default 4) about every millisecond in each window and prints the functions met most often, what
-  each thread was blocked in, and under which function of the game. `tools\dev\profnames.py build\run\<name>.log` adds
+  each thread was blocked in, and under which function of the game. `tools/dev/profnames.py build/run/<name>.log` adds
   the names of the lifted game's functions (`guest f_...`) from the function list.
 - `SMO_FRAMETL=<first frame>,<frames>` records a timeline of those frames (every job the game's threads queue for the
   render thread and when it ran, the submissions to the GPU and the waits for it, the presents, the game's waits for the
   refresh and the refreshes, each with its thread and processor) into `SMO_FRAMETL_OUT=<file>` (default `frametl.txt`
-  next to the exe). `tools\dev\frametl.py <file>` makes a table of it per frame: when the batch was submitted, how long
+  next to the exe). `tools/dev/frametl.py <file>` makes a table of it per frame: when the batch was submitted, how long
   the replay and the present took and how much of it was waiting for the GPU, how long the main thread drew after the
   present, and how far ahead of the next refresh it was done; the slow frames are listed.
 - `nvn_vk_ring:` (every 300 frames) says what the stream ring copied per frame, how often its range caches were dropped
   (`new generations`) and which writes of the host into guest memory were checked against them instead.
-- `tools\dev\cpuload.py --busy <n> --seconds <s> --log <file>` keeps n processes busy (arithmetic and memory copies) and
+- `tools/dev/cpuload.py --busy <n> --seconds <s> --log <file>` keeps n processes busy (arithmetic and memory copies) and
   logs the CPU use of the system, the game and the busiest other programs every 5 seconds: frame rates measured while
   other programs use the PC, the same way each time.
-- `SMO_PRIORITY_CLASS=normal` runs the process in the NORMAL priority class (default ABOVE_NORMAL: the game's threads
-  are tied to three processors and must come before other programs' threads there; `runtime/os/os_threads.c`).
+- Thread priorities on Linux (`runtime/os/os_threads.c`): the game's six priority levels become nice values, from the
+  lowest `RLIMIT_NICE` allows (0 for an ordinary user) up, and the lowest levels (18..31) run under `SCHED_IDLE`; the
+  log's `nn::os: thread priorities as nice values ...` line says which. Raising `RLIMIT_NICE` for your user (e.g.
+  `/etc/security/limits.d`) gives the game's threads room above other programs. Nice values are weights, not strict
+  priorities: the stress test (`tests/stress_stages.py`) is the measure.
 - `SMO_FAST=0` leaves the game's own code where `runtime/game/smo_fast.c` puts host code in its place (the sort of the
   sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
@@ -170,16 +172,16 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Memory
 
-- Every 300 frames the log has `nvn_vk_mem: frame F:` the process's working set (its private part and peak), private
-  bytes, the commit of pagefile-backed sections (the game's memory heap), the Vulkan memory the renderer allocated (the
+- Every 300 frames the log has `nvn_vk_mem: frame F:` the process's resident memory (and its peak), its anonymous
+  part, the shared memory of the game's heap (a memfd), the Vulkan memory the renderer allocated (the
   host-visible part is system memory the driver keeps resident) and the shader modules made, released and made again.
-- `tools\dev\memmap.py <pid or exe name> [--log build\run\<name>.log] [--zero 64] [--json <file>]` reads a
-  running game from outside (nothing is written into it): every allocation with its reserved, committed and resident
-  size, named where it can be (images and mapped files, thread stacks with their start function from the exe's map, NT
-  heap segments and large blocks, the guest memory heap and NVN virtual pools from the log, Vulkan memory blocks with
-  `SMO_VK_MEMLOG=1`). `--zero` adds, for the large allocations, how much of what is resident holds only zeros and where
-  in the allocation it lies.
-- Where a game's memory goes (Sand Kingdom home stage, frame 6000 of a scripted run): the game's own memory heap
+- `tools/dev/memmap.py <pid or process name> [--log build/run/<name>.log] [--zero 64] [--json <file>]` reads a
+  running game from outside (nothing is written into it) through `/proc/<pid>/smaps`: every allocation (adjacent
+  mappings of the same name) with its reserved, accessible and resident size, named where it can be (files and shared
+  libraries, the main thread's stack, the guest memory heap and NVN virtual pools from the log, Vulkan memory blocks
+  with `SMO_VK_MEMLOG=1`). `--zero` adds, for the large allocations, how much of what is resident holds only zeros and
+  where in the allocation it lies (reads `/proc/<pid>/pagemap` and `mem`: needs `kernel.yama.ptrace_scope=0` or root).
+- Where a game's memory goes (Windows build; Sand Kingdom home stage, frame 6000 of a scripted run): the game's own memory heap
   (2.2 GB resident of the 3.05 GB the game asks for; 92% of it non-zero data), the graphics driver's heaps (stage
   libraries and pipelines, the pipeline cache object: 640 MB), the stream ring (256 MB of resident system memory), the C
   runtime heap (250 MB), executables and DLLs (100 MB). Graphics memory adds commit, not resident memory: about as much
@@ -192,8 +194,9 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Crashes and stalls
 
-- A crash prints `HOST EXCEPTION` with the last guest function, its registers and the host call stack, named from the
-  linker map next to the exe. `SMO_CRASH_DUMP=<bytes>` (0x60 to 0x1000) adds memory at every register, the strings it
+- A crash prints `HOST EXCEPTION` (a signal handler for SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGABRT, on an alternate
+  stack) with the last guest function, its registers, the faulting address and the host call stack (`backtrace`,
+  module + offset by `dladdr`, named from the linker map next to the exe). `SMO_CRASH_DUMP=<bytes>` (0x60 to 0x1000) adds memory at every register, the strings it
   finds there and the guest's frame-pointer chain (the real guest call stack).
 - `SMO_WATCH=<heap offset>[,<length>]` logs every write that changes that range of the game's heap, with the writing
   function (heap offsets repeat from run to run).
@@ -207,14 +210,14 @@ The end of every log has the counts that tell whether a run was healthy:
   them (`*` = all): `nerve: frame F keeper K: OpeningStageStartDemoNrvCameraAuto -> OpeningStageStartDemoNrvCameraTutorial`.
 - `SMO_ACTORPOS=<n>[:<state name prefixes>]` prints actor positions every n frames (default: the player).
 - `SMO_ICALLS=<start second>,<seconds>` counts the targets of indirect calls in that window and prints them at the time
-  limit; map the `f_71...` addresses with `build\functions\main_functions.tsv` (address - 0x7100000000). Every state
+  limit; map the `f_71...` addresses with `build/functions\main_functions.tsv` (address - 0x7100000000). Every state
   machine runs its current state once a frame through such a call, so the active one stands out.
 - See [`scripted-runs.md`](scripted-runs.md) for waiting on states and steering in input sequences.
 
 ## Audio and input
 
 - `SMO_AUDIO=0` turns the audio output off; `SMO_AUDIO_WAV=<file>` also writes the final mix to a WAV file.
-- Test copies (any exe name but `smo_native.exe` and `smo_user.exe`) are silent: their volume in the Windows mixer is
+- Test copies (any exe name but `smo_native` and `smo_user`) are silent: the gain of their SDL audio stream is
   0. The sound is still made and fed to the device as with sound, so the timing, the dropped-sample and underrun counts
   and an `SMO_AUDIO_WAV` capture are the same. `SMO_VOLUME=<0..100>` sets the volume of any copy (the log says
   `host volume N%`).
@@ -226,11 +229,11 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Starting elsewhere in the game
 
-- `tools\dev\save_warp.py <save folder> --out <new folder> --stage <StageName> [--world <n>] [--scenario <n>]
+- `tools/dev/save_warp.py <save folder> --out <new folder> --stage <StageName> [--world <n>] [--scenario <n>]
   [--checkpoint <object id> --visited]` copies a save folder so that its game file continues in another stage (at the
   stage's default entrance, for a kingdom the Odyssey; the world number comes from `SystemData\WorldList.szs` for a
   kingdom's home stage, e.g. `BossRaidWorldHomeStage` = 11). `--scenario` sets the kingdom's scenario (which objects
-  its stages place); `--checkpoint` starts at one of the stage's checkpoint flags (`tools\dev\byml.py
+  its stages place); `--checkpoint` starts at one of the stage's checkpoint flags (`tools/dev/byml.py
   StageData\<Stage>Map.szs --grep CheckpointFlag` lists them; the flag is marked as reached in the copy, a flag in a
   zone is named `<id>(<zone>[<the zone's id in the stage>])`), `--reached <object id>` marks more flags as reached
   without starting at them, and `--visited` lets it apply in a kingdom the save has
@@ -241,7 +244,7 @@ The end of every log has the counts that tell whether a run was healthy:
   stage scene the game starts that stage instead, at its default start point, as when Mario goes through its entrance:
   any sub-area, room or 2D section (the log says `start stage: frame F: the game starts <home>, scenario N;
   SMO_START_STAGE makes it <stage>, scenario M (<whose>)`). Give it a save warped to the stage's kingdom. The runtime
-  watches for `StageScene::init` (found in the game's own vtable, `GAME_VSYM_StageScene_init` in `build\gen\image.h`)
+  watches for `StageScene::init` (found in the game's own vtable, `GAME_VSYM_StageScene_init` in `build/gen\image.h`)
   and changes the stage name it is called with, once; later stage scenes are only logged (`the game starts <stage>,
   scenario <n> itself`, e.g. the restart after a miss). The scenario: the one given (`asked for`), else the stage's own
   when the game has one for it (`the stage's own, as through its door`: what the game's own `ChangeStageInfo` gives a
@@ -259,7 +262,7 @@ The end of every log has the counts that tell whether a run was healthy:
   and the start point (the id of a placed start, e.g. a checkpoint flag's `PlayerRestartPos` link; default: the stage's
   default start), and hands it to `GameDataFunction::tryChangeNextStage`; the scene then ends and the game loads the
   stage, a kingdom's home stage with its kingdom. The game's `main` has no symbols for the two functions: they are
-  found by what they do (`GAME_FN_*` in `build\gen\image.h`, see `find_game_functions` in
+  found by what they do (`GAME_FN_*` in `build/gen\image.h`, see `find_game_functions` in
   `tools\lifter\gen_tables.py`). When the
   stage's `StageScene::init` runs, the input sequence starts again: `SMO_SEQ_<n>` for the n-th stage of the list
   (counted from 1), else `SMO_STAGE_SEQ`, else `SMO_SEQ`. The log marks each stage: `stage list: frame F: stage n of N
@@ -269,12 +272,12 @@ The end of every log has the counts that tell whether a run was healthy:
   can take them apart per stage. After the last stage the run ends as with `SMO_SEQ_EXIT=1`. The run's time limit (the
   exe's second argument) counts from the start of the stage being played. Stay within one kingdom: the game changes
   kingdom for a home stage only, so another kingdom's sub-area would load with the old kingdom's scenario.
-- `tests\stress_stages.py --save <save folder> [--scenarios] [--jobs 2] [--speed 4] [--cache <folder>]`
+- `tests/stress_stages.py --save <save folder> [--scenarios] [--jobs 2] [--speed 4] [--cache <folder>]`
   starts every stage of the game from a warped copy of the save (a kingdom's home stage directly, any other stage with
   `SMO_START_STAGE`; with `--scenarios` also every scenario of every kingdom, at its checkpoint flags), plays a few
   seconds of each at a raised speed and lists what the logs show: host exceptions, the game's aborts, operations not
   implemented, shader stages not translated, Vulkan failures, unimplemented system calls, freezes, dummy textures,
-  stages that never reach play (`build\stress\<name>\summary.md`, with four small pictures a run). It also
+  stages that never reach play (`build/stress\<name>\summary.md`, with four small pictures a run). It also
   uses two test switches: `SMO_SPEED=<n>` (TEST ONLY) runs the refresh clock n times faster, 60 x n refreshes a second
   (0 = 960): the game steps once per refresh, so it runs up to n times faster where the PC keeps up, and input sequences,
   counted in frames, play the same; `SMO_SEQ_EXIT=1` ends the run when its input sequence is done. A game takes about
@@ -283,7 +286,7 @@ The end of every log has the counts that tell whether a run was healthy:
   (the boot to the title menu alone is about half), so short runs spend most of their time starting. `--chain N` plays
   up to N stages of one kingdom and one kind (stages in the save's scenario; scenarios started at a checkpoint flag;
   scenarios at their default start) in one run with `SMO_STAGE_LIST`, splits the log per stage
-  (`build\run\<name>_<stage>.log`, as a run of its own is named) and records each stage as its own run would,
+  (`build/run\<name>_<stage>.log`, as a run of its own is named) and records each stage as its own run would,
   its counters from the run's totals after each stage; after a crash or a time limit a new run plays the stages left.
   `--exe-prefix` names the jobs' exe copies. A stage that only a painting leads to (the Mushroom Kingdom's six boss
   rematches, the Darker Side's last room; found in the maps: its `MissRestartArea` names the room, whose
@@ -296,10 +299,11 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Other switches
 
-- Threads: the game's three console cores run on three processors of the PC, one per physical core, from a slot of six
-  processors the game takes for itself: counted from the top of the process's affinity, the first slot no other
-  running game holds (a named mutex per slot, `Local\smo_console_cores_<k>`; a 32-processor PC has five). A game alone
-  takes slot 0; games started while it runs take the next ones, so games side by side never share these processors
+- Threads: the game's three console cores run on three processors of the PC, one hardware thread of each of three
+  physical cores (the core's other thread is left free), from a slot of three performance cores the game takes for
+  itself: counted from the top of the process's affinity, the first slot no other running game holds (a lock per slot,
+  `build/run/console_cores_<k>.lock`). Performance cores come from `/sys/devices/cpu_core/cpus` on a hybrid Intel CPU,
+  physical cores from `/sys/devices/system/cpu/cpu*/topology`. A game alone takes slot 0; games started while it runs take the next ones, so games side by side never share these processors
   (`console cores in processor slot K of N` in the log). `SMO_OS_HOST_CPUS=<hexadecimal mask>` chooses the processors
   instead (the stress test's `--cpus split`). TEST ONLY, for comparisons: `SMO_OS_PRIO17=0` puts the game's priority 17 back on one level with
   18 to 27 (by default the model draw buffer update, 17, runs before the archive decompression, 18, as on the console).
@@ -308,7 +312,7 @@ The end of every log has the counts that tell whether a run was healthy:
   applet, the NFC reader with an amiibo held to it, the amiibo menu's list and picture): run when every handler is
   registered, before the game starts; one line per group, then it exits with the number of failed checks as exit code.
   `SMO_AMIIBO_SHOT=<file.png>` also saves the menu picture it composes.
-- `SMO_MANUAL=<folder>` takes the game's manual from that folder instead of `build\manual`; `SMO_WEB_NOOPEN=1` prepares
+- `SMO_MANUAL=<folder>` takes the game's manual from that folder instead of `build/manual`; `SMO_WEB_NOOPEN=1` prepares
   the Help pages without showing them (neither in the game window nor in the browser). Nothing is written next to the
   manual: the game window adds the console browser's `window.nx` to the page, a web browser gets a copy in
   `%TEMP%\smo-recomp-help`.
@@ -335,13 +339,13 @@ The end of every log has the counts that tell whether a run was healthy:
 
 ## Looking things up in the executable
 
-- `tools\dev\disasm.py <symbol or address> [--module main|sdk]` disassembles one function, naming call targets.
-- `tools\dev\callers.py <name substring>` lists the callers of a function or import.
-- `tools\dev\sarc.py <romfs path>` lists the files in a SARC archive of the extracted RomFS;
-  `tools\dev\byml.py StageData\<Stage>Map.szs --scenario 0 --grep <name>` lists the objects placed in a stage, with
+- `tools/dev/disasm.py <symbol or address> [--module main|sdk]` disassembles one function, naming call targets.
+- `tools/dev/callers.py <name substring>` lists the callers of a function or import.
+- `tools/dev/sarc.py <romfs path>` lists the files in a SARC archive of the extracted RomFS;
+  `tools/dev/byml.py StageData\<Stage>Map.szs --scenario 0 --grep <name>` lists the objects placed in a stage, with
   their positions (prints to the console only).
 - `tools\lifter\mapaddr.py` names host addresses from the linker map.
-- The function list (`build\functions\<module>_functions.tsv`) names functions by the module's own symbols (column
+- The function list (`build/functions\<module>_functions.tsv`) names functions by the module's own symbols (column
   `symbol`) and, for `main`, the `execute` function of every state class from its RTTI (column `rtti_name`): the
   game's `main` keeps almost no symbols, so these are most of its names. `tools\target.py` says where the build's
   files are.

@@ -88,7 +88,10 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
   release con `ST`, seq_cst el resto), `isb` → barrera del compilador, `ldar`/`ldaxr` → `lda<n>` (acquire),
   `stlr` → `stl<n>` (release) en `runtime.h`. Comprobado sin dump con `tests/check_ordered.py` (ELF falso; 256 casos
   iguales a Unicorn). Falta `difftest.py all` con el dump (va en la Verificación 2)
-- [ ] Fase 7 — README, `docs/*.md`, `.gitignore`
+- [x] Fase 7 — `README.md` (Linux, estado: medido en Windows, aún no corrido en Linux), `docs/building.md`
+  (pacman, `.venv`, PRIME, cachés, dump cifrado con hactoolnet), `docs/architecture.md` (plat.h, SDL3, memfd, FFmpeg,
+  FreeType, sin OpenGL/WebView2/MF), `docs/debugging.md` (señales, `/proc`, nice/SCHED_IDLE, slots con flock),
+  `.gitignore` (`*.so`, `smo_native`, `smo_test*`)
 - [ ] Verificación 1–2: dependencias y `setup.py --dump ./dump --check` (bloqueado: dump cifrado, ver arriba)
 - [ ] Verificación 3–4: autotests, shaders, texturas, fast paths
 - [ ] Verificación 5: jugar (`run.py play`)

@@ -43,6 +43,12 @@ gen*/
 *.exe
 *.pdb
 *.map
+*.so
+*.so.*
+smo_native
+smo_user
+smo_test*
+smo_stress*
 *.spv
 
 # function lists carry addresses and names derived from the dump
