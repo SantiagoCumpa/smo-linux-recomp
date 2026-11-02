@@ -13,8 +13,8 @@
  *   FreeMemoryBlock(addr, size)        [doc] gives the block back to the heap.
  * Host: one region of HEAP_RESERVE bytes is RESERVED once; SetMemoryHeapSize commits [0, size). Blocks are handed out
  * first-fit on 2 MB granules from a bitmap. Fresh pages are zero (as the kernel's heap pages are when first mapped).
- * The region is a VIEW OF A PAGEFILE-BACKED SECTION (SEC_RESERVE), not plain VirtualAlloc memory, so that the same
- * physical pages can be shown at a second address: NVN virtual memory pools (nvnMemoryPoolMapVirtual, nvn_stub.c) map
+ * The region is a MAP_SHARED mapping of a sparse memfd (memfd_create, ftruncate to HEAP_RESERVE; pages exist once
+ * touched), not anonymous memory, so that the same physical pages can be shown at a second address: NVN virtual memory pools (nvnMemoryPoolMapVirtual, nvn_stub.c) map
  * views of it, the way the console's GPU address space maps physical pool pages. smo_heap_section_offset() tells
  * whether an address lies in the heap and where.
  *
@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include "plat.h"
 #include "hostrt.h"
 #include "sdklift.h"
@@ -34,18 +36,18 @@
 #define RESULT_OUT_OF_MEMORY 0x1003u
 
 static plat_rwlock_t g_heap_lock = PLAT_RWLOCK_INIT;
-static HANDLE g_heap_section;                  /* pagefile-backed section the heap is a view of */
+static int g_heap_section = -1;               /* the memfd the heap is a view of */
 static uint8_t *g_heap;                        /* base, fixed once reserved */
 static uint64_t g_heap_size;                   /* committed size (the heap size the game set) */
 static uint8_t g_used[HEAP_RESERVE / UNIT];    /* 1 = granule belongs to an allocated block */
 static unsigned long long g_alloc_calls, g_alloc_fail, g_peak;
 
-int smo_heap_section_handle(HANDLE *h) { *h = g_heap_section; return g_heap_section != NULL; }
+int smo_heap_section_handle(int *fd) { *fd = g_heap_section; return g_heap_section >= 0; }
 /* The committed heap: base and size (0 before SetMemoryHeapSize). */
 int smo_heap_range(uint64_t *base, uint64_t *size) { *base = (uint64_t)(uintptr_t)g_heap; *size = g_heap ? g_heap_size : 0; return g_heap != NULL; }
 
 /* The heap's section and the offset of [addr, addr+size) in it; 0 if the range is not inside the committed heap. */
-int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset) {
+int smo_heap_section_offset(uint64_t addr, uint64_t size, int *section, uint64_t *offset) {
     uint64_t base = (uint64_t)(uintptr_t)g_heap;
     if (!g_heap || addr < base || addr + size > base + g_heap_size || addr + size < addr) return 0;
     *section = g_heap_section;
@@ -60,18 +62,24 @@ static void os_SetMemoryHeapSize(Ctx *c) {
     if (size % UNIT || size > HEAP_RESERVE) r = RESULT_OUT_OF_MEMORY;
     else {
         if (!g_heap) {
-            g_heap_section = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_RESERVE,
-                                                (uint32_t)(HEAP_RESERVE >> 32), (uint32_t)HEAP_RESERVE, NULL);
-            if (g_heap_section) g_heap = MapViewOfFile(g_heap_section, FILE_MAP_ALL_ACCESS, 0, 0, (size_t)HEAP_RESERVE);
-            if (!g_heap) printf("nn::os::SetMemoryHeapSize: cannot create the heap section (error %lu)\n", GetLastError());
+            g_heap_section = memfd_create("smo_heap", MFD_CLOEXEC);
+            if (g_heap_section >= 0 && ftruncate(g_heap_section, (off_t)HEAP_RESERVE) == 0) {
+                void *p = mmap(NULL, (size_t)HEAP_RESERVE, PROT_NONE, MAP_SHARED | MAP_NORESERVE, g_heap_section, 0);
+                g_heap = p == MAP_FAILED ? NULL : p;
+            }
+            if (!g_heap) printf("nn::os::SetMemoryHeapSize: cannot create the heap memfd (%s)\n", strerror(errno));
         }
         if (!g_heap) r = RESULT_OUT_OF_MEMORY;
         else if (size > g_heap_size) {
-            if (!VirtualAlloc(g_heap + g_heap_size, size - g_heap_size, MEM_COMMIT, PAGE_READWRITE)) r = RESULT_OUT_OF_MEMORY;
+            if (mprotect(g_heap + g_heap_size, size - g_heap_size, PROT_READ | PROT_WRITE)) r = RESULT_OUT_OF_MEMORY;
         } else if (size < g_heap_size) {
             for (uint64_t g = size / UNIT; g < g_heap_size / UNIT; g++) if (g_used[g]) r = RESULT_OUT_OF_MEMORY;   /* blocks still live above */
-            /* pages of a section view cannot be decommitted (VirtualFree MEM_DECOMMIT fails on mapped views): they stay
-             * committed; the heap's size shrinks as on the console, only host memory is not given back */
+            /* the pages above the new size go back to the system (a hole punched in the memfd: zero when used again;
+             * views of them in virtual pools see the same) and lose their access */
+            if (!r) {
+                mprotect(g_heap + size, g_heap_size - size, PROT_NONE);
+                fallocate(g_heap_section, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)size, (off_t)(g_heap_size - size));
+            }
         }
         if (!r) g_heap_size = size;
     }
@@ -233,12 +241,7 @@ static void diag_log_line(const char *s, size_t n) {
 }
 static void diag_LogImpl(Ctx *c) { char msg[1024]; int n = clib_format_call(c, 1, msg, sizeof msg); diag_log_line(msg, n < 0 ? 0 : (size_t)n < sizeof msg ? (size_t)n : sizeof msg - 1); }
 static void diag_PutImpl(Ctx *c) { if (c->x[1]) diag_log_line((const char *)(uintptr_t)c->x[1], (size_t)c->x[2]); }
-static int readable(uint64_t p, size_t n) {
-    MEMORY_BASIC_INFORMATION mb;
-    if (!p || VirtualQuery((void *)(uintptr_t)p, &mb, sizeof mb) != sizeof mb || mb.State != MEM_COMMIT) return 0;
-    if (mb.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
-    return p + n <= (uint64_t)(uintptr_t)mb.BaseAddress + mb.RegionSize;
-}
+static int readable(uint64_t p, size_t n) { return p && plat_readable((const void *)(uintptr_t)p, n); }
 static void diag_GetBacktrace(Ctx *c) {
     uint64_t out = c->x[0], fp = c->x[29];
     int max = (int)c->x[1], n = 0;
@@ -309,19 +312,11 @@ static void time_Finalize(Ctx *c) { plat_xchg(&g_time_init, 0); c->x[0] = 0; }
 static volatile int32_t g_shot_orientation;
 int smo_screenshot_orientation(void) { return (int)g_shot_orientation; }
 static void oe_SetScreenShotImageOrientation(Ctx *c) { plat_xchg(&g_shot_orientation, (int32_t)(c->x[0] & 3)); }
-static HANDLE g_inact_req;
 static int g_inact_ext;
+void display_keep_awake(int source, int on);          /* display.c: the screen saver is held off while any source asks */
 static void oe_SetUserInactivityDetectionTimeExtended(Ctx *c) {
     int on = (int)(c->x[0] & 1);
-    if (!g_inact_req) {
-        REASON_CONTEXT rc;
-        memset(&rc, 0, sizeof rc);
-        rc.Version = POWER_REQUEST_CONTEXT_VERSION; rc.Flags = POWER_REQUEST_CONTEXT_SIMPLE_STRING;
-        rc.Reason.SimpleReasonString = L"Super Mario Odyssey (smo-recomp): the game asked for a longer time before the screen dims";
-        g_inact_req = PowerCreateRequest(&rc);
-        if (g_inact_req == INVALID_HANDLE_VALUE) g_inact_req = NULL;
-    }
-    if (g_inact_req && on != g_inact_ext) { if (on) PowerSetRequest(g_inact_req, PowerRequestDisplayRequired); else PowerClearRequest(g_inact_req, PowerRequestDisplayRequired); }
+    if (on != g_inact_ext) display_keep_awake(1, on);
     g_inact_ext = on;
 }
 static void oe_IsUserInactivityDetectionTimeExtended(Ctx *c) { c->x[0] = (uint64_t)g_inact_ext; }

@@ -12,6 +12,8 @@
  * (below). */
 #include <stdio.h>
 #include <stdlib.h>
+#include <SDL3/SDL.h>
+#include <openssl/evp.h>
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
@@ -130,7 +132,8 @@ static uint8_t g_oe_event[0x40];
 static uint32_t g_oe_queue[16];
 static int g_oe_count, g_oe_event_ready, g_oe_focus_state = 1, g_oe_focus_mode = 0, g_oe_was_foreground;
 static int g_oe_opmode_notify, g_oe_resume_notify, g_oe_focus_pending, g_oe_focus_recheck;
-static HWND g_oe_window;
+int display_focus_flags(void);                     /* display.c: DISPLAY_FOCUSED 1, DISPLAY_MINIMISED 2, DISPLAY_SHOWN 4 */
+void display_test_minimise(int on);               /* display.c: minimise / restore the window (focus test) */
 static plat_lock_t g_oe_lock;
 static void oe_event_setup(void) {
     if (!g_oe_event_ready) { os_init_event((uint64_t)(uintptr_t)g_oe_event, 0); g_oe_event_ready = 1; }
@@ -157,11 +160,6 @@ extern volatile int32_t g_guest_frozen;
 static volatile int32_t g_oe_poll_count;
 static int g_oe_exit_requested;                           /* defined with the exit request code below */
 #define OE_MSG_RESUME 16u
-static int oe_find_window(HWND w, LPARAM out) {
-    uint32_t pid = 0;
-    if (GetWindowThreadProcessId(w, &pid) && pid == getpid() && IsWindowVisible(w) && !GetWindow(w, GW_OWNER)) { *(HWND *)out = w; return 0; }
-    return 1;
-}
 static uint32_t oe_watch(void * pause) {
     static const char *const k_test_state[] = {"", "not active (another program has the focus)", "minimised"};
     const char *test = getenv("SMO_FOCUS_TEST");
@@ -174,15 +172,14 @@ static uint32_t oe_watch(void * pause) {
         plat_sleep_ms(20);
         double t = (double)(plat_ms() - t0) / 1000.0;
         if (test && test_phase < 3 && t >= t_start + test_phase * t_len) {
-            HWND w = NULL;
+            int w = display_focus_flags() & 4;
             if (test_phase > 0)
-                printf("nn::oe: focus test: %s for %llu ms: the game's main loop polled %ld times\n", k_test_state[test_phase],
-                       (unsigned long long)(plat_ms() - phase_at), (long)(g_oe_poll_count - phase_polls));
-            if (test_phase == 1) EnumWindows(oe_find_window, (LPARAM)&w);
+                printf("nn::oe: focus test: %s for %llu ms: the game's main loop polled %d times\n", k_test_state[test_phase],
+                       (unsigned long long)(plat_ms() - phase_at), (int)(g_oe_poll_count - phase_polls));
             if (test_phase == 0) g_oe_was_foreground = 1;  /* never the foreground window, so from now on another program has the focus */
-            else if (test_phase == 1 && w) { g_oe_window = w; ShowWindow(w, SW_SHOWMINNOACTIVE); }
+            else if (test_phase == 1 && w) display_test_minimise(1);
             else {                                        /* restored (or no window on screen to minimise: SMO_SHOW=1 for a test copy) */
-                if (test_phase == 2) ShowWindow(g_oe_window, SW_SHOWNOACTIVATE);
+                if (test_phase == 2) display_test_minimise(0);
                 else printf("nn::oe: focus test: no window on screen to minimise (a test copy needs SMO_SHOW=1)\n");
                 g_oe_was_foreground = 0;                  /* a window that was never the foreground window counts as in focus again */
                 test_phase = 2;
@@ -192,12 +189,11 @@ static uint32_t oe_watch(void * pause) {
             if (test_phase < 3) printf("nn::oe: focus test: the window is %s (unfocused = %s, handling mode %d)\n", k_test_state[test_phase], pause ? "pause" : "run", g_oe_focus_mode);
             fflush(stdout);
         }
-        uint32_t pid = 0;
-        HWND fg = GetForegroundWindow();
-        int testing = test_phase == 1 || test_phase == 2;   /* the test's state of the window wins over the real foreground */
-        int ours = !testing && fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid();
-        if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
-        int minimised = g_oe_window && IsIconic(g_oe_window);
+        int flags = display_focus_flags();
+        int testing = test_phase == 1 || test_phase == 2;   /* the test's state of the window wins over the real focus */
+        int ours = !testing && (flags & 1);
+        if (ours) g_oe_was_foreground = 1;
+        int minimised = (flags & 2) != 0;
         int runnable = !pause || !g_oe_was_foreground || ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
@@ -207,7 +203,7 @@ static uint32_t oe_watch(void * pause) {
         } else if (runnable && g_guest_frozen) {
             int32_t polls = g_oe_poll_count - polls_at;
             plat_xchg(&g_guest_frozen, 0);
-            printf("nn::oe: application resumed after %llu ms of suspension; main-loop polls during it: %ld\n", (unsigned long long)(plat_ms() - frozen_at), (long)polls);
+            printf("nn::oe: application resumed after %llu ms of suspension; main-loop polls during it: %d\n", (unsigned long long)(plat_ms() - frozen_at), (int)polls);
             fflush(stdout);
             trace_printf("     nn::oe: application resumed after %llu ms\n", (unsigned long long)(plat_ms() - frozen_at));
         }
@@ -222,22 +218,21 @@ static void oe_track_focus(void) {
     if (enabled < 0) { const char *e = getenv("SMO_FOCUS_NOTIFY"); enabled = !(e && e[0] == '0'); }
     if (enabled && plat_cas(&watcher, 1, 0) == 0) {     /* the watcher: only to pause the game, or for the test */
         int pause = gfx_options()->pause_unfocused;
-        if (pause || getenv("SMO_FOCUS_TEST")) CloseHandle(CreateThread(NULL, 0, oe_watch, (void *)(intptr_t)pause, 0, NULL));
+        if (pause || getenv("SMO_FOCUS_TEST")) plat_thread_detach(plat_thread_start(oe_watch, (void *)(intptr_t)pause, 0));
     }
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;
     last = now;
     g_oe_focus_recheck = 0;
-    uint32_t pid = 0;
-    HWND fg = GetForegroundWindow();
-    int ours = fg && GetWindowThreadProcessId(fg, &pid) && pid == getpid();
-    if (ours) { g_oe_was_foreground = 1; g_oe_window = fg; }
+    int flags = display_focus_flags();
+    int ours = flags & 1;
+    if (ours) g_oe_was_foreground = 1;
     if (!g_oe_was_foreground) return;
     /* the applet manager's rule (suyu am/lifecycle_manager.cpp UpdateRequestedFocusState, GetFocusStateWhile*), with
      * the window as the activity state: foreground = ForegroundVisible; visible but not the foreground window = ForegroundObscured
      * (something else has the input, as under an overlay or a library applet); minimised = Background (as behind the HOME menu).
      * The handling mode is what [sdk 0x32c3d0, table 0xa7ff70] sends for the oe mode: 0 = (notify 0, suspend 1), 1 = (notify 1,
      * suspend 0) NoSuspend, 2 = (notify 1, suspend 1), 3 = (notify 0, suspend 1) + SetOutOfFocusSuspendingEnabled(1) AlwaysSuspend. */
-    int minimised = g_oe_window && IsIconic(g_oe_window);
+    int minimised = (flags & 2) != 0;
     int state = ours ? 1                                                    /* InFocus */
               : g_oe_focus_mode == 3 ? 1                                    /* AlwaysSuspend: the application never learns it */
               : !minimised ? 2                                              /* obscured: NotInFocus in the other three modes */
@@ -323,18 +318,19 @@ static uint64_t desired_language(void) {
     static uint64_t cached;
     static const char *const supported[] = {"ja", "en-US", "en-GB", "fr", "fr-CA", "de", "it", "es", "es-419", "zh-Hans", "zh-Hant", "ko", "nl", "ru"};
     if (cached) return cached;
-    char name[LOCALE_NAME_MAX_LENGTH * 3] = "", pick[16] = "en-US";
+    char name[128] = "", pick[16] = "en-US";
     const char *env = getenv("SMO_LANGUAGE");
-    wchar_t wname[LOCALE_NAME_MAX_LENGTH] = L"";
-    uint32_t count = 0, size = 0;
     if (env && env[0]) snprintf(name, sizeof name, "%s", env);
     else {
-        /* the display language of the user interface, not the regional format */
-        wchar_t list[512];
-        size = 512;
-        if (GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &count, list, &size) && count > 0) wcsncpy(wname, list, LOCALE_NAME_MAX_LENGTH - 1);
-        else GetUserDefaultLocaleName(wname, LOCALE_NAME_MAX_LENGTH);
-        WideCharToMultiByte(CP_UTF8, 0, wname, -1, name, sizeof name, NULL, NULL);
+        /* the language of messages: LANGUAGE (its first entry), LC_ALL, LC_MESSAGES, LANG; "es_PE.UTF-8" -> "es-PE" */
+        const char *vars[] = {"LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"};
+        for (int i = 0; i < 4 && !name[0]; i++) {
+            const char *v = getenv(vars[i]);
+            if (!v || !v[0] || !strcmp(v, "C") || !strcmp(v, "POSIX") || !strncmp(v, "C.", 2)) continue;
+            snprintf(name, sizeof name, "%s", v);
+        }
+        name[strcspn(name, ":.@")] = 0;
+        for (char *p = name; *p; p++) if (*p == '_') *p = '-';
     }
     int exact = 0;
     for (size_t i = 0; i < sizeof supported / sizeof supported[0]; i++) if (!strcasecmp(name, supported[i])) { strcpy(pick, supported[i]); exact = 1; }
@@ -350,7 +346,7 @@ static uint64_t desired_language(void) {
     }
     uint64_t v = 0;
     memcpy(&v, pick, strlen(pick));
-    printf("nn::oe::GetDesiredLanguage: Windows display language \"%s\" -> \"%s\"\n", name, pick);
+    printf("nn::oe::GetDesiredLanguage: system language \"%s\" -> \"%s\"\n", name, pick);
     cached = v;
     return v;
 }
@@ -360,14 +356,14 @@ const char *oe_language(void) { static char code[9]; uint64_t v = desired_langua
 
 /* ---------------------------------------------------------------- nn::err
  * The console's error viewer shows "Error Code: 2MMM-DDDD" (2000 + module, description) in a dialog and returns when
- * the user closes it. Here it is a Windows message box on the calling thread, which blocks the same way. Scripted
+ * the user closes it. Here it is an SDL message box on the calling thread, which blocks the same way. Scripted
  * runs (SMO_SEQ / SMO_PLAY / SMO_PRESS / SMO_SCRIPT) and SMO_ERROR_DIALOG=0 only log, so tests never hang. */
 static void err_dialog(unsigned category, unsigned number) {
     const char *off = getenv("SMO_ERROR_DIALOG");
     char text[160];
     if ((off && off[0] == '0') || getenv("SMO_SEQ") || getenv("SMO_PLAY") || getenv("SMO_PRESS") || getenv("SMO_SCRIPT")) return;
     snprintf(text, sizeof text, "Error Code: %04u-%04u\n\nAn error has occurred.", category, number);
-    MessageBoxA(NULL, text, "Error", MB_OK | MB_ICONERROR | MB_SETFOREGROUND | MB_TASKMODAL);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Error", text, NULL);
 }
 static void err_ShowErrorResult(Ctx *c) {                 /* (Result): the console shows the error applet */
     uint32_t r = (uint32_t)A0;
@@ -378,37 +374,25 @@ static void err_ShowErrorResult(Ctx *c) {                 /* (Result): the conso
 }
 
 /* ---------------------------------------------------------------- nn::util */
-static HCRYPTPROV crypt_provider(void) {
-    static HCRYPTPROV prov;
-    static volatile int32_t lock;
-    while (plat_xchg(&lock, 1)) plat_yield();
-    if (!prov && !CryptAcquireContextA(&prov, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) prov = 0;
-    plat_xchg(&lock, 0);
-    return prov;
-}
 /* [sdk] BinaryFileHeader checks (layout in nnsdk.c): signature = first 8 bytes; alignment shift u8 @0xe;
  * byte-order mark i16 @0xc, reversed when it reads 0xFFFE. */
 static void util_BinaryFileHeader_IsSignatureValid(Ctx *c) { RET(rd64(A0) == A1); }
 static void util_BinaryFileHeader_IsAlignmentValid(Ctx *c) { RET((A0 & ~(~0ull << (rd8(A0 + 0xe) & 63))) == 0); }
 static void util_BinaryFileHeader_IsEndianReverse(Ctx *c) { RET(rd16(A0 + 0xc) == 0xfffe); }
 
-/* ---------------------------------------------------------------- nn::crypto (Windows CryptoAPI) */
+/* ---------------------------------------------------------------- nn::crypto (OpenSSL libcrypto) */
 static void crypto_Sha1(Ctx *c) {                         /* (void *out, size_t outSize, const void *data, size_t size) */
-    HCRYPTHASH h = 0;
     uint8_t digest[20] = {0};
-    uint32_t len = sizeof digest;
-    if (crypt_provider() && CryptCreateHash(crypt_provider(), CALG_SHA1, 0, 0, &h)) {
-        CryptHashData(h, (const uint8_t *)(uintptr_t)A2, (uint32_t)A3, 0);
-        CryptGetHashParam(h, HP_HASHVAL, digest, &len, 0);
-        CryptDestroyHash(h);
-    }
+    unsigned len = sizeof digest;
+    EVP_Digest((const void *)(uintptr_t)A2, (size_t)A3, digest, &len, EVP_sha1(), NULL);
     memcpy((void *)(uintptr_t)A0, digest, A1 < sizeof digest ? (size_t)A1 : sizeof digest);
 }
 /* Md5Impl: the guest object is not touched; the running hash is kept on the host, keyed by its address. */
-static struct { uint64_t key; HCRYPTHASH h; } g_md5[64];
+typedef EVP_MD_CTX *HashCtx;
+static struct { uint64_t key; HashCtx h; } g_md5[64];
 static plat_lock_t g_md5_lock;
-static HCRYPTHASH *md5_slot(uint64_t key, int create) {
-    HCRYPTHASH *found = NULL;
+static HashCtx *md5_slot(uint64_t key, int create) {
+    HashCtx *found = NULL;
     plat_lock(&g_md5_lock);
     for (int i = 0; i < 64 && !found; i++) if (g_md5[i].key == key) found = &g_md5[i].h;
     for (int i = 0; i < 64 && !found && create; i++) if (!g_md5[i].key) { g_md5[i].key = key; g_md5[i].h = 0; found = &g_md5[i].h; }
@@ -417,21 +401,22 @@ static HCRYPTHASH *md5_slot(uint64_t key, int create) {
 }
 static void md5_drop(uint64_t key) {
     plat_lock(&g_md5_lock);
-    for (int i = 0; i < 64; i++) if (g_md5[i].key == key) { if (g_md5[i].h) CryptDestroyHash(g_md5[i].h); g_md5[i].key = 0; g_md5[i].h = 0; }
+    for (int i = 0; i < 64; i++) if (g_md5[i].key == key) { if (g_md5[i].h) EVP_MD_CTX_free(g_md5[i].h); g_md5[i].key = 0; g_md5[i].h = 0; }
     plat_unlock(&g_md5_lock);
 }
 static void crypto_Md5_Initialize(Ctx *c) {
     md5_drop(A0);
-    HCRYPTHASH *h = md5_slot(A0, 1);
+    HashCtx *h = md5_slot(A0, 1);
     if (!h) fatal(c, "nn::crypto Md5Impl: more than 64 hashes in progress");
-    if (!crypt_provider() || !CryptCreateHash(crypt_provider(), CALG_MD5, 0, 0, h)) *h = 0;
+    *h = EVP_MD_CTX_new();
+    if (*h && !EVP_DigestInit_ex(*h, EVP_md5(), NULL)) { EVP_MD_CTX_free(*h); *h = 0; }
 }
-static void crypto_Md5_Update(Ctx *c) { HCRYPTHASH *h = md5_slot(A0, 0); if (h && *h) CryptHashData(*h, (const uint8_t *)(uintptr_t)A1, (uint32_t)A2, 0); }
+static void crypto_Md5_Update(Ctx *c) { HashCtx *h = md5_slot(A0, 0); if (h && *h) EVP_DigestUpdate(*h, (const void *)(uintptr_t)A1, (size_t)A2); }
 static void crypto_Md5_GetHash(Ctx *c) {                  /* (this, void *out, size_t outSize) */
-    HCRYPTHASH *h = md5_slot(A0, 0);
+    HashCtx *h = md5_slot(A0, 0);
     uint8_t digest[16] = {0};
-    uint32_t len = sizeof digest;
-    if (h && *h) CryptGetHashParam(*h, HP_HASHVAL, digest, &len, 0);
+    unsigned len = sizeof digest;
+    if (h && *h) { EVP_MD_CTX *copy = EVP_MD_CTX_new(); if (copy && EVP_MD_CTX_copy_ex(copy, *h)) EVP_DigestFinal_ex(copy, digest, &len); EVP_MD_CTX_free(copy); }
     memcpy((void *)(uintptr_t)A1, digest, A2 < sizeof digest ? (size_t)A2 : sizeof digest);
 }
 static void crypto_Md5_dtor(Ctx *c) { md5_drop(A0); }
@@ -525,9 +510,13 @@ int image_protect_selftest(Ctx *c) {
     (void)c;
     if (!getenv("SMO_NO_PROTECT")) {
         n += 3;
-        if (!IsBadWritePtr((void *)(uintptr_t)GUEST_BASE, 1)) { bad++; printf("  image protection: the first text page is writable\n"); }
-        if (!IsBadWritePtr((void *)(uintptr_t)(GUEST_BASE + GUEST_RO_END - 1), 1)) { bad++; printf("  image protection: the last read-only data byte is writable\n"); }
-        if (IsBadWritePtr((void *)(uintptr_t)(GUEST_BASE + GUEST_RO_END), 1) || IsBadReadPtr((void *)(uintptr_t)GUEST_BASE, 16)) { bad++; printf("  image protection: data segment not writable or text not readable\n"); }
+        int p0 = 0, p1 = 0, p2 = 0;
+        plat_query((void *)(uintptr_t)GUEST_BASE, NULL, NULL, &p0);
+        plat_query((void *)(uintptr_t)(GUEST_BASE + GUEST_RO_END - 1), NULL, NULL, &p1);
+        plat_query((void *)(uintptr_t)(GUEST_BASE + GUEST_RO_END), NULL, NULL, &p2);
+        if (p0 & 2) { bad++; printf("  image protection: the first text page is writable\n"); }
+        if (p1 & 2) { bad++; printf("  image protection: the last read-only data byte is writable\n"); }
+        if (!(p2 & 2) || !(p0 & 1)) { bad++; printf("  image protection: data segment not writable or text not readable\n"); }
     }
     printf("  image protection: %d cases, %d failed\n", n, bad);
     return bad;

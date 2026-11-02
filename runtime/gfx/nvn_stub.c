@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include "plat.h"
 #include "runtime.h"
 #include "hostrt.h"
@@ -163,34 +164,15 @@ typedef struct VPool { uint64_t key, base, size; int nseg, used, direct; VpSeg s
 static VPool *g_vpools;
 static plat_rwlock_t g_vp_lock = PLAT_RWLOCK_INIT;
 static unsigned long long g_vp_maps, g_vp_unmaps;
-typedef void * (*VirtualAlloc2Fn)(HANDLE, void *, size_t, uint32_t, uint32_t, void *, uint32_t);
-typedef void * (*MapViewOfFile3Fn)(HANDLE, HANDLE, void *, uint64_t, size_t, uint32_t, uint32_t, void *, uint32_t);
-typedef int (*UnmapViewOfFile2Fn)(HANDLE, void *, uint32_t);
-static VirtualAlloc2Fn p_VirtualAlloc2;
-static MapViewOfFile3Fn p_MapViewOfFile3;
-static UnmapViewOfFile2Fn p_UnmapViewOfFile2;
-#ifndef MEM_RESERVE_PLACEHOLDER
-#define MEM_RESERVE_PLACEHOLDER 0x00040000
-#define MEM_REPLACE_PLACEHOLDER 0x00004000
-#define MEM_PRESERVE_PLACEHOLDER 0x00000002
-#define MEM_COALESCE_PLACEHOLDERS 0x00000001
-#endif
-int smo_heap_section_offset(uint64_t addr, uint64_t size, HANDLE *section, uint64_t *offset);     /* smo_nn.c */
+int smo_heap_section_offset(uint64_t addr, uint64_t size, int *section, uint64_t *offset);     /* smo_nn.c */
 static void vp_fail(Ctx *c, const char *what, uint64_t a, uint64_t b) {
-    printf("\nnvn: virtual memory pool: %s (0x%llx, 0x%llx; Windows error %lu)\n", what, (unsigned long long)a, (unsigned long long)b, GetLastError());
+    printf("\nnvn: virtual memory pool: %s (0x%llx, 0x%llx; %s)\n", what, (unsigned long long)a, (unsigned long long)b, strerror(errno));
     guest_trap("nvnMemoryPoolMapVirtual: request that cannot be mapped exactly", c ? c->x[30] - 4 : 0);
 }
-static void vp_load(Ctx *c) {
-    if (p_MapViewOfFile3) return;
-    HMODULE k = GetModuleHandleA("kernelbase.dll");
-    p_VirtualAlloc2 = (VirtualAlloc2Fn)(void *)GetProcAddress(k, "VirtualAlloc2");
-    p_MapViewOfFile3 = (MapViewOfFile3Fn)(void *)GetProcAddress(k, "MapViewOfFile3");
-    p_UnmapViewOfFile2 = (UnmapViewOfFile2Fn)(void *)GetProcAddress(k, "UnmapViewOfFile2");
-    if (!p_VirtualAlloc2 || !p_MapViewOfFile3 || !p_UnmapViewOfFile2) vp_fail(c, "placeholder API missing (Windows 10 1803 or newer is needed)", 0, 0);
-}
+static void vp_load(Ctx *c) { (void)c; }
 static VPool *vp_find(uint64_t key) { VPool *v = g_vpools; while (v && v->key != key) v = v->next; return v; }
-/* Make segment boundaries at off (splits the segment containing it). Views are split by unmapping and mapping the two
- * halves again; placeholders by VirtualFree(MEM_PRESERVE_PLACEHOLDER). */
+/* Make segment boundaries at off (splits the segment containing it). Only bookkeeping: a MAP_FIXED mapping of part of
+ * a view replaces that part and leaves the rest as it was. */
 static int vp_map_view(Ctx *c, VPool *v, VpSeg *s);
 static void vp_split(Ctx *c, VPool *v, uint64_t off) {
     for (int i = 0; i < v->nseg; i++) {
@@ -201,36 +183,30 @@ static void vp_split(Ctx *c, VPool *v, uint64_t off) {
         VpSeg left = *s, right = *s;
         left.size = off - s->start;
         right.start = off; right.size = s->start + s->size - off; right.sec_off = s->sec_off + left.size;
-        if (s->mapped) {
-            if (!p_UnmapViewOfFile2(GetCurrentProcess(), (void *)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap for a split", v->base + s->start, s->size);
-        }
-        if (!VirtualFree((void *)(uintptr_t)(v->base + left.start), (size_t)left.size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "placeholder split", v->base + left.start, left.size);
         v->seg[i] = left; v->seg[i + 1] = right; v->nseg++;
-        if (left.mapped) { vp_map_view(c, v, &v->seg[i]); vp_map_view(c, v, &v->seg[i + 1]); }
         return;
     }
 }
-int smo_heap_section_handle(HANDLE *h);                       /* smo_nn.c */
+int smo_heap_section_handle(int *fd);                         /* smo_nn.c */
 static int vp_map_view(Ctx *c, VPool *v, VpSeg *s) {
-    HANDLE sec;
-    if (!smo_heap_section_handle(&sec)) vp_fail(c, "no heap section", 0, 0);
-    void * r = p_MapViewOfFile3(sec, GetCurrentProcess(), (void *)(uintptr_t)(v->base + s->start), s->sec_off, (size_t)s->size,
-                               MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0);
-    if (r != (void *)(uintptr_t)(v->base + s->start)) vp_fail(c, "MapViewOfFile3", v->base + s->start, s->size);
+    int sec;
+    if (!smo_heap_section_handle(&sec)) vp_fail(c, "no heap memfd", 0, 0);
+    void *r = mmap((void *)(uintptr_t)(v->base + s->start), (size_t)s->size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, sec, (off_t)s->sec_off);
+    if (r != (void *)(uintptr_t)(v->base + s->start)) vp_fail(c, "mmap of a heap view", v->base + s->start, s->size);
     return 1;
 }
 static void pool_virtual_init(Ctx *c, NvnObj *p) {
     vp_load(c);
     if (p->memory) vp_fail(c, "a virtual pool was given memory of its own", p->memory, p->size);
     if (!p->size || p->size % VP_GRAN) vp_fail(c, "virtual pool size is not a multiple of 64 KB", p->size, 0);
-    void * base = p_VirtualAlloc2(GetCurrentProcess(), NULL, (size_t)p->size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, NULL, 0);
-    if (!base) vp_fail(c, "placeholder reservation", p->size, 0);
+    void *base = plat_reserve(NULL, (size_t)p->size);
+    if (!base) vp_fail(c, "address space reservation", p->size, 0);
     VPool *v = calloc(1, sizeof *v);
     v->key = p->key; v->base = (uint64_t)(uintptr_t)base; v->size = p->size;
     v->nseg = 1; v->seg[0].start = 0; v->seg[0].size = p->size;
     plat_rw_wlock(&g_vp_lock); v->next = g_vpools; g_vpools = v; plat_rw_wunlock(&g_vp_lock);
     p->memory = v->base;
-    printf("nvn: virtual memory pool %llx: 0x%llx bytes at %llx (placeholder)\n", (unsigned long long)p->key, (unsigned long long)p->size, (unsigned long long)v->base);
+    printf("nvn: virtual memory pool %llx: 0x%llx bytes at %llx (reserved)\n", (unsigned long long)p->key, (unsigned long long)p->size, (unsigned long long)v->base);
 }
 static void pool_map_virtual(Ctx *c) {
     log_call(c);
@@ -247,26 +223,26 @@ static void pool_map_virtual(Ctx *c) {
                    (unsigned long long)pool, (unsigned long long)k, (unsigned long long)phys, (unsigned long long)poff, (unsigned long long)voff, (unsigned long long)size, cls);
         if (voff % VP_GRAN || size % VP_GRAN || !size || voff + size > v->size) vp_fail(c, "request offset / size (64 KB granularity, inside the pool)", voff, size);
         uint64_t sec_off = 0;
-        HANDLE sec;
+        int sec;
         if (v->direct) vp_fail(c, "a pool that is a direct alias of physical memory is mapped again", voff, size);
         if (phys) {
             NvnObj *pp = nobj(phys);
             if (vp_find(phys)) vp_fail(c, "the physical pool of a request is itself virtual", phys, 0);
             int in_heap = smo_heap_section_offset(pp->memory + poff, size, &sec, &sec_off);
-            if (!in_heap || sec_off % VP_GRAN) {
+            if (!in_heap || sec_off % 0x1000) {
                 /* A view cannot express this (memory outside the heap, or a heap offset that is only 4 KB aligned: NVN pool
-                 * memory needs 4 KB alignment, host views 64 KB). Exact only in one case: ONE request mapping the WHOLE,
+                 * memory needs 4 KB alignment, and so do host views). Exact only in one case: ONE request mapping the WHOLE,
                  * still unmapped and unused virtual pool from one contiguous physical range. Then the virtual pool's
                  * memory IS that range: its address becomes the physical address, which aliases exactly. */
                 if (n != 1 || voff != 0 || size != v->size || v->nseg != 1 || v->seg[0].mapped || v->used)
                     vp_fail(c, in_heap ? "physical offset in the heap is not a multiple of 64 KB, and the request is not a whole-pool mapping of an unused pool"
                                        : "physical memory is not inside the memory heap, and the request is not a whole-pool mapping of an unused pool", pp->memory + poff, size);
-                if (!VirtualFree((void *)(uintptr_t)v->base, 0, MEM_RELEASE)) vp_fail(c, "placeholder release", v->base, v->size);
+                plat_release((void *)(uintptr_t)v->base, (size_t)v->size);
                 v->direct = 1;
                 v->base = pp->memory + poff;
                 nobj(pool)->memory = v->base;
                 g_vp_maps++;
-                printf("nvn: virtual memory pool %llx is a direct alias of physical pool %llx +0x%llx (0x%llx bytes at %llx): heap offset 0x%llx is not 64 KB aligned\n",
+                printf("nvn: virtual memory pool %llx is a direct alias of physical pool %llx +0x%llx (0x%llx bytes at %llx): heap offset 0x%llx is not 4 KB aligned\n",
                        (unsigned long long)pool, (unsigned long long)phys, (unsigned long long)poff, (unsigned long long)size,
                        (unsigned long long)v->base, (unsigned long long)sec_off);
                 continue;
@@ -282,12 +258,11 @@ static void pool_map_virtual(Ctx *c) {
             if (first < 0) first = i;
             last = i;
             if (s->mapped) {
-                if (!p_UnmapViewOfFile2(GetCurrentProcess(), (void *)(uintptr_t)(v->base + s->start), MEM_PRESERVE_PLACEHOLDER)) vp_fail(c, "unmap", v->base + s->start, s->size);
+                if (!plat_decommit((void *)(uintptr_t)(v->base + s->start), (size_t)s->size)) vp_fail(c, "unmap", v->base + s->start, s->size);
                 s->mapped = 0; g_vp_unmaps++;
             }
         }
         if (last > first) {
-            if (!VirtualFree((void *)(uintptr_t)(v->base + voff), (size_t)size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) vp_fail(c, "placeholder coalesce", v->base + voff, size);
             memmove(&v->seg[first + 1], &v->seg[last + 1], sizeof(VpSeg) * (size_t)(v->nseg - last - 1));
             v->nseg -= last - first;
         }

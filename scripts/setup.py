@@ -67,7 +67,8 @@ def check_deps(a):
     if shutil.which('pkg-config'):
         for mod, pkg in (('sdl3', 'sdl3'), ('vulkan', 'vulkan-headers vulkan-icd-loader'), ('shaderc', 'shaderc'),
                          ('libavcodec', 'ffmpeg'), ('libavformat', 'ffmpeg'), ('libavutil', 'ffmpeg'), ('libswscale', 'ffmpeg'),
-                         ('libswresample', 'ffmpeg'), ('freetype2', 'freetype2'), ('fontconfig', 'fontconfig')):
+                         ('libswresample', 'ffmpeg'), ('freetype2', 'freetype2'), ('fontconfig', 'fontconfig'),
+                         ('libcrypto', 'openssl')):
             r = subprocess.run(['pkg-config', '--modversion', mod], capture_output=True, text=True)
             print('  %-38s %s' % (mod, r.stdout.strip() if r.returncode == 0 else 'NOT FOUND (sudo pacman -S %s)' % pkg))
             ok &= r.returncode == 0

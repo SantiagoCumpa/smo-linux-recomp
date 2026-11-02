@@ -25,7 +25,7 @@ OBJ_GAME = T.build('obj', 'main')
 BIN = T.build('bin')
 CLANG = T.CLANG
 PKGS = ['sdl3', 'vulkan', 'shaderc', 'libavcodec', 'libavformat', 'libavutil', 'libswscale', 'libswresample',
-        'freetype2', 'fontconfig']
+        'freetype2', 'fontconfig', 'libcrypto']
 
 
 def pkg_config(*args):

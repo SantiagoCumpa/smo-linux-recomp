@@ -280,7 +280,7 @@ static void stdalloc_Initialize(Ctx *c) { g_std_alloc_size = A2; }
 static void stdalloc_Allocate(Ctx *c) { RET(plat_aligned_alloc(A1 ? (size_t)A1 : 1, 16)); }
 static void stdalloc_AllocateAligned(Ctx *c) { RET(plat_aligned_alloc(A1 ? (size_t)A1 : 1, A2 < 16 ? 16 : (size_t)A2)); }
 static void stdalloc_Free(Ctx *c) { plat_aligned_free((void *)(uintptr_t)A1); }
-static void stdalloc_Reallocate(Ctx *c) { RET(_aligned_realloc((void *)(uintptr_t)A1, A2 ? (size_t)A2 : 1, 16)); }
+static void stdalloc_Reallocate(Ctx *c) { RET(realloc((void *)(uintptr_t)A1, A2 ? (size_t)A2 : 1));   /* glibc: 16-byte aligned, and realloc takes posix_memalign blocks */ }
 
 /* ---- nn::util string and bit helpers */
 static void util_SNPrintf(Ctx *c) {                       /* (char *buf, size_t size, const char *fmt, ...) */
