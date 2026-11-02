@@ -185,6 +185,7 @@ uint64_t plat_file_mtime(const char *path);               /* modification time i
 /* the folder for temporary files, with a trailing '/': $SMO_TMP, else <exe dir>/../tmp (build/tmp: never /tmp), made */
 const char *plat_temp_dir(void);
 void plat_exit(int code) __attribute__((noreturn));
+int plat_open_url(const char *url_or_path);              /* xdg-open, detached (not waited for); 1 when started */
 int plat_random(void *buf, size_t n);                     /* kernel entropy (getrandom); 1 on success */
 extern int plat_argc;                                     /* the program's arguments, from before main() */
 extern char **plat_argv;

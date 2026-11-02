@@ -37,8 +37,9 @@
  * String *text) with text->bufSize temporarily set to the size of the entered text; it returns
  * [doc] TextCheckResult 0 Success, 1 ShowFailureDialog, 2 ShowConfirmDialog, with the message in
  * textCheckWorkBuf.
- * Here the applet is a small Win32 dialog (edit box, OK, Cancel) run on the calling guest thread, which
- * blocks exactly like on the console. Scripted runs must not block: SMO_SWKBD=cancel answers "cancelled",
+ * Here the applet is a text-entry dialog of the desktop (zenity, else kdialog; SMO_SWKBD_CMD names another program
+ * that is given <title> <prompt> <initial text> and prints the text, exit status 0 = OK) run from the calling guest
+ * thread, which blocks exactly like on the console. Scripted runs must not block: SMO_SWKBD=cancel answers "cancelled",
  * SMO_SWKBD=text:<utf-8 text> answers that text, SMO_SWKBD=dialog forces the dialog; without the
  * variable the dialog is used unless an input script (SMO_SEQ / SMO_PRESS / SMO_SCRIPT) is active.
  *
@@ -72,6 +73,10 @@
 #include <string.h>
 #include "plat.h"
 #include "sdklift.h"
+#include <SDL3/SDL.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #define A0 (c->x[0])
 #define A1 (c->x[1])
@@ -215,15 +220,14 @@ static void url_append(char *url, size_t cap, const char *s) {      /* a path as
     }
     url[n] = 0;
 }
-/* A PC web browser: a copy of the page in %TEMP%\smo-recomp-help with window.nx first and a <base> naming the page's own
+/* A PC web browser: a copy of the page in build/tmp/smo-recomp-help (plat_temp_dir) with window.nx first and a <base> naming the page's own
  * folder (its pictures, scripts and styles load from there), and a forwarding page, because a file URL with a query cannot
  * be opened by name. SMO_WEB_NOOPEN (self-test): both written, nothing opened. */
 static int web_open_in_browser(const char *doc, const char *full, const char *q) {
-    char tmp[PATH_MAX], dir[PATH_MAX], copy[PATH_MAX], fwd[PATH_MAX], base[4096] = "file:///", url[4096] = "file:///", page[8192];
-    const char *name = strrchr(full, '\\') ? strrchr(full, '\\') + 1 : full;
-    if (!GetTempPathA(sizeof tmp, tmp)) return 0;
+    char dir[PATH_MAX], copy[PATH_MAX], fwd[PATH_MAX], base[4096] = "file://", url[4096] = "file://", page[8192];
+    const char *name = strrchr(full, '/') ? strrchr(full, '/') + 1 : full, *tmp = plat_temp_dir();
     snprintf(dir, sizeof dir, "%ssmo-recomp-help", tmp);
-    snprintf(copy, sizeof copy, "%s\\%s", dir, name);
+    snprintf(copy, sizeof copy, "%s/%s", dir, name);
     snprintf(fwd, sizeof fwd, "%ssmo-recomp-help.html", tmp);
     plat_mkdir(dir);
     FILE *f = fopen(full, "rb");
@@ -254,21 +258,20 @@ static int web_open_in_browser(const char *doc, const char *full, const char *q)
                       "<title>Super Mario Odyssey - Help</title><a href=\"%s\">Help</a>\n", url, url);
     if (pn <= 0 || !write_if_differs(fwd, page, (size_t)pn)) return 0;
     if (getenv("SMO_WEB_NOOPEN")) { printf("nn::web::ShowOfflineHtmlPage: \"%s\" ready as %s (not opened: SMO_WEB_NOOPEN)\n", doc, url); return 1; }
-    HINSTANCE r = ShellExecuteA(NULL, "open", fwd, NULL, NULL, SW_SHOWNORMAL);
-    printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, (intptr_t)r > 32 ? "" : ": FAILED");
-    return (intptr_t)r > 32;
+    int r = plat_open_url(fwd);
+    printf("nn::web::ShowOfflineHtmlPage: \"%s\" opened in the web browser (%s)%s\n", doc, url, r ? "" : ": FAILED (xdg-open)");
+    return r;
 }
 /* 0: the document is not there or could not be shown; 1: shown and closed by the player (or opened in a web browser); 2: the
  * page went to a callback address, copied to callback. */
 static int web_open_offline(const char *doc, char *callback, size_t cap) {
-    char root[PATH_MAX], path[PATH_MAX], full[PATH_MAX], url[4096] = "file:///";
+    char root[PATH_MAX], path[PATH_MAX], full[PATH_MAX], url[4096] = "file://";
     const char *env = getenv("SMO_MANUAL"), *q = strpbrk(doc, "?#");
     size_t plen = q ? (size_t)(q - doc) : strlen(doc);
-    snprintf(root, sizeof root, "%s", env && env[0] ? env : "..\\manual");
-    snprintf(path, sizeof path, "%s\\html-document\\%.*s", root, (int)plen, doc);
-    for (char *p = path; *p; p++) if (*p == '/') *p = '\\';
-    if (!GetFullPathNameA(path, sizeof full, full, NULL) || GetFileAttributesA(full) == INVALID_FILE_ATTRIBUTES || !strrchr(full, '\\')) {
-        printf("nn::web::ShowOfflineHtmlPage: %s not found (run scripts\\setup.py --only manual)\n", full);
+    snprintf(root, sizeof root, "%s", env && env[0] ? env : "../manual");
+    snprintf(path, sizeof path, "%s/html-document/%.*s", root, (int)plen, doc);
+    if (!realpath(path, full) || !plat_is_file(full)) {
+        printf("nn::web::ShowOfflineHtmlPage: %s not found (manual/ in the dump: scripts/setup.py --redo import)\n", path);
         return 0;
     }
     url_append(url, sizeof url, full);
@@ -324,84 +327,122 @@ static void oe_SetExpectedVolumeBalance(Ctx *c) { g_volume_main = clamp01(c->v[0
 #define ARG_CHECKBUF 0x4e0
 #define SWKBD_MAX_CHARS 500                               /* [sdk] 0x38b150: SetInitialText stops at 0x1f4 characters */
 
+/* Text is UTF-16 (the console's), in uint16_t arrays: wchar_t is 32 bits on Linux */
+typedef uint16_t u16ch;
+static size_t u16len(const u16ch *s) { size_t n = 0; while (s[n]) n++; return n; }
+static void u16ncpy(u16ch *d, const u16ch *s, size_t n) { size_t i = 0; for (; i < n && s[i]; i++) d[i] = s[i]; for (; i < n; i++) d[i] = 0; }
+static int u16eq(const u16ch *a, const char *ascii) { while (*a && *ascii && *a == (u16ch)(uint8_t)*ascii) { a++; ascii++; } return !*a && !*ascii; }
+/* UTF-8 -> UTF-16, at most max units (+ terminator); returns the units written */
+static int utf8_to_16(const char *in, u16ch *out, int max) {
+    const uint8_t *p = (const uint8_t *)in;
+    int n = 0;
+    while (*p && n < max) {
+        uint32_t c = *p++;
+        int more = c >= 0xf0 ? 3 : c >= 0xe0 ? 2 : c >= 0xc0 ? 1 : 0;
+        if (more) c &= 0x3fu >> more;
+        for (; more && (*p & 0xc0) == 0x80; more--) c = c << 6 | (*p++ & 0x3f);
+        if (c >= 0x10000) { if (n + 2 > max) break; c -= 0x10000; out[n++] = (u16ch)(0xd800 | c >> 10); out[n++] = (u16ch)(0xdc00 | (c & 0x3ff)); }
+        else out[n++] = (u16ch)c;
+    }
+    out[n] = 0;
+    return n;
+}
+/* UTF-16 -> UTF-8 into cap bytes (terminated); returns the bytes written without the terminator */
+static int utf16_to_8(const u16ch *in, char *out, int cap) {
+    int n = 0;
+    for (; *in; in++) {
+        uint32_t c = *in;
+        if (c >= 0xd800 && c < 0xdc00 && in[1] >= 0xdc00 && in[1] < 0xe000) { c = 0x10000 + ((c - 0xd800) << 10) + (in[1] - 0xdc00); in++; }
+        int k = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+        if (n + k >= cap) break;
+        if (k == 1) out[n++] = (char)c;
+        else {
+            out[n++] = (char)((k == 2 ? 0xc0 : k == 3 ? 0xe0 : 0xf0) | c >> (6 * (k - 1)));
+            for (int s = k - 2; s >= 0; s--) out[n++] = (char)(0x80 | ((c >> (6 * s)) & 0x3f));
+        }
+    }
+    if (cap) out[n] = 0;
+    return n;
+}
+
 typedef struct {
-    const wchar_t *header, *sub, *guide, *initial;
+    const u16ch *header, *sub, *guide, *initial;
     int max_len, min_len, password;
-    wchar_t text[SWKBD_MAX_CHARS + 2];
+    u16ch text[SWKBD_MAX_CHARS + 2];
 } KbdDialog;
 
-#define IDC_EDIT 1001
-#define IDC_INFO 1002
-static intptr_t kbd_proc(HWND dlg, unsigned msg, WPARAM wp, LPARAM lp) {
-    KbdDialog *k = (KbdDialog *)GetWindowLongPtrW(dlg, GWLP_USERDATA);
-    switch (msg) {
-    case WM_INITDIALOG: {
-        k = (KbdDialog *)lp;
-        SetWindowLongPtrW(dlg, GWLP_USERDATA, (intptr_t)k);
-        wchar_t info[600];
-        _snwprintf(info, 599, L"%ls%ls%ls%ls%ls", k->header, k->header[0] && k->sub[0] ? L"\r\n" : L"", k->sub,
-                   (k->header[0] || k->sub[0]) && k->guide[0] ? L"\r\n" : L"", k->guide);
-        info[599] = 0;
-        SetDlgItemTextW(dlg, IDC_INFO, info[0] ? info : L"Enter text");
-        SendDlgItemMessageW(dlg, IDC_EDIT, EM_SETLIMITTEXT, (WPARAM)k->max_len, 0);
-        if (k->password) SendDlgItemMessageW(dlg, IDC_EDIT, EM_SETPASSWORDCHAR, (WPARAM)L'*', 0);
-        SetDlgItemTextW(dlg, IDC_EDIT, k->initial);
-        SendDlgItemMessageW(dlg, IDC_EDIT, EM_SETSEL, 0, -1);
-        SetForegroundWindow(dlg);
-        SetFocus(GetDlgItem(dlg, IDC_EDIT));
-        return 0;
+/* Runs argv, its standard output into out (cap bytes, terminated, trailing newline cut); the exit status, -1 when it
+ * could not run */
+static int run_capture(char *const argv[], char *out, size_t cap) {
+    int fd[2];
+    if (pipe2(fd, O_CLOEXEC)) return -1;
+    pid_t pid = fork();
+    if (pid < 0) { close(fd[0]); close(fd[1]); return -1; }
+    if (pid == 0) {
+        dup2(fd[1], 1);
+        execvp(argv[0], argv);
+        _exit(127);
     }
-    case WM_COMMAND:
-        if (LOWORD(wp) == IDOK) {
-            GetDlgItemTextW(dlg, IDC_EDIT, k->text, SWKBD_MAX_CHARS + 1);
-            if ((int)wcslen(k->text) < k->min_len) { MessageBeep(MB_ICONWARNING); return 1; }
-            EndDialog(dlg, 1);
-            return 1;
-        }
-        if (LOWORD(wp) == IDCANCEL) { EndDialog(dlg, 0); return 1; }
-        break;
-    case WM_CLOSE: EndDialog(dlg, 0); return 1;
+    close(fd[1]);
+    size_t n = 0;
+    for (ssize_t r; n + 1 < cap && (r = read(fd[0], out + n, cap - 1 - n)) != 0;) { if (r < 0) { if (errno == EINTR) continue; break; } n += (size_t)r; }
+    close(fd[0]);
+    out[n] = 0;
+    while (n && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+static int on_path(const char *prog) {
+    const char *path = getenv("PATH");
+    char buf[PATH_MAX];
+    for (const char *p = path ? path : "/usr/bin"; p && *p;) {
+        const char *e = strchr(p, ':');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        snprintf(buf, sizeof buf, "%.*s/%s", (int)n, p, prog);
+        if (!access(buf, X_OK)) return 1;
+        p = e ? e + 1 : NULL;
     }
     return 0;
 }
-static uint8_t *tmpl_align(uint8_t *p, int a) { while ((uintptr_t)p & (uintptr_t)(a - 1)) *p++ = 0; return p; }
-static uint8_t *tmpl_wstr(uint8_t *p, const wchar_t *s) { size_t n = (wcslen(s) + 1) * sizeof(wchar_t); memcpy(p, s, n); return p + n; }
-static uint8_t *tmpl_item(uint8_t *p, uint32_t style, int x, int y, int w, int h, int id, uint16_t cls, const wchar_t *text) {
-    p = tmpl_align(p, 4);
-    DLGITEMTEMPLATE it = {style | WS_CHILD | WS_VISIBLE, 0, (short)x, (short)y, (short)w, (short)h, (uint16_t)id};
-    memcpy(p, &it, sizeof it); p += sizeof it;
-    uint16_t cl[2] = {0xffff, cls};
-    memcpy(p, cl, 4); p += 4;
-    p = tmpl_wstr(p, text);
-    *p++ = 0; *p++ = 0;                                   /* no creation data */
-    return p;
-}
+/* 1 confirmed (k->text holds the text), 0 cancelled */
 static int kbd_run_dialog(KbdDialog *k) {
-    uint8_t buf[1024], *p = buf;
-    memset(buf, 0, sizeof buf);
-    DLGTEMPLATE dt = {DS_MODALFRAME | DS_CENTER | DS_SETFONT | WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_SETFOREGROUND, WS_EX_TOPMOST, 4, 0, 0, 260, 96};
-    memcpy(p, &dt, sizeof dt); p += sizeof dt;
-    *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0;               /* no menu, default class */
-    p = tmpl_wstr(p, L"Software keyboard (smo-recomp)");
-    *p++ = 9; *p++ = 0;
-    p = tmpl_wstr(p, L"Segoe UI");
-    p = tmpl_item(p, SS_LEFT, 8, 6, 244, 34, IDC_INFO, 0x0082, L"");
-    p = tmpl_item(p, ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 8, 44, 244, 14, IDC_EDIT, 0x0081, L"");
-    p = tmpl_item(p, BS_DEFPUSHBUTTON | WS_TABSTOP, 144, 72, 50, 16, IDOK, 0x0080, L"OK");
-    p = tmpl_item(p, BS_PUSHBUTTON | WS_TABSTOP, 202, 72, 50, 16, IDCANCEL, 0x0080, L"Cancel");
-    intptr_t r = DialogBoxIndirectParamW(GetModuleHandleW(NULL), (DLGTEMPLATE *)buf, NULL, kbd_proc, (LPARAM)k);
-    if (r == -1) { printf("nn::swkbd: the text dialog could not be created (error %lu); answered as cancelled\n", GetLastError()); return 0; }
-    return (int)r;
+    char info[1600] = "", initial[SWKBD_MAX_CHARS * 4 + 4], h8[300], s8[600], g8[1100], out[SWKBD_MAX_CHARS * 4 + 64];
+    utf16_to_8(k->header, h8, sizeof h8); utf16_to_8(k->sub, s8, sizeof s8); utf16_to_8(k->guide, g8, sizeof g8);
+    utf16_to_8(k->initial, initial, sizeof initial);
+    snprintf(info, sizeof info, "%s%s%s%s%s", h8, h8[0] && s8[0] ? "\n" : "", s8, (h8[0] || s8[0]) && g8[0] ? "\n" : "", g8);
+    if (!info[0]) snprintf(info, sizeof info, "Enter text");
+    const char *title = "Software keyboard (smo-recomp)", *cmd = getenv("SMO_SWKBD_CMD");
+    for (int tries = 0; tries < 8; tries++) {
+        char prompt[1700];
+        snprintf(prompt, sizeof prompt, "%s%s", info, tries ? "\n(too short: enter more characters)" : "");
+        int r;
+        if (cmd && cmd[0]) { char *const argv[] = {(char *)cmd, (char *)title, prompt, initial, NULL}; r = run_capture(argv, out, sizeof out); }
+        else if (on_path("zenity")) {
+            char t[300], tx[1800], et[sizeof initial + 16];
+            snprintf(t, sizeof t, "--title=%s", title); snprintf(tx, sizeof tx, "--text=%s", prompt); snprintf(et, sizeof et, "--entry-text=%s", initial);
+            char *const argv[] = {"zenity", "--entry", t, tx, et, k->password ? "--hide-text" : NULL, NULL};
+            r = run_capture(argv, out, sizeof out);
+        } else if (on_path("kdialog")) {
+            char *const argv[] = {"kdialog", "--title", (char *)title, k->password ? "--password" : "--inputbox", prompt, k->password ? NULL : initial, NULL};
+            r = run_capture(argv, out, sizeof out);
+        } else { printf("nn::swkbd: no text dialog program (zenity or kdialog: pacman -S zenity); answered as cancelled\n"); return 0; }
+        if (r != 0) return 0;
+        int n = utf8_to_16(out, k->text, k->max_len);
+        if (n >= k->min_len) return 1;
+        snprintf(initial, sizeof initial, "%s", out);
+    }
+    return 0;
 }
-static void copy_w(wchar_t *dst, uint64_t src, int max) {
+static void copy_w(u16ch *dst, uint64_t src, int max) {
     int i = 0;
     for (; i < max; i++) { uint16_t ch = rd16(src + (uint64_t)i * 2); if (!ch) break; dst[i] = ch; }
     dst[i] = 0;
 }
 /* How this call is answered: 0 dialog, 1 cancel, 2 fixed text. */
-static int kbd_mode(wchar_t *fixed) {
+static int kbd_mode(u16ch *fixed) {
     const char *v = getenv("SMO_SWKBD");
-    if (v && strncmp(v, "text:", 5) == 0) { MultiByteToWideChar(CP_UTF8, 0, v + 5, -1, fixed, SWKBD_MAX_CHARS + 1); fixed[SWKBD_MAX_CHARS] = 0; return 2; }
+    if (v && strncmp(v, "text:", 5) == 0) { utf8_to_16(v + 5, fixed, SWKBD_MAX_CHARS); return 2; }
     if (v && strcmp(v, "cancel") == 0) return 1;
     if (v && strcmp(v, "dialog") == 0) return 0;
     if (getenv("SMO_SEQ") || getenv("SMO_PRESS") || getenv("SMO_SCRIPT")) return 1;
@@ -409,29 +450,39 @@ static int kbd_mode(wchar_t *fixed) {
 }
 /* Writes `text` into the caller's String the way the applet's storage is copied ([sdk] 0x389ff4):
  * at most bufSize bytes, always terminated. Returns the number of bytes used including the terminator. */
-static uint64_t kbd_store(uint64_t string, const wchar_t *text, int utf8) {
+static uint64_t kbd_store(uint64_t string, const u16ch *text, int utf8) {
     uint64_t ptr = rd64(string), cap = rd64(string + 8);
     if (!ptr || !cap) return 0;
     if (utf8) {
         char tmp[SWKBD_MAX_CHARS * 4 + 4];
-        int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, tmp, (int)sizeof tmp, NULL, NULL);
-        if (n <= 0) { n = 1; tmp[0] = 0; }
+        int n = utf16_to_8(text, tmp, (int)sizeof tmp) + 1;
         while ((uint64_t)n > cap) { n--; while (n > 1 && ((uint8_t)tmp[n - 1] & 0xc0) == 0x80) n--; if (n > 0) n--; tmp[n] = 0; n++; }
         memcpy((void *)(uintptr_t)ptr, tmp, (size_t)n);
         return (uint64_t)n;
     }
-    uint64_t chars = wcslen(text);
+    uint64_t chars = u16len(text);
     if ((chars + 1) * 2 > cap) chars = cap / 2 ? cap / 2 - 1 : 0;
     if (cap < 2) return 0;
     for (uint64_t i = 0; i < chars; i++) wr16(ptr + i * 2, (uint16_t)text[i]);
     wr16(ptr + chars * 2, 0);
     return (chars + 1) * 2;
 }
+static int kbd_message(const u16ch *message, int question) {      /* 1 when "Yes" */
+    char m8[3000];
+    utf16_to_8(message, m8, sizeof m8);
+    if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
+    if (!question) { SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_WARNING, "Software keyboard", m8, NULL); return 0; }
+    const SDL_MessageBoxButtonData b[2] = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 1, "Yes"}, {SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT, 0, "No"}};
+    SDL_MessageBoxData d = {SDL_MESSAGEBOX_INFORMATION, NULL, "Software keyboard", m8, 2, b, NULL};
+    int hit = 0;
+    return SDL_ShowMessageBox(&d, &hit) && hit == 1;
+}
 static void swkbd_ShowKeyboard(Ctx *c) {
     uint64_t string = A0, arg = A1;
     static KbdDialog k;                                    /* one keyboard at a time, as on the console */
     static volatile int32_t busy;
-    static wchar_t header[70], sub[140], guide[260], initial[SWKBD_MAX_CHARS + 2], fixed[SWKBD_MAX_CHARS + 2];
+    static u16ch header[70], sub[140], guide[260], initial[SWKBD_MAX_CHARS + 2], fixed[SWKBD_MAX_CHARS + 2];
+    char t8[2][1100];
     if (plat_xchg(&busy, 1)) { RET(SWKBD_RESULT_CANCELED); return; }
     copy_w(header, arg + KC_HEADER, 64);
     copy_w(sub, arg + KC_SUB, 128);
@@ -447,11 +498,12 @@ static void swkbd_ShowKeyboard(Ctx *c) {
     uint64_t callback = rd8(arg + KC_CHECK_ENABLED) ? rd64(arg + KC_CHECK_CALLBACK) : 0, check_buf = rd64(arg + ARG_CHECKBUF);
     int mode = kbd_mode(fixed);
     uint32_t result = SWKBD_RESULT_CANCELED;
-    trace_printf("     nn::swkbd::ShowKeyboard header \"%ls\" guide \"%ls\" max %d min %d%s\n", header, guide, max_len, min_len, callback ? " (text check)" : "");
+    utf16_to_8(header, t8[0], sizeof t8[0]); utf16_to_8(guide, t8[1], sizeof t8[1]);
+    trace_printf("     nn::swkbd::ShowKeyboard header \"%s\" guide \"%s\" max %d min %d%s\n", t8[0], t8[1], max_len, min_len, callback ? " (text check)" : "");
     for (int attempt = 0; attempt < 16; attempt++) {
         int confirmed;
         if (mode == 1) confirmed = 0;
-        else if (mode == 2) { wcsncpy(k.text, fixed, (size_t)max_len); k.text[max_len] = 0; confirmed = attempt == 0; }
+        else if (mode == 2) { u16ncpy(k.text, fixed, (size_t)max_len); k.text[max_len] = 0; confirmed = attempt == 0; }
         else {
             k.header = header; k.sub = sub; k.guide = guide; k.initial = initial;
             k.max_len = max_len; k.min_len = min_len; k.password = rd32(arg + KC_PASSWORD) == 1;
@@ -470,21 +522,23 @@ static void swkbd_ShowKeyboard(Ctx *c) {
             for (int i = 0; i < 12; i++) c->x[19 + i] = saved[i];
             wr64(string + 8, saved_cap);
             if (verdict) {
-                wchar_t message[1024];
-                if (utf8) { MultiByteToWideChar(CP_UTF8, 0, (const char *)(uintptr_t)check_buf, -1, message, 1023); message[1023] = 0; }
+                u16ch message[1024];
+                char m8[3000];
+                if (utf8) utf8_to_16((const char *)(uintptr_t)check_buf, message, 1023);
                 else copy_w(message, check_buf, 1000);
-                trace_printf("     nn::swkbd text check -> %d \"%ls\"\n", verdict, message);
+                utf16_to_8(message, m8, sizeof m8);
+                trace_printf("     nn::swkbd text check -> %d \"%s\"\n", verdict, m8);
                 if (mode != 0) break;                      /* a scripted answer that is refused counts as cancelled */
-                if (verdict == 2 && MessageBoxW(NULL, message, L"Software keyboard", MB_YESNO | MB_ICONQUESTION | MB_TOPMOST) == IDYES) verdict = 0;
-                else if (verdict != 2) MessageBoxW(NULL, message, L"Software keyboard", MB_OK | MB_ICONWARNING | MB_TOPMOST);
-                if (verdict) { wcsncpy(initial, k.text, SWKBD_MAX_CHARS); initial[SWKBD_MAX_CHARS] = 0; continue; }
+                if (verdict == 2 && kbd_message(message, 1)) verdict = 0;
+                else if (verdict != 2) kbd_message(message, 0);
+                if (verdict) { u16ncpy(initial, k.text, SWKBD_MAX_CHARS); initial[SWKBD_MAX_CHARS] = 0; continue; }
             }
         }
         result = 0;
         break;
     }
     if (result) trace_printf("     nn::swkbd::ShowKeyboard -> cancelled\n");
-    else trace_printf("     nn::swkbd::ShowKeyboard -> \"%ls\"\n", k.text);
+    else { char r8[SWKBD_MAX_CHARS * 4 + 4]; utf16_to_8(k.text, r8, sizeof r8); trace_printf("     nn::swkbd::ShowKeyboard -> \"%s\"\n", r8); }
     plat_xchg(&busy, 0);
     RET(result);
 }
@@ -662,25 +716,18 @@ static ImportFn h(const char *name) {
     return f;
 }
 static int guard_ok(const uint8_t *p, size_t from, size_t to, uint8_t v) { for (size_t i = from; i < to; i++) if (p[i] != v) return 0; return 1; }
-static volatile int g_kbd_test_initial_seen;
-static uint32_t kbd_test_driver(void * arg) {
-    (void)arg;
-    for (int round = 0; round < 2; round++) {
-        HWND w = NULL;
-        for (int i = 0; i < 500 && !w; i++) { plat_sleep_ms(10); w = FindWindowW(NULL, L"Software keyboard (smo-recomp)"); }
-        if (!w) return 1;
-        plat_sleep_ms(100);
-        if (round == 0) {
-            wchar_t now[64] = L"";
-            GetDlgItemTextW(w, IDC_EDIT, now, 63);
-            g_kbd_test_initial_seen = wcscmp(now, L"Mario") == 0;
-            static const wchar_t typed[] = {'Z', 0x30bc, 0};
-            SetDlgItemTextW(w, IDC_EDIT, typed);
-            PostMessageW(w, WM_COMMAND, IDOK, 0);
-        } else PostMessageW(w, WM_COMMAND, IDCANCEL, 0);
-        for (int i = 0; i < 500 && IsWindow(w); i++) plat_sleep_ms(10);
-    }
-    return 0;
+/* The dialog's stand-in for the self-test (SMO_SWKBD_CMD): the first time it is shown the initial text "Mario" it answers
+ * "Z" + U+30BC (OK), afterwards it cancels. */
+static int kbd_test_script(char *path, size_t cap) {
+    char mark[PATH_MAX];
+    snprintf(path, cap, "%sswkbd_test.sh", plat_temp_dir());
+    snprintf(mark, sizeof mark, "%sswkbd_test.done", plat_temp_dir());
+    unlink(mark);
+    FILE *f = fopen(path, "w");
+    if (!f) return 0;
+    fprintf(f, "#!/bin/sh\n[ -e '%s' ] && exit 1\n: > '%s'\n[ \"$3\" = Mario ] || exit 1\nprintf 'Z\\343\\202\\274\\n'\n", mark, mark);
+    fclose(f);
+    return chmod(path, 0755) == 0;
 }
 /* An amiibo held to the reader, in the order the game's NFC thread asks ([game] 0x95efa8): found at StartDetection with the
  * activate event signalled; Mount; TagInfo / ModelInfo; Unmount takes it away (deactivate event); searching again finds
@@ -764,25 +811,26 @@ int nnapplet_selftest(Ctx *c) {
     ok = rd32(P(buf) + KC_INITIAL_LENGTH) == 5 && rd16(P(work) + rd32(P(buf) + KC_INITIAL_OFFSET)) == 'M';
     uint64_t string[2] = {P(text), string_size};
     memset(text, 0xee, string_size + 16);
-    _putenv("SMO_SWKBD=text:Kirby");
+    setenv("SMO_SWKBD", "text:Kirby", 1);
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     ok = ok && c->x[0] == 0 && rd16(P(text)) == 'K' && rd16(P(text) + 8) == 'y' && rd16(P(text) + 10) == 0 && guard_ok(text, string_size, string_size + 16, 0xee);
-    _putenv("SMO_SWKBD=cancel");
+    setenv("SMO_SWKBD", "cancel", 1);
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     ok = ok && c->x[0] == SWKBD_RESULT_CANCELED;
-    /* the real dialog: a helper thread types into it and presses OK, then a second run is cancelled */
-    _putenv("SMO_SWKBD=dialog");
-    HANDLE helper = CreateThread(NULL, 0, kbd_test_driver, NULL, 0, NULL);
+    /* the dialog path: a stand-in program sees the initial text and types into it (OK), then a second run is cancelled */
+    char script[PATH_MAX];
+    setenv("SMO_SWKBD", "dialog", 1);
+    int script_ok = kbd_test_script(script, sizeof script);
+    setenv("SMO_SWKBD_CMD", script, 1);
     memset(text, 0xee, string_size + 16);
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
-    int dialog_ok = c->x[0] == 0 && rd16(P(text)) == 'Z' && rd16(P(text) + 2) == 0x30bc && rd16(P(text) + 4) == 0 && g_kbd_test_initial_seen;
+    int dialog_ok = script_ok && c->x[0] == 0 && rd16(P(text)) == 'Z' && rd16(P(text) + 2) == 0x30bc && rd16(P(text) + 4) == 0;
     c->x[0] = P(string); c->x[1] = P(buf); swkbd_ShowKeyboard(c);
     dialog_ok = dialog_ok && c->x[0] == SWKBD_RESULT_CANCELED;
-    WaitForSingleObject(helper, 5000);
-    CloseHandle(helper);
-    printf("  swkbd: Win32 dialog shows the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel: %s\n", dialog_ok ? "ok" : "FAILED");
+    unsetenv("SMO_SWKBD_CMD");
+    printf("  swkbd: the dialog program is shown the initial text \"Mario\", returns typed text \"Z\" + U+30BC on OK and 0x29f on Cancel: %s\n", dialog_ok ? "ok" : "FAILED");
     bad += !dialog_ok;
-    _putenv("SMO_SWKBD=");
+    unsetenv("SMO_SWKBD");
     printf("  swkbd: sizes work 0x%llx string 0x%llx; SetInitialText in the work buffer; scripted answer \"Kirby\" (UTF-16) and cancel (0x29f): %s\n",
            (unsigned long long)work_size, (unsigned long long)string_size, ok ? "ok" : "FAILED");
     bad += !ok;

@@ -1,5 +1,6 @@
 /* The host platform layer: see plat.h. Linux only. */
 #include "plat.h"
+#include <sys/wait.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -453,6 +454,24 @@ static void tmp_init(void) {
     snprintf(g_tmp, sizeof g_tmp, "%s/", d);
 }
 const char *plat_temp_dir(void) { pthread_once(&g_tmp_once, tmp_init); return g_tmp; }
+
+int plat_open_url(const char *url) {
+    pid_t pid = fork();
+    if (pid < 0) return 0;
+    if (pid == 0) {                                         /* double fork: the opener is nobody's child to wait for */
+        if (fork() == 0) {
+            setsid();
+            int fd = open("/dev/null", O_RDWR);
+            if (fd >= 0) { dup2(fd, 0); dup2(fd, 1); dup2(fd, 2); }
+            execlp("xdg-open", "xdg-open", url, (char *)NULL);
+            _exit(127);
+        }
+        _exit(0);
+    }
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
 
 void plat_exit(int code) {
     fflush(NULL);
