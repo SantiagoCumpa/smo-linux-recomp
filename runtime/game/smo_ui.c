@@ -42,8 +42,8 @@ void ui_image_free(UiImage *im) { if (im) { free(im->px); memset(im, 0, sizeof *
 /* ================================================================ files */
 uint8_t *ui_file(const char *path, size_t *size) {
     char full[PATH_MAX];
-    snprintf(full, sizeof full, "%s\\%s", fs_rom_root(), path);
-    for (char *p = full; *p; p++) if (*p == '/') *p = '\\';
+    int fs_rom_file(const char *rel, char *out);           /* nnfs.c */
+    if (!fs_rom_file(path, full)) return NULL;
     FILE *f = fopen(full, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);

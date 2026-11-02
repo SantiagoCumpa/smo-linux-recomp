@@ -151,6 +151,13 @@ static int ci_resolve(const char *root, const char *rel, char *out) {
     snprintf(out, PATH_MAX, "%s", cur);
     return 1;
 }
+/* smo_ui.c: a file of the RomFS by its path in it, found as the game's own reads find it (case-insensitive fallback) */
+int fs_rom_file(const char *rel, char *out) {
+    char full[PATH_MAX];
+    snprintf(full, sizeof full, "%s/%s", fs_rom_root(), rel);
+    if (exists(full)) { snprintf(out, PATH_MAX, "%s", full); return 1; }
+    return ci_resolve(fs_rom_root(), rel, out);
+}
 static int copy_file(const char *from, const char *to) {   /* fails when `to` exists */
     int in = open(from, O_RDONLY | O_CLOEXEC), out = in < 0 ? -1 : open(to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
     char buf[1 << 16];

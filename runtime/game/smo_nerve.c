@@ -137,8 +137,8 @@ static int exe_cmp(const void *a, const void *b) { uint64_t x = ((const ExeFn *)
  * (host_name). */
 static void nerve_load(void) {
     const char *path = getenv("SMO_FUNCTIONS");
-    FILE *f = fopen(path ? path : "..\\functions\\main_functions.tsv", "r");
-    if (!f) { printf("nerve: cannot open the function list %s (set SMO_FUNCTIONS); nerve tracking off\n", path ? path : "..\\functions\\main_functions.tsv"); return; }
+    FILE *f = fopen(path ? path : "../functions/main_functions.tsv", "r");
+    if (!f) { printf("nerve: cannot open the function list %s (set SMO_FUNCTIONS); nerve tracking off\n", path ? path : "../functions/main_functions.tsv"); return; }
     char line[4096], nm[256];
     ExeFn *exe = NULL, *host = NULL;
     uint64_t (*cand)[2] = NULL;                           /* unnamed functions of at most 0x80 bytes: start, end */

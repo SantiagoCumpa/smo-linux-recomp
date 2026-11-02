@@ -361,7 +361,7 @@ int amiibo_menu_entry(int i, uint8_t id[8], char *name, int cap) {
 int tex_write_png(const char *path, const uint8_t *rgba, int w, int h);
 static void save_shot(int opening, int k) {
     char p[400];
-    snprintf(p, sizeof p, "%s\\amiibo_menu_%d_%d.png", getenv("SMO_AMIIBO_SHOT_DIR"), opening, k);
+    snprintf(p, sizeof p, "%s/amiibo_menu_%d_%d.png", getenv("SMO_AMIIBO_SHOT_DIR"), opening, k);
     if (tex_write_png(p, M.frame.px, M.frame.w, M.frame.h) == 0) printf("amiibo menu: picture saved to %s\n", p);
 }
 

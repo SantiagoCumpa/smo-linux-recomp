@@ -1320,7 +1320,7 @@ static void shd_init(void) {
                  glCreateProgram && glLinkProgram && glProgramParameteri && glGetProgramBinary && glProgramBinary;
     if (!g_shd_mode) return;
     const char *v[3] = {(const char *)glGetString(GL_VENDOR), (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION)};
-    snprintf(g_shd_dir, sizeof g_shd_dir, "%s", e && e[0] ? e : "../cache/shaders");      /* build\\cache\\shaders when run from build\\bin */
+    snprintf(g_shd_dir, sizeof g_shd_dir, "%s", e && e[0] ? e : "../cache/shaders");      /* build/cache/shaders when run from build/bin */
     if (!(e && e[0])) plat_mkdir("../cache");
     plat_mkdir(g_shd_dir);
     g_shd_drv = 0x243F6A8885A308D3ULL;
