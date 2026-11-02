@@ -263,22 +263,32 @@ static int pos_match(const char *name) {
 
 /* al::getTrans of the keeper's parent, if the parent is an actor; 0 if a pointer on the way is null or unreadable */
 static int actor_trans(uint64_t keeper, float out[3]) {
-    __try {
-        uint64_t actor = rd64(keeper), pose = actor ? rd64(actor + 0x50) : 0;
-        if (!pose) return 0;
-        memcpy(out, (void *)(uintptr_t)(pose + 8), 12);
-        return out[0] == out[0] && out[1] == out[1] && out[2] == out[2];
-    } __except (1) { return 0; }
+    int ok = 1;
+    uint64_t actor = plat_safe_rd64(keeper, &ok), pose = actor && ok ? plat_safe_rd64(actor + 0x50, &ok) : 0;
+    if (!ok || !pose || !plat_safe_read(out, (const void *)(uintptr_t)(pose + 8), 12)) return 0;
+    return out[0] == out[0] && out[1] == out[1] && out[2] == out[2];
 }
 
 /* The class of a game object from its RTTI: vtable -> typeinfo (vtable - 8) -> the type's mangled name ("4Frog",
  * "N12_GLOBAL__N_17FooBarE", ...) -> its last component. 0 if a read faults or the name has another form (templates). */
 static int class_of(uint64_t obj, char *out, size_t n) {
-    __try {
-        uint64_t vt = rd64(obj), ti = vt ? rd64(vt - 8) : 0, nm = ti ? rd64(ti + 8) : 0;
-        const char *p = (const char *)(uintptr_t)nm, *last = NULL;
+    {
+        int ok = 1;
+        char name[256];
+        uint64_t vt = plat_safe_rd64(obj, &ok), ti = vt && ok ? plat_safe_rd64(vt - 8, &ok) : 0, nm = ti && ok ? plat_safe_rd64(ti + 8, &ok) : 0;
+        if (!ok || !nm) return 0;
+        size_t got = 0;                                   /* the name, read up to its end (or a page that cannot be read) */
+        while (got < sizeof name - 1) {
+            size_t k = 64 - ((nm + got) & 63);
+            if (k > sizeof name - 1 - got) k = sizeof name - 1 - got;
+            if (!plat_safe_read(name + got, (const void *)(uintptr_t)(nm + got), k)) break;
+            if (memchr(name + got, 0, k)) { got += k; break; }
+            got += k;
+        }
+        name[got] = 0;
+        const char *p = name, *last = NULL;
         long last_len = 0;
-        if (!p) return 0;
+        if (!got) return 0;
         int nested = *p == 'N';
         p += nested;
         while (*p >= '1' && *p <= '9') {
@@ -292,7 +302,7 @@ static int class_of(uint64_t obj, char *out, size_t n) {
         memcpy(out, last, (size_t)last_len);
         out[last_len] = 0;
         return 1;
-    } __except (1) { return 0; }
+    }
 }
 
 /* A HostType nerve (host = 1) gets its real name the first time it runs: HostTypeNrv<State> -> <Class>Nrv<State>, the
@@ -301,7 +311,9 @@ static int class_of(uint64_t obj, char *out, size_t n) {
 static void host_name(int i, uint64_t keeper) {
     char cls[200], nm[256];
     uint64_t parent = 0;
-    __try { parent = rd64(keeper); } __except (1) { parent = 0; }
+    int ok = 1;
+    parent = plat_safe_rd64(keeper, &ok);
+    if (!ok) parent = 0;
     if (!parent || !class_of(parent, cls, sizeof cls)) { g_nrv[i].host = 3; return; }
     snprintf(nm, sizeof nm, "%sNrv%s", cls, g_nrv[i].name + 11);
     g_nrv[i].log_ok = (char)filter_match(nm);
@@ -504,17 +516,11 @@ static void stage_totals(char *out, size_t n) {
     nvn_vk_counts(&fail, &miss);
     smo_audio_counts(&af, &drop, &under);
     nvn_vk_hold_counts(&holds, &hold_ms, &dummies);
-    PROCESS_MEMORY_COUNTERS_EX pm;
-    memset(&pm, 0, sizeof pm);
-    K32GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS *)&pm, sizeof pm);
-    FILETIME made, ex, k, u, now;                         /* the run's time: since the process was made */
-    GetProcessTimes(GetCurrentProcess(), &made, &ex, &k, &u);
-    GetSystemTimeAsFileTime(&now);
-    double run_s = (double)((((uint64_t)now.dwHighDateTime << 32) | now.dwLowDateTime) - (((uint64_t)made.dwHighDateTime << 32) | made.dwLowDateTime)) / 1e7;
+    double run_s = (double)(plat_ticks() - plat_start_ticks) / PLAT_TICK_HZ;     /* the run's time: since the process started */
     snprintf(out, n, "%lld frames presented, %lld Vulkan call failures, %lld calls of operations that are not implemented, imports reached %d "
              "(still stubs %d), audio device sink %lld frames, %lld samples dropped, %lld underruns, loading-screen holds %lld (%lld ms), "
              "samplers given a dummy %lld, process memory %llu MB, run time %.1f s", display_frames(), fail, miss, imports, stubs, af, drop, under,
-             holds, hold_ms, dummies, (unsigned long long)(pm.PrivateUsage >> 20), run_s);
+             holds, hold_ms, dummies, (unsigned long long)(plat_private_bytes() >> 20), run_s);
 }
 
 /* nnhid.c: when the input sequence of the entry being played is done, does a next entry follow? Else the sequence's own
@@ -660,11 +666,17 @@ const char *stage_list_begun(void) {
 void stage_init_hit(Ctx *c) {
     int first = g_stage_inits++ == 0;
     uint64_t info = c->x[1];
-    __try {
+    /* the init info and the stage's name are read without faulting (plat_safe_read); what follows only runs on an info
+     * that could be read */
+    if (plat_readable((const void *)(uintptr_t)(info + 0x18), 12)) {
         uint64_t was = rd64(info + 0x18);
         int scen = (int)rd32(info + 0x20);
         char name[96] = "?";
-        for (int i = 0; was && i < (int)sizeof name - 1; i++) { name[i] = (char)rd8(was + i); name[i + 1] = 0; if (!name[i]) break; }
+        for (int i = 0; was && i < (int)sizeof name - 1; i++) {
+            if (!plat_safe_read(&name[i], (const void *)(uintptr_t)(was + i), 1)) { name[i] = 0; break; }
+            name[i + 1] = 0;
+            if (!name[i]) break;
+        }
         if (!first && !g_list_n)                          /* SMO_START_STAGE alone: later stage scenes are only logged */
             printf("start stage: frame %lld: the game starts %s, scenario %d itself (a later stage scene: a restart after a miss?)\n", nvn_front_frame_next(), name, scen);
         if (first && g_start_stage[0]) {                  /* the scenario: the one asked for, else the stage's own (as through its door), else the game's */
@@ -678,7 +690,7 @@ void stage_init_hit(Ctx *c) {
             scen = to;
         }
         if (g_list_n) stage_list_init_seen(info, name, scen);
-    } __except (1) {
+    } else {
         printf("start stage: the scene's init info at %llx could not be read: the game's own stage starts\n", (unsigned long long)info);
     }
     fflush(stdout);
@@ -697,14 +709,11 @@ int nerve_active(const char *name) {
 /* Camera 0 of an actor's scene, as al::getCameraPos / al::getCameraAt read it: LiveActor::getCameraDirector = scene info
  * (+0xf8) -> director (+8); director +0x10 -> scene camera info, +8 -> views, view 0, +8 -> camera: position +0x38, look-at +0x44 */
 static int camera_of(uint64_t actor, float pos[3], float at[3]) {
-    __try {
-        uint64_t si = rd64(actor + 0xf8), dir = si ? rd64(si + 8) : 0, info = dir ? rd64(dir + 0x10) : 0;
-        uint64_t views = info ? rd64(info + 8) : 0, v0 = views ? rd64(views) : 0, cam = v0 ? rd64(v0 + 8) : 0;
-        if (!cam) return 0;
-        memcpy(pos, (void *)(uintptr_t)(cam + 0x38), 12);
-        memcpy(at, (void *)(uintptr_t)(cam + 0x44), 12);
-        return 1;
-    } __except (1) { return 0; }
+    int ok = 1;
+    uint64_t si = plat_safe_rd64(actor + 0xf8, &ok), dir = si && ok ? plat_safe_rd64(si + 8, &ok) : 0, info = dir && ok ? plat_safe_rd64(dir + 0x10, &ok) : 0;
+    uint64_t views = info && ok ? plat_safe_rd64(info + 8, &ok) : 0, v0 = views && ok ? plat_safe_rd64(views, &ok) : 0, cam = v0 && ok ? plat_safe_rd64(v0 + 8, &ok) : 0;
+    if (!ok || !cam) return 0;
+    return plat_safe_read(pos, (const void *)(uintptr_t)(cam + 0x38), 12) && plat_safe_read(at, (const void *)(uintptr_t)(cam + 0x44), 12);
 }
 
 /* SMO_SEQ "@goto:<x>,<z>[,<r>]" (nnhid.c): the left stick that moves the player toward the world point (x, z) on the

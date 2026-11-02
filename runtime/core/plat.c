@@ -329,6 +329,12 @@ int plat_readable(const void *addr, size_t n) {
     return 1;
 }
 
+int plat_safe_read(void *dst, const void *src, size_t n) {
+    if (!n) return 1;
+    struct iovec local = {dst, n}, remote = {(void *)src, n};
+    return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == (ssize_t)n;
+}
+
 static _Thread_local void *t_altstack;
 void plat_thread_altstack(void) {
     if (t_altstack) return;
@@ -457,7 +463,8 @@ int plat_argc;
 char **plat_argv;
 
 /* glibc calls .init_array functions with (argc, argv, envp) */
-static void plat_args(int argc, char **argv, char **envp) { (void)envp; plat_argc = argc; plat_argv = argv; }
+int64_t plat_start_ticks;
+static void plat_args(int argc, char **argv, char **envp) { (void)envp; plat_argc = argc; plat_argv = argv; plat_start_ticks = plat_ticks(); }
 __attribute__((section(".init_array"), used)) static void (*const plat_args_init)(int, char **, char **) = plat_args;
 
 /* ---- sampling another thread's stack ---- */

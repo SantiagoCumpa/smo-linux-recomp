@@ -31,6 +31,7 @@
 #include "plat.h"
 #include "hostrt.h"
 #include "sdklift.h"
+#include <SDL3/SDL.h>
 
 static unsigned long long g_mgr_by_hipc;
 
@@ -56,7 +57,7 @@ static void audio_manager_by_hipc(Ctx *c) {
 static plat_rwlock_t g_sys_lock = PLAT_RWLOCK_INIT;
 static uint64_t g_sys[MAX_SYS];                 /* started AudioRenderSystem objects */
 static int g_nsys;
-static HANDLE g_frame_thread;
+static plat_thread *g_frame_thread;
 static volatile int64_t g_frames, g_lists, g_commands_bytes;
 static uint8_t *g_proc[16];                     /* CommandListProcessor per session (host memory, zeroed) */
 
@@ -70,22 +71,20 @@ static uint64_t call1(Ctx *c, ImportFn f, uint64_t a0) { c->x[0] = a0; c->x[30] 
 static uint32_t frame_thread(void * arg) {
     (void)arg;
     static Ctx c;                                /* one frame thread: its own guest context, stack and thread block */
-    uint8_t *stack = VirtualAlloc(NULL, 0x40000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-    uint8_t *tls = VirtualAlloc(NULL, 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    uint8_t *stack = plat_alloc(NULL, 0x40000, PLAT_RW);
+    uint8_t *tls = plat_alloc(NULL, 0x10000, PLAT_RW);
     static uint8_t thread_type[0x400];
     c.x[31] = (uint64_t)(uintptr_t)(stack + 0x40000);
     c.tpidr = (uint64_t)(uintptr_t)tls;
     wr64(c.tpidr + 0x1f8, (uint64_t)(uintptr_t)thread_type);   /* Horizon thread block: ThreadType pointer at +0x1f8 */
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    plat_set_thread_name("smo_audio");
+    if (!SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL)) plat_set_nice(0, -10);   /* rtkit when it can; else nice if RLIMIT_NICE allows */
     ImportFn send = lifted(RS_SEND), rate = lifted(RS_RATE), count = lifted(RS_COUNT);
     plat_counter fq, t0, now;
     plat_qpf(&fq);
     plat_qpc(&t0);
-    /* The wait for the next frame boundary sleeps on a high-resolution timer. It used to plat_sleep_ms(1) until 2 ms before the
-     * boundary and then call SwitchToThread in a loop: 2 of every 5 ms busy on a time-critical thread (69% of a core in
-     * all, measured), taken from the game's threads when the PC is busy. The output has 120 ms queued, so a frame a
-     * fraction of a millisecond late changes nothing; the schedule stays on the performance counter. */
-    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    /* The wait for the next frame boundary sleeps until an absolute CLOCK_MONOTONIC deadline (clock_nanosleep): no busy
+     * wait. The output has 120 ms queued, so a frame a fraction of a millisecond late changes nothing. */
     double period = 0;
     long long tick = 0;                          /* frames since t0: the schedule (g_frames only counts) */
     for (;;) {
@@ -112,10 +111,8 @@ static uint32_t frame_thread(void * arg) {
             double due = frame * p;
             if (!n || t >= due) { if (t > due + 10 * p) { t0 = now; tick = 0; } break; }
             double left = due - t;
-            plat_counter rel;
-            rel.QuadPart = -(int64_t)(left * 1e7) - 1;              /* relative, 100 ns units */
-            if (timer && SetWaitableTimer(timer, &rel, 0, NULL, NULL, 0)) WaitForSingleObject(timer, 100);
-            else if (left > 0.002) plat_sleep_ms(1); else plat_yield();
+            if (left > 0.1) left = 0.1;
+            plat_sleep_until(now.QuadPart + (int64_t)(left * 1e9) + 1);
         }
         if (!n) plat_sleep_ms(1);
     }
@@ -133,7 +130,7 @@ static void rs_Start(Ctx *c) {
     if (!known && g_nsys < MAX_SYS) g_sys[g_nsys++] = sys;
     plat_rw_wunlock(&g_sys_lock);
     printf("smo_audio: renderer %llx started (%d running)\n", (unsigned long long)sys, g_nsys);
-    if (!g_frame_thread) g_frame_thread = CreateThread(NULL, 1 << 20, frame_thread, NULL, 0, NULL);
+    if (!g_frame_thread) g_frame_thread = plat_thread_start(frame_thread, NULL, 1 << 20);
 }
 static void rs_Stop(Ctx *c) {
     static ImportFn stop;
@@ -144,7 +141,8 @@ static void rs_Stop(Ctx *c) {
     plat_rw_wunlock(&g_sys_lock);
     stop(c);
 }
-/* ---- THE SOUND: the device sink's channels go to the PC through waveOut (48 kHz, 16-bit, stereo).
+/* ---- THE SOUND: the device sink's channels go to the PC through an SDL3 audio stream (48 kHz, 16-bit, stereo; PipeWire
+ * or PulseAudio underneath).
  * DeviceSinkCommand [sdk 0x18aab8 GenerateDeviceSinkCommand]: magic 0xcafebabe, u16 size 0x130, u16 type 0xf, +0x10 enabled,
  * +0x14 device name (256), +0x114 session, +0x118 sample buffer (the upsampler's output when the renderer does not run at
  * 48 kHz; 0 otherwise), +0x120 input count, +0x124 mix buffer index per channel (u8, already offset). Mix buffers are int32
@@ -152,12 +150,11 @@ static void rs_Stop(Ctx *c) {
  * gathered into blocks of 40 ms; 16 blocks in flight at most (the oldest pending audio is dropped and counted if the
  * device falls behind; a block the device finished before the next one was ready is counted as an underrun). */
 static float g_dev_volume[3];                    /* defined with its values below (the device layer) */
-#define SINK_BLOCK 1920                           /* frames per waveOut block (40 ms at 48 kHz) */
-#define SINK_NBLK 16
-static HWAVEOUT g_wo;
-static WAVEHDR g_wh[SINK_NBLK];
-static int16_t g_wbuf[SINK_NBLK][SINK_BLOCK * 2];
-static int g_wcur, g_wfill, g_wopen = -1, g_wstarted;
+#define SINK_BLOCK 1920                           /* frames per block handed to the stream (40 ms at 48 kHz) */
+#define SINK_NBLK 16                              /* blocks queued in the stream at most */
+static SDL_AudioStream *g_wo;
+static int16_t g_wbuf[SINK_BLOCK * 2];
+static int g_wfill, g_wopen = -1, g_wstarted;
 static int64_t g_sink_frames, g_sink_blocks, g_sink_dropped, g_sink_underruns;
 static uint32_t g_sink_peak;
 static FILE *g_wav;                               /* SMO_AUDIO_WAV=<file>: what goes to the device, as a WAV file (header completed at exit) */
@@ -174,42 +171,33 @@ static void wav_header(void) {
 }
 static void sink_open(void) {
     if (getenv("SMO_AUDIO_WAV")) { g_wav = fopen(getenv("SMO_AUDIO_WAV"), "wb"); if (g_wav) wav_header(); }
-    WAVEFORMATEX f = {WAVE_FORMAT_PCM, 2, 48000, 48000 * 4, 4, 16, 0};
     if (getenv("SMO_AUDIO") && !atoi(getenv("SMO_AUDIO"))) { g_wopen = 0; printf("smo_audio: sound output off (SMO_AUDIO=0)\n"); return; }
-    MMRESULT r = waveOutOpen(&g_wo, WAVE_MAPPER, &f, 0, 0, _NULL);
-    g_wopen = r == MMSYSERR_NOERROR;
-    printf("smo_audio: sound output: %s\n", g_wopen ? "waveOut, 48000 Hz, 16-bit stereo, 40 ms blocks" : "waveOutOpen FAILED: no sound");
+    SDL_AudioSpec f = {SDL_AUDIO_S16LE, 2, 48000};
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO))
+        g_wo = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &f, NULL, NULL);    /* opened paused */
+    g_wopen = g_wo != NULL;
+    if (g_wopen) printf("smo_audio: sound output: SDL %s, 48000 Hz, 16-bit stereo, 40 ms blocks\n", SDL_GetCurrentAudioDriver());
+    else printf("smo_audio: could not open the sound output (%s): no sound\n", SDL_GetError());
     if (g_wopen) {
-        waveOutPause(g_wo);
-        /* Test copies are silent, as nnaudio.c's AudioOut: only the copies a person plays (smo_native.exe, smo_user.exe)
-         * are audible. The device stays open and is fed as with sound, so the timing, the dropped-sample and underrun
+        /* Test copies are silent, as nnaudio.c's AudioOut: only the copies a person plays (smo_native, smo_user) are
+         * audible. The stream stays open and is fed as with sound, so the timing, the dropped-sample and underrun
          * counts and an SMO_AUDIO_WAV capture are the same. SMO_VOLUME=<0..100> overrides either way. */
-        char exe[PATH_MAX] = "";
-        snprintf(exe, sizeof exe, "%s", plat_exe_path());
-        const char *base = strrchr(exe, '\\') ? strrchr(exe, '\\') + 1 : exe, *vol = getenv("SMO_VOLUME");
-        int percent = vol ? atoi(vol) : (!strcasecmp(base, "smo_native.exe") || !strcasecmp(base, "smo_user.exe")) ? 100 : 0;
+        const char *base = plat_exe_name(), *vol = getenv("SMO_VOLUME");
+        int percent = vol ? atoi(vol) : (!strcmp(base, "smo_native") || !strcmp(base, "smo_user")) ? 100 : 0;
         if (percent < 0) percent = 0;
         if (percent > 100) percent = 100;
-        uint32_t level = (uint32_t)(0xffff * percent / 100);
-        waveOutSetVolume(g_wo, level | level << 16);
+        SDL_SetAudioStreamGain(g_wo, (float)percent / 100.0f);
         printf("smo_audio: host volume %d%%%s\n", percent, percent ? "" : " (test copy: silent; SMO_VOLUME=<0..100> to change)");
     }
 }
-static void sink_submit(void) {                   /* the block g_wcur is full */
-    WAVEHDR *h = &g_wh[g_wcur];
-    if (h->dwFlags & WHDR_PREPARED) waveOutUnprepareHeader(g_wo, h, sizeof *h);
-    memset(h, 0, sizeof *h);
-    h->lpData = (char *)g_wbuf[g_wcur]; h->dwBufferLength = SINK_BLOCK * 4;
-    waveOutPrepareHeader(g_wo, h, sizeof *h);
-    waveOutWrite(g_wo, h, sizeof *h);
+static int sink_queued_blocks(void) { return SDL_GetAudioStreamQueued(g_wo) / (SINK_BLOCK * 4); }
+static void sink_submit(void) {                   /* the block is full */
+    int empty = g_wstarted && SDL_GetAudioStreamQueued(g_wo) == 0;   /* everything before it already played: the device waited for us */
+    SDL_PutAudioStreamData(g_wo, g_wbuf, SINK_BLOCK * 4);
     g_sink_blocks++;
-    if (!g_wstarted && g_sink_blocks >= 3) { waveOutRestart(g_wo); g_wstarted = 1; }      /* 120 ms queued before playing */
-    else if (g_wstarted) {                       /* everything before this one already played: the device waited for us */
-        int busy = 0;
-        for (int i = 0; i < SINK_NBLK; i++) if (i != g_wcur && (g_wh[i].dwFlags & WHDR_PREPARED) && !(g_wh[i].dwFlags & WHDR_DONE)) busy = 1;
-        if (!busy) g_sink_underruns++;
-    }
-    g_wcur = (g_wcur + 1) % SINK_NBLK; g_wfill = 0;
+    if (!g_wstarted && g_sink_blocks >= 3) { SDL_ResumeAudioStreamDevice(g_wo); g_wstarted = 1; }      /* 120 ms queued before playing */
+    else if (empty) g_sink_underruns++;
+    g_wfill = 0;
 }
 /* The command header and the device sink command, as each SDK writes them:
  *   3.5.1 [sdk 0x18aab8 GenerateDeviceSinkCommand]: {u32 magic 0xcafebabe, u16 size, u16 type (0xf: device sink), u32
@@ -257,8 +245,8 @@ static void audio_sink_out(const Sink *s, uint64_t mb, uint32_t ns) {
         l *= vol; r *= vol;
         int32_t li = (int32_t)(l < -32768.f ? -32768.f : l > 32767.f ? 32767.f : l), ri = (int32_t)(r < -32768.f ? -32768.f : r > 32767.f ? 32767.f : r);
         uint32_t a = (uint32_t)(li < 0 ? -li : li); if (a > g_sink_peak) g_sink_peak = a;
-        if (g_wfill == 0 && (g_wh[g_wcur].dwFlags & WHDR_PREPARED) && !(g_wh[g_wcur].dwFlags & WHDR_DONE)) { g_sink_dropped += ns - i; return; }    /* all 16 blocks still queued */
-        g_wbuf[g_wcur][g_wfill * 2] = (int16_t)li; g_wbuf[g_wcur][g_wfill * 2 + 1] = (int16_t)ri;
+        if (g_wfill == 0 && sink_queued_blocks() >= SINK_NBLK) { g_sink_dropped += ns - i; return; }    /* all 16 blocks still queued */
+        g_wbuf[g_wfill * 2] = (int16_t)li; g_wbuf[g_wfill * 2 + 1] = (int16_t)ri;
         if (g_wav) { int16_t fr[2] = {(int16_t)li, (int16_t)ri}; fwrite(fr, 4, 1, g_wav); g_wav_frames++; }
         if (++g_wfill == SINK_BLOCK) sink_submit();
     }
@@ -326,7 +314,7 @@ static void dsp_SendCommandBuffer(Ctx *c) {
                         uint64_t ptr;
                         memcpy(&ptr, cmd + strtoul(at, NULL, 16), 8);
                         printf("\n  at +%s -> %llx:", at, (unsigned long long)ptr);
-                        __try { for (int i = 0; i < 32; i++) printf(" %02x", ((const uint8_t *)(uintptr_t)ptr)[i]); } __except (1) { printf(" (unreadable)"); }
+                        if (plat_readable((const void *)(uintptr_t)ptr, 32)) { for (int i = 0; i < 32; i++) printf(" %02x", ((const uint8_t *)(uintptr_t)ptr)[i]); } else printf(" (unreadable)");
                     }
                     printf("\n");
                 }

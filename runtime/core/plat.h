@@ -156,6 +156,14 @@ static inline void *plat_aligned_alloc(size_t size, size_t align) {
 }
 static inline void plat_aligned_free(void *p) { free(p); }
 int plat_readable(const void *addr, size_t n);              /* n bytes can be read without a fault */
+/* copies n bytes from src without ever faulting (process_vm_readv: what __try/__except reads were on Windows);
+ * 1 when all of them could be read */
+int plat_safe_read(void *dst, const void *src, size_t n);
+static inline uint64_t plat_safe_rd64(uint64_t addr, int *ok) {
+    uint64_t v = 0;
+    if (!plat_safe_read(&v, (const void *)(uintptr_t)addr, 8)) { *ok = 0; return 0; }
+    return v;
+}
 uint64_t plat_rss_bytes(void);
 uint64_t plat_private_bytes(void);                          /* resident anonymous + shared memory (RssAnon + RssShmem) */
 int plat_set_nice(pid_t tid, int nice);                     /* tid 0: this thread; 1 when the kernel took it */
@@ -180,6 +188,7 @@ void plat_exit(int code) __attribute__((noreturn));
 int plat_random(void *buf, size_t n);                     /* kernel entropy (getrandom); 1 on success */
 extern int plat_argc;                                     /* the program's arguments, from before main() */
 extern char **plat_argv;
+extern int64_t plat_start_ticks;                          /* plat_ticks() when the process started (before main) */
 
 #ifdef __cplusplus
 }
