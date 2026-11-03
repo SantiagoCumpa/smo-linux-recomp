@@ -298,6 +298,7 @@ static void apply_sched(pid_t tid, uint64_t core_mask) {     /* tid 0: the calli
 #define PRIO_IDLE 100
 static int g_nice_base = 99, g_nice_step = 1;
 static volatile int32_t g_prio_refused;
+static int batch_level(int nice);
 static void nice_range(void) {
     if (g_nice_base != 99) return;
     struct rlimit rl;
@@ -308,7 +309,7 @@ static void nice_range(void) {
     g_nice_base = lowest < -10 ? -10 : lowest;
     g_nice_step = g_nice_base <= -8 ? 3 : 1;
     printf("nn::os: thread priorities as nice values from %d in steps of %d (RLIMIT_NICE)%s\n", g_nice_base, g_nice_step,
-           console_cores() ? ", 18..31 under SCHED_IDLE" : "");
+           console_cores() ? (batch_level(g_nice_base + 4 * g_nice_step) ? ", 17 under SCHED_BATCH, 18..31 under SCHED_IDLE" : ", 18..31 under SCHED_IDLE") : "");
 }
 static int host_priority(int prio) {
     static int split = -1;                                     /* TEST ONLY, SMO_OS_PRIO17=0: 17 shares its level with 18..27 again */
@@ -324,11 +325,25 @@ static int host_priority(int prio) {
     if (level == 5 && console_cores()) return PRIO_IDLE;
     return g_nice_base + level * g_nice_step;
 }
+/* Level 4 (17) under SCHED_BATCH with the console model: a waking SCHED_BATCH thread never preempts the running one.
+ * The console runs only the highest-priority ready thread of a core, so a thread the game wakes on its own core with a
+ * lower priority waits until the waker blocks, and the game relies on it: al::AsyncFunctorThread::start [main 0x7aca60]
+ * sends the message to its thread and only then clears the thread's done flag. The main thread (16) starts the scene
+ * deletion that way on DeleteScene (17, same core); a deletion that ran and set done between the two had its done
+ * cleared again and HakoniwaStateDeleteScene waited forever after the title menu (4 of 10 boots stuck with SCHED_OTHER,
+ * which lets the woken thread run first on the shared processor). Linux allows OTHER <-> BATCH without privileges.
+ * SMO_OS_BATCH=0 turns it off. */
+static int batch_level(int nice) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SMO_OS_BATCH"); on = !e || atoi(e) != 0; }
+    return on && console_cores() && nice == g_nice_base + 4 * g_nice_step;
+}
 static void set_host_priority(pid_t tid, int prio) {        /* tid 0: the calling thread */
     int nice = host_priority(prio);
     struct sched_param sp = {0};
     if (nice == PRIO_IDLE) { sched_setscheduler(tid, SCHED_IDLE, &sp); return; }
-    if (sched_getscheduler(tid) == SCHED_IDLE && sched_setscheduler(tid, SCHED_OTHER, &sp) != 0) { plat_inc(&g_prio_refused); return; }
+    int want = batch_level(nice) ? SCHED_BATCH : SCHED_OTHER, now = sched_getscheduler(tid);
+    if (now != want && sched_setscheduler(tid, want, &sp) != 0) { plat_inc(&g_prio_refused); if (now == SCHED_IDLE) return; }
     if (setpriority(PRIO_PROCESS, (id_t)(tid ? tid : plat_tid()), nice) != 0) plat_inc(&g_prio_refused);
 }
 
@@ -355,9 +370,15 @@ static uint32_t spawner_main(void *arg) {
     }
     return 0;
 }
-static plat_thread *spawn(plat_thread_fn fn, void *arg, size_t stack) {
+/* Started from os_apply_main_sched before the main guest thread takes its own priority and core: started later from a
+ * guest thread it inherited that thread's nice value (3 for the main thread's 16, which an ordinary user cannot lower
+ * again) and its console core, and so did every guest thread it made (levels 0..3 all ran at nice 3). */
+static void spawner_start(void) {
     static int32_t started;
     if (!plat_xchg(&started, 1)) plat_thread_detach(plat_thread_start(spawner_main, NULL, 1 << 20));
+}
+static plat_thread *spawn(plat_thread_fn fn, void *arg, size_t stack) {
+    spawner_start();
     SpawnReq r = {fn, arg, stack, NULL, 0, NULL};
     plat_lock(&g_spawn_lock);
     SpawnReq **tail = &g_spawn_q;
@@ -505,6 +526,7 @@ static void process_priority(void) {
 /* boot.c, on the main guest thread before the game starts: main.npdm gives it core 0 and priority 44 - 28 = 16 */
 void os_apply_main_sched(void) {
     process_priority();
+    spawner_start();
     if (!console_cores()) return;
     apply_sched(0, 1ull << OS_DEFAULT_CORE);
     set_host_priority(0, OS_DEFAULT_PRIORITY);

@@ -4381,6 +4381,17 @@ static void tex_finalize(Ctx *c) {
         wr32(A0 + 8, 0);
         return;
     }
+    if (g_vk && t->nslots > 0) {
+        /* Still named by a texture pool entry agl has not given up: on the console that descriptor stays valid after
+         * the finalize (the GPU reads it and the texels from memory), and SMO keeps drawing the layout textures of the
+         * scene-change wipe through it for a few frames of a load before it makes them again. So the texture lives on,
+         * named only by those entries; when the last one goes, pool_ent_release hands it to the back end, which frees
+         * its image as for any texture nothing names (the maker no longer holds it: its tag is cleared below). */
+        if (texlog_on()) printf("texlog: finalize %llx host %p: still in %d pool entries, kept for them (caller %llx)\n", (unsigned long long)A0, (void *)t, t->nslots, (unsigned long long)c->x[30]);
+        wr32(A0 + 8, 0);
+        nvn_label_drop(A0);
+        return;
+    }
     plat_xchg(&t->dead, 1);
     tp_remove(t);
     if (texlog_on()) printf("texlog: finalize %llx host %p %dx%d fmt 0x%x mem %p (caller %llx)\n", (unsigned long long)A0, (void *)t, t->b.width, t->b.height, t->b.format, (void *)t->mem, (unsigned long long)c->x[30]);
@@ -5499,7 +5510,16 @@ int nvn_front_handle(TexPool *tp, SamplerPool *sp, uint64_t nh, Tex **t, View *v
     if (tid < (uint32_t)tp->count) { *t = tp->e[tid].tex; *v = tp->e[tid].view; }
     if (sp && sid < (uint32_t)sp->count && sp->used[sid]) { *p = sp->e[sid]; r |= 2; }
     plat_rw_runlock(&g_pool_lock);
-    if (*t && !(*t)->dead) r |= 1; else *t = NULL;
+    if (*t && (*t)->dead) {
+        /* The game finalized the texture and initialized a new one in the same object, on the same memory, without
+         * registering it again: on the console the slot's descriptor is still valid (the GPU reads it from memory).
+         * SMO does this with the layout textures of the scene-change wipe during a load; with no texture the wipe's
+         * black came out transparent and the old scene showed through it. The new texture serves if it is the same. */
+        Tex *d = *t, *now = d->guest ? hobj(d->guest, K_TEX) : NULL;
+        *t = now && !now->dead && now->mem == d->mem && now->b.format == d->b.format && now->b.target == d->b.target &&
+             now->b.width == d->b.width && now->b.height == d->b.height && now->b.depth == d->b.depth && now->b.levels == d->b.levels ? now : NULL;
+    }
+    if (*t) r |= 1;
     return r;
 }
 /* debug aid: why nvn_front_handle found no texture for a handle (text for the bind log of SMO_VK_PASSSHOT). */

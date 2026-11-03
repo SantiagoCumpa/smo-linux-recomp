@@ -83,19 +83,24 @@ static NvnObj *nobj(uint64_t key) {
     while (o && o->key != key) o = o->next;
     plat_rw_runlock(&g_objs_lock);
     if (o) return o;
+    NvnObj *n = calloc(1, sizeof *n);       /* outside the lock: a low-priority thread holds it as briefly as possible */
+    n->key = key;
     plat_rw_wlock(&g_objs_lock);
     o = g_objs[h];
     while (o && o->key != key) o = o->next;
-    if (!o) { o = calloc(1, sizeof *o); o->key = key; o->next = g_objs[h]; g_objs[h] = o; }
+    if (!o) { o = n; n->next = g_objs[h]; g_objs[h] = n; n = NULL; }
     plat_rw_wunlock(&g_objs_lock);
+    free(n);
     return o;
 }
 static void nobj_drop(uint64_t key) {                                   /* the object is finalized: forget what it referred to */
     unsigned h = (unsigned)((key >> 3) * 2654435761u) & (NOBJ_N - 1);
+    NvnObj *o = NULL;
     plat_rw_wlock(&g_objs_lock);
     for (NvnObj **pp = &g_objs[h]; *pp; pp = &(*pp)->next)
-        if ((*pp)->key == key) { NvnObj *o = *pp; *pp = o->next; free(o); break; }
+        if ((*pp)->key == key) { o = *pp; *pp = o->next; break; }
     plat_rw_wunlock(&g_objs_lock);
+    free(o);
 }
 void nvn_label_set(uint64_t obj, const char *text);                    /* nvn_gl.c */
 void nvn_label_drop(uint64_t obj);
@@ -280,11 +285,15 @@ void nvn_virtual_pool_report(FILE *out) {
 
 /* For nvn_gl.c: where a memory pool's storage is. */
 /* a virtual pool whose address was handed out cannot later become a direct alias (pool_map_virtual) */
+/* Called on every pool map, buffer initialisation and pool range lookup, from any thread: a shared lock, so the
+ * calls never wait for each other. With the exclusive lock, a low-priority thread (the scene initialisation thread
+ * during a stage load) that was descheduled while holding it stopped the main thread for up to a second, and the
+ * loading screen froze. Only nvnMemoryPoolMapVirtual takes the exclusive lock (at boot). */
 static void vp_note_use(uint64_t pool) {
-    plat_rw_wlock(&g_vp_lock);
+    plat_rw_rlock(&g_vp_lock);
     VPool *v = vp_find(pool);
-    if (v && !v->direct) v->used = 1;
-    plat_rw_wunlock(&g_vp_lock);
+    if (v && !v->direct && !v->used) __atomic_store_n(&v->used, 1, __ATOMIC_RELAXED);
+    plat_rw_runlock(&g_vp_lock);
 }
 int nvn_pool_range(uint64_t pool, uint64_t *mem, uint64_t *size) {
     NvnObj *p = nobj(pool);

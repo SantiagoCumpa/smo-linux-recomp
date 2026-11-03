@@ -57,6 +57,7 @@ static void audio_manager_by_hipc(Ctx *c) {
 static plat_rwlock_t g_sys_lock = PLAT_RWLOCK_INIT;
 static uint64_t g_sys[MAX_SYS];                 /* started AudioRenderSystem objects */
 static int g_nsys;
+void os_pin_host_thread(void);                    /* os_threads.c: away from the console cores */
 static plat_thread *g_frame_thread;
 static volatile int64_t g_frames, g_lists, g_commands_bytes;
 static uint8_t *g_proc[16];                     /* CommandListProcessor per session (host memory, zeroed) */
@@ -78,6 +79,10 @@ static uint32_t frame_thread(void * arg) {
     c.tpidr = (uint64_t)(uintptr_t)tls;
     wr64(c.tpidr + 0x1f8, (uint64_t)(uintptr_t)thread_type);   /* Horizon thread block: ThreadType pointer at +0x1f8 */
     plat_set_thread_name("smo_audio");
+    /* Started from a guest thread, it inherited that thread's console core; away from the console cores with the runtime's
+     * other threads (the device stream's SDL threads, made from this one, follow). On a console core it competed with the
+     * game's threads there during loading: device underruns in tests/run_cap_kingdom.py. */
+    os_pin_host_thread();
     if (!SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_TIME_CRITICAL)) plat_set_nice(0, -10);   /* rtkit when it can; else nice if RLIMIT_NICE allows */
     ImportFn send = lifted(RS_SEND), rate = lifted(RS_RATE), count = lifted(RS_COUNT);
     plat_counter fq, t0, now;
@@ -193,10 +198,29 @@ static void sink_open(void) {
 static int sink_queued_blocks(void) { return SDL_GetAudioStreamQueued(g_wo) / (SINK_BLOCK * 4); }
 static void sink_submit(void) {                   /* the block is full */
     int empty = g_wstarted && SDL_GetAudioStreamQueued(g_wo) == 0;   /* everything before it already played: the device waited for us */
+    static plat_counter last;                      /* when the block before was handed over (for the underrun lines) */
+    plat_counter now;
+    plat_qpc(&now);
     SDL_PutAudioStreamData(g_wo, g_wbuf, SINK_BLOCK * 4);
     g_sink_blocks++;
     if (!g_wstarted && g_sink_blocks >= 3) { SDL_ResumeAudioStreamDevice(g_wo); g_wstarted = 1; }      /* 120 ms queued before playing */
-    else if (empty) g_sink_underruns++;
+    else if (empty) {
+        /* The device played everything: it went on with silence (an SDL stream does not stop as waveOut did), so the
+         * 120 ms queued at the start are gone and, blocks coming at the device's own rate, would never come back: every
+         * later block found the queue empty again (305 underruns in one Cap Kingdom run after one stall at the prologue's
+         * loading). Two blocks of silence after this one put the 120 ms back: one gap for one stall. */
+        static const int16_t silence[SINK_BLOCK * 2];
+        SDL_PutAudioStreamData(g_wo, silence, sizeof silence);
+        SDL_PutAudioStreamData(g_wo, silence, sizeof silence);
+        if (++g_sink_underruns <= 50) {             /* one line per underrun (the first 50): when, and the gap since the block before */
+            extern long long nvn_front_frame_next(void);
+            plat_counter fq;
+            plat_qpf(&fq);
+            printf("smo_audio: underrun %lld at frame %lld: the device had played everything queued (%.1f ms since the block before); 80 ms of silence queued\n",
+                   (long long)g_sink_underruns, nvn_front_frame_next(), (double)(now.QuadPart - last.QuadPart) * 1000.0 / (double)fq.QuadPart);
+        }
+    }
+    last = now;
     g_wfill = 0;
 }
 /* The command header and the device sink command, as each SDK writes them:

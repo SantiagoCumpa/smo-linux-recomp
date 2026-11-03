@@ -322,7 +322,11 @@ void display_init(void) {
     SDL_SetHint(SDL_HINT_APP_NAME, "Super Mario Odyssey (smo-recomp)");
     SDL_SetHint(SDL_HINT_APP_ID, "smo-recomp");
     SDL_SetHint(SDL_HINT_VIDEO_ALLOW_SCREENSAVER, "1");
+    /* Wayland first, X11 if there is no Wayland session. SDL 3 picks X11 (Xwayland) on its own when the compositor lacks
+     * fifo-v1 / commit-timing-v1 (niri), for its FIFO pacing; this runtime presents in mailbox mode on its own 60 Hz
+     * clock and does not need them. SMO_SDL_VIDEO=<driver> or SDL_VIDEO_DRIVER chooses instead. */
     if (getenv("SMO_SDL_VIDEO")) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, getenv("SMO_SDL_VIDEO"));
+    else if (!getenv("SDL_VIDEO_DRIVER")) SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "wayland,x11");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_JOYSTICK | SDL_INIT_GAMEPAD)) { fprintf(stderr, "display: SDL_Init failed: %s\n", SDL_GetError()); plat_exit(1); }
     hitch_init();
     window_create();

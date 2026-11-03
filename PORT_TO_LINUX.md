@@ -35,18 +35,20 @@ gráfico y casi no toca Win32 salvo locks, eventos, contadores y la superficie.
 
 ## TODO
 
-**Dump (importante):** en `./dump` hay **dos NSP** sin descifrar: el juego base
-`[0100000000010000][v0]` y la actualización `[0100000000010800][v262144]` por separado. `extract.py` espera la
-carpeta ya descifrada (`exefs/` con la actualización, `romfs/` con la actualización aplicada, `control.nacp`).
-Para descifrar hacen falta las claves de la consola del usuario (`prod.keys`, no están en la máquina: no hay
-`~/.switch/`) y una herramienta (`hactool`/`hactoolnet` de AUR, no instaladas): la RomFS de la actualización es un
-parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca base> <nca update> --romfsdir ...`).
+**Dump (2026-11-02):** `./dump/switch/smo141/{exefs,romfs,control.nacp,manual}` (`--dump ./dump/switch/smo141`),
+sacado de `./dump/game.nsp` (base v0 + actualización v393216 = **1.4.1**) con `hactool`. La primera extracción del
+usuario (`dump/switch/smo`, actualización v262144 = 1.3.0) tenía la RomFS dañada; el `main` es el mismo en ambas
+(build id `b424be15…`), así que lo compilado sirvió sin cambios.
 
-> Pendiente del usuario: poner `prod.keys` (de su consola) en `./dump/prod.keys` e instalar `hactoolnet`
-> (o `hactool`) — o bien dejar el dump ya descifrado en `./dump/{exefs,romfs,control.nacp}`. Hasta entonces no se
-> puede generar `build/gen` ni enlazar; el runtime se comprueba con `clang -fsyntax-only` y un `image.h` falso
-> (`build/tmp/syncheck.py`, `build/tmp/stubgen/`).
-> Ya instalado: clang 23, lld, vulkan-headers, sdl3, shaderc, ffmpeg, freetype2, fontconfig, `.venv` con los paquetes.
+Cómo se extrajo (para repetirlo): el `hactool` de `build/tools/hactool` (SciresM, 2023) no acepta las actualizaciones
+nuevas: (1) `prod.keys` trae claves `mariko_master_kek_source_*` de 34 dígitos que lo hacen abortar → copia filtrada;
+(2) `title.keys` no tiene las del juego → se toman de los `.tik` del NSP (clave cifrada en 0x180, rights id en 0x2a0;
+tickets comunes) en un `HOME` temporal con `.switch/{prod,title}.keys`, porque `--titlekey` solo vale para el NCA
+principal y el base la busca en `title.keys`; (3) la sección BKTR nueva tiene 0x4200 bytes tras las tablas y su tabla
+AES-CTR-EX termina en el inicio de la tabla de reubicación, no en el de subsecciones: copia parcheada en
+`build/tmp/hactool-src` (acepta ambos; `HACTOOL_BKTR_LOOSE=1` salta la comprobación de tamaño). Validado: 4,666/4,666
+`.szs` Yaz0 válidos, 246 archivos cambiados y 336 nuevos respecto a la base (`build/tmp/yaz0all.py`). Las copias de
+claves y el NSP desempaquetado se borraron después.
 
 - [x] Crear `PORT_TO_LINUX.md` y la rama `linux-port`
 - [x] Fase 0 — `tools/target.py`: CLANG, extensiones `.o`/`.so`, nombres sin `.exe`
@@ -100,11 +102,64 @@ parche BKTR que se aplica sobre la del juego base (`hactoolnet --basenca <nca ba
   (pacman, `.venv`, PRIME, cachés, dump cifrado con hactoolnet), `docs/architecture.md` (plat.h, SDL3, memfd, FFmpeg,
   FreeType, sin OpenGL/WebView2/MF), `docs/debugging.md` (señales, `/proc`, nice/SCHED_IDLE, slots con flock),
   `.gitignore` (`*.so`, `smo_native`, `smo_test*`)
-- [ ] Verificación 1–2: dependencias y `setup.py --dump ./dump --check` (bloqueado: dump cifrado, ver arriba)
-- [~] Verificación 3–4: autotests, shaders, texturas, fast paths (sin dump ya pasan `check_fast_paths.py`,
-  `check_ordered.py`, `check_link.py` con la autoprueba de shaderc y la de mandos; el resto necesita la RomFS)
-- [ ] Verificación 5: jugar (`run.py play`)
-- [ ] Verificación 6–7: Cap Kingdom 13/13, stress de etapas
+- [x] Verificación 1–2: `setup.py --dump ./dump/switch/smo --check`: compila 219/219, `difftest` 23,191/23,191
+  idénticos, `linkcheck` 0 sin resolver, fn_table 54,214 MATCH
+- [x] Verificación 3–4: `SMO_IMPORT_SELFTEST` 0 fallos (amiibo y Ayuda incluidos); `SMO_SDK_SELFTEST` igual que en
+  Windows (los 2 fallos conocidos: errno, NumberLineAllocator); `check_all_shaders.py` 27,888/27,888;
+  `bntx_layout_check.py` 20,203/20,203; `check_fast_paths.py` PASS
+- [x] Verificación 5: arranque y juego con ventana (`run.py play --exe smo_native`, Joy-Con por SDL): RTX 4060,
+  audio por PipeWire, 0 fallos de Vulkan. La primera vez el juego entrega ~28k programas de shaders en la pantalla de
+  carga y se compilan todos (varios minutos); luego vienen de `build/cache`. Tres fallos de Linux encontrados y
+  arreglados (2026-11-03), ver "Correcciones tras la primera partida"
+- [x] Verificación 6: `tests/run_cap_kingdom.py` **PASS** (`capk3`): 14/14 puntos de control, 0 excepciones, 0 fallos
+  de Vulkan, 0 underruns de audio, 59.7 fps de media (mínimo 53.9). Antes de las correcciones: FAIL por 156 / 47
+  underruns (`capk1` en frío, `capk2` caliente)
+- [ ] Verificación 7: stress de etapas
+- [ ] Lanzador directo (carpeta con un binario/script que se lance sin `run.py`), pedido por el usuario
+
+### Correcciones tras la primera partida (2026-11-03)
+
+- **Juego colgado tras "Start" (4 de 10 arranques):** `HakoniwaStateDeleteSceneNrvDeleteScene` no terminaba nunca.
+  `al::AsyncFunctorThread::start` [main 0x7aca60] envía el mensaje a su hilo y *después* borra la bandera de terminado;
+  en la consola el hilo `DeleteScene` (17) no corre antes que el principal (16) en el mismo núcleo, en Linux CFS lo
+  deja adelantarse al despertar y la bandera se borraba tras terminar. Arreglo en `os_threads.c`: prioridad 17 bajo
+  `SCHED_BATCH` (un hilo BATCH no desaloja al despertar; sin privilegios). 20/20 + 10/10 arranques bien
+  (`build/tmp/bootloop.sh`). `SMO_OS_BATCH=0` lo desactiva
+- **Underruns de audio:** `smo_audio` (y los hilos de SDL que crea) heredaban el núcleo de consola del hilo invitado
+  que lo arrancó (CPU 10) y competían con los hilos de carga del juego. Ahora `os_pin_host_thread()` al arrancar.
+  Además, tras un parón el stream de SDL seguía con silencio y el colchón de 120 ms no volvía (305 underruns, uno por
+  bloque, en `capk6`): `sink_submit` mete 80 ms de silencio en cada underrun y lo registra (`smo_audio: underrun N at
+  frame F`). Resultado: `capk7`, `capk9`, `capk10`, `capk11` PASS con 0; `capk8` 1 underrun (el hilo de audio estuvo
+  296 ms sin producir en la carga de Cap Kingdom; un hueco de 80 ms).
+- **Pantallas de carga congeladas** (el juego se quedaba quieto y saltaba de golpe a la escena siguiente): el hilo
+  principal esperaba hasta ~1 s en `nvnMemoryPoolMap` (`vp_note_use`, `runtime/gfx/nvn_stub.c`), que tomaba el lock
+  exclusivo `g_vp_lock` en cada llamada. El hilo de inicialización de escena (prioridad 19 → SCHED_IDLE, mismo núcleo de
+  consola que el principal) lo tomaba y quedaba desplazado por los hilos de carga: inversión de prioridad. Ahora es lock
+  compartido (el exclusivo solo en `nvnMemoryPoolMapVirtual`, al arrancar) y `nobj` reserva/libera fuera del lock.
+  Encontrado con la pila del hilo principal (`__pthread_rwlock_wrlock` ← `vp_note_use`); `SMO_HITCH` nombra ahora la
+  función del juego también dentro de un import. `capk16`/`capk17` PASS: sin parones en la carga de Cap Kingdom (antes
+  4–6 frames de 150–900 ms), peor ventana de 300 frames 58 fps (antes 28–44). Quedan 2 frames >100 ms por partida
+  (frame 1445: render 80 ms; frame 5717: código del juego 140 ms al entrar en la torre).
+  Pendiente: 18..31 bajo SCHED_IDLE puede dar la misma inversión con otros locks del runtime.
+- **Cortinilla de cambio de escena transparente** (comparado con un vídeo del emulador: tras cerrarse la cortinilla
+  con forma de gorra reaparecía la escena anterior ~1 s en vez de negro, y al salir de la Odyssey no había cortinilla):
+  durante la carga el juego finaliza las texturas del layout de la cortinilla (256x256 y 512x512, formato 0x49) y las
+  vuelve a crear en el mismo objeto y la misma memoria sin registrarlas otra vez; sigue dibujando con los huecos del
+  pool antiguos, que en la consola siguen siendo válidos. El backend no ligaba nada (`slot N holds a DEAD texture` en
+  el log de `SMO_VK_PASSSHOT`) y el negro salía transparente. Arreglo en `runtime/gfx/nvn_gl.c`: `tex_finalize` deja
+  viva una textura que aún nombra alguna entrada de pool (se libera con el mecanismo normal cuando la última entrada
+  se va) y `nvn_front_handle` usa la textura nueva del mismo objeto si es idéntica (misma memoria, formato, tamaño).
+  Comprobado con `SMO_SHOT_RANGES` en la puerta de la torre (`capk23`): cierre, negro durante toda la carga y
+  apertura sobre la escena nueva, como en el emulador. 0 imágenes "made again".
+- Parón de audio intermitente en la carga de Cap Kingdom (frames ~1840–2100, 240–1370 ms sin producir, un hueco de
+  80 ms): 4 de 9 ejecuciones (`capk20`, `capk22`–`capk24`), sin relación con los arreglos de arriba. Sin investigar.
+- **Prioridades aplastadas:** `smo-spawner` nacía de un hilo invitado ya en nice 3 y núcleo 0; sin `RLIMIT_NICE` no
+  podía volver a 0, así que los niveles 0..3 corrían todos en nice 3. Ahora se arranca en `os_apply_main_sched` antes
+  de que el hilo principal tome su prioridad
+- **Wayland:** SDL 3 elegía X11 en niri (le faltan fifo-v1 / commit-timing-v1); `display.c` pide `wayland,x11`
+  (respeta `SDL_VIDEO_DRIVER` / `SMO_SDL_VIDEO`)
+- **Sin sonido** en la primera partida: la salida por defecto de PipeWire era HDMI; el usuario la cambió (pavucontrol)
+
 
 ## Enfoque
 

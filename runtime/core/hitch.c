@@ -129,7 +129,7 @@ static uint32_t watchdog(void * arg) {
             if (a) snprintf(key, sizeof key, "render: %s%s|%llx", s, rt_running ? "" : " (render thread not on a CPU: waiting for the driver or preempted)", (unsigned long long)a);
             else snprintf(key, sizeof key, "render: %s%s", s, rt_running ? "" : " (render thread not on a CPU: waiting for the driver or preempted)");
         } else if (imp) {
-            if (running) snprintf(key, sizeof key, "main: %s: %s|%s", import_class(imp), imp, m->note);
+            if (running) snprintf(key, sizeof key, "main: %s: %s|%s f_%llx", import_class(imp), imp, m->note, (unsigned long long)c->fn);
             else snprintf(key, sizeof key, "main: %s: %s (blocked)|%s called from %llx", import_class(imp), imp, m->note, (unsigned long long)c->import_from);
             blocked_scan = !running;
         } else snprintf(key, sizeof key, "main: lifted code%s|f_%llx", running ? "" : " (not on a CPU: preempted or page fault)", (unsigned long long)c->fn);
