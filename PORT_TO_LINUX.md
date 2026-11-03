@@ -115,10 +115,22 @@ claves y el NSP desempaquetado se borraron después.
   de Vulkan, 0 underruns de audio, 59.7 fps de media (mínimo 53.9). Antes de las correcciones: FAIL por 156 / 47
   underruns (`capk1` en frío, `capk2` caliente)
 - [ ] Verificación 7: stress de etapas
-- [ ] Lanzador directo (carpeta con un binario/script que se lance sin `run.py`), pedido por el usuario
+- [x] Lanzador directo: `tools/make_game_folder.py` compila y deja una carpeta autónoma `smo/` (ignorada por git) al
+  estilo de totk-pc-recomp: `smo/smo` (lanzador bash: PRIME, cachés y TMPDIR dentro de la carpeta, logs rotados en
+  `logs/`), `bin/`, `game/{elf,exefs}`, `romfs/`, `manual/`, `config/`, `userdata/`, `cache/{vk,nvidia,mesa}`.
+  Rehacerla actualiza `bin/` y `game/` y conserva partidas, ajustes y cachés. En btrfs las copias son reflinks (0 bytes
+  extra). Probado lanzándolo desde otra carpeta: Wayland, RTX 4060, caché de pipelines reutilizada, hasta el juego.
 
 ### Correcciones tras la primera partida (2026-11-03)
 
+- [x] Instalador CLI al estilo totk: `./smo-recomp --in_dir=<NSPs> --keys=<prod.keys> --out_dir=<carpeta> [--language=es]`
+  (`scripts/install.py`): comprueba dependencias, crea `.venv` (+ `cryptography`), usa `tools/bin/hactool` (binario estático incluido
+  en el repo: commit de totk + `tools/hactool/bktr-new-layout.patch`; `tools/build_hactool.py` lo regenera;
+  `THIRD_PARTY_NOTICES.md`), descifra con
+  `tools/extract/nsp.py` (cabeceras NCA con AES-XTS en Python, contenidos por el cnmt, claves de título de los tickets;
+  RomFS y Help con la base debajo del parche BKTR) a `build/install/dump`, ejecuta `setup.py` y `make_game_folder.py`.
+  Reanudable. Con tu `game.nsp` (base + 1.4.1 en un NSP): descifrado en 17 s, idéntico byte a byte al dump hecho a
+  mano (exefs, romfs 4972 ficheros, control.nacp, manual). Firmware no necesario; idioma opcional (`smo.env`).
 - **Juego colgado tras "Start" (4 de 10 arranques):** `HakoniwaStateDeleteSceneNrvDeleteScene` no terminaba nunca.
   `al::AsyncFunctorThread::start` [main 0x7aca60] envía el mensaje a su hilo y *después* borra la bandera de terminado;
   en la consola el hilo `DeleteScene` (17) no corre antes que el principal (16) en el mismo núcleo, en Linux CFS lo
@@ -160,6 +172,12 @@ claves y el NSP desempaquetado se borraron después.
   anterior). Encontrado partiendo los dibujos con `SMO_VK_SKIPPROG` (nuevo), traduciendo los shaders con
   `mx_all` (`MX_ALL_DUMP=1`, nuevo) y ejecutándolos en CPU con los datos del frame. `capk25` PASS; capturas de toda la
   prueba de Cap Kingdom sin cambios visibles.
+- **Lanzamiento de gorra al entrar en cada zona jugando con Joy-Con** (no pasa en Edén): los ejes del sensor de SDL se
+  pasaban al marco de Nintendo como `(-x, y, -z)`; SDL da la gravedad en +y con el mando plano, así que el juego veía
+  (0, 1, 0) en vez de (0, 0, -1) y su detector de agitado, que empieza en reposo en cada escena, lo tomaba por un
+  agitón. Ahora aceleración `(-x, z, -y)` y giro `(x, -z, y)` (`runtime/input/nnpad_sdl.c`, el convenio de yuzu/Edén).
+  Con `SMO_TEST_SIXAXIS` (nuevo, solo pruebas): `0,1,0` (lo de antes) gira y lanza la gorra 8 frames tras empezar la
+  escena; `0,0,-1` no. Autoprueba de mandos 51/51.
 - Parón de audio intermitente en la carga de Cap Kingdom (frames ~1840–2100, 240–1370 ms sin producir, un hueco de
   80 ms): 4 de 9 ejecuciones (`capk20`, `capk22`–`capk24`), sin relación con los arreglos de arriba. Sin investigar.
 - **Prioridades aplastadas:** `smo-spawner` nacía de un hilo invitado ya en nice 3 y núcleo 0; sin `RLIMIT_NICE` no

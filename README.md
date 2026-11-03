@@ -62,22 +62,28 @@ on Linux.
 - Linux x86-64 (developed on Arch Linux, Wayland) and a Vulkan 1.3 GPU (developed on NVIDIA; hybrid laptops render on
   the discrete GPU through PRIME offload; `VK_EXT_graphics_pipeline_library`, `VK_EXT_extended_dynamic_state3`,
   `VK_EXT_vertex_input_dynamic_state` and `VK_EXT_depth_clip_control` are used).
-- Your own *Super Mario Odyssey* dump at version 1.4.1: the program with the update, the RomFS with the update applied
-  and the update's control data. [`docs/building.md`](docs/building.md) lists what to dump and how to lay it out.
+- Your own *Super Mario Odyssey* files: the base game and the 1.4.1 update as NSP files (two files, or one that
+  carries both) and your console's `prod.keys`; or a decrypted dump of them ([`docs/building.md`](docs/building.md)).
 - System packages (Arch): `clang lld llvm pkgconf sdl3 vulkan-headers vulkan-icd-loader shaderc ffmpeg freetype2
   fontconfig openssl python`, and your GPU's Vulkan driver.
 
 ## Quick start
 
 ```sh
-sudo pacman -S clang lld llvm pkgconf sdl3 vulkan-headers vulkan-icd-loader shaderc ffmpeg freetype2 fontconfig openssl
-python -m venv .venv
-.venv/bin/python -m pip install lz4 capstone unicorn numpy Pillow
-.venv/bin/python scripts/setup.py --dump ./dump
-.venv/bin/python scripts/run.py play --exe smo_native --seconds 0
+sudo pacman -S clang lld llvm pkgconf sdl3 vulkan-headers vulkan-icd-loader shaderc ffmpeg freetype2 fontconfig openssl python
+./smo-recomp --in_dir=<folder with the NSP files> --keys=<prod.keys> --out_dir=<game folder> [--language=es]
+<game folder>/smo
 ```
 
-The first build takes a while (lifting and compiling the game); later runs of `setup.py` only redo what changed.
+`smo-recomp` makes the Python environment, decrypts your NSP files (with the repository's `tools/bin/hactool`) into `build/install/dump`, lifts and
+compiles the game (the first time takes a while) and makes the game folder: `smo` (the launcher), `bin/`, `game/`,
+`romfs/`, `config/`, `userdata/` (saves), `cache/`, `logs/`. Each step is skipped when its result is there, so a run that
+stopped resumes, and running it again on the same folder updates the program and keeps saves, settings and caches.
+No firmware is needed. The folder can be moved anywhere; on btrfs or XFS its copies are reflinks (no extra space).
+The language defaults to your system's; `--language` (or `SMO_LANGUAGE` in `<game folder>/smo.env`) changes it.
+
+From a decrypted dump instead (developers): `.venv/bin/python scripts/setup.py --dump ./dump`, then
+`.venv/bin/python scripts/run.py play --exe smo_native --seconds 0`, or `tools/make_game_folder.py` for a game folder.
 [`docs/building.md`](docs/building.md) has the details, settings and troubleshooting.
 
 ## Repository layout
@@ -123,8 +129,9 @@ clean, and every claim is measured.
 
 This project is not affiliated with, endorsed or sponsored by Nintendo. *Super Mario Odyssey* and *Nintendo Switch*
 are trademarks of Nintendo and are named only to say what the software works with. The repository contains only
-original source code and documentation (GPL-3.0-or-later, see [LICENSE](LICENSE)): no game code, binaries, assets,
-console keys or firmware, and it does not help anyone obtain them. Function names and addresses in comments identify
+original source code and documentation (GPL-3.0-or-later, see [LICENSE](LICENSE)) and one third-party tool, a build of
+hactool to decrypt your own files ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)): no game code, assets, console
+keys or firmware, and it does not help anyone obtain them. Function names and addresses in comments identify
 locations in the game's own executable, for interoperability; they are not game code. You must own the game and dump
 it yourself.
 

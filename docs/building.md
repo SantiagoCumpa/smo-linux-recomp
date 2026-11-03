@@ -10,9 +10,21 @@ by git). One script does all of it, in steps that resume where they stopped:
 No console keys and no firmware are needed: the dump's files are already decrypted by your console, and the build only
 converts and reads them.
 
-## What you need
+**From NSP files** (the base game and the 1.4.1 update, with your console's `prod.keys`), one command does everything,
+decrypting included, and makes a game folder to play from:
 
-- Wi## What you need
+```sh
+./smo-recomp --in_dir=<folder with the NSP files> --keys=<prod.keys> --out_dir=<game folder> [--language=es]
+```
+
+Decrypting uses `tools/bin/hactool`, a static build of hactool the repository carries
+([THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md); `tools/build_hactool.py` rebuilds it, patched with
+`tools/hactool/bktr-new-layout.patch` for the 1.4.1 update's RomFS patch). The NSP files may
+be two (base and update) or one that carries both; personalized tickets are refused (dump with a common ticket). The
+decrypted dump goes to `build/install/dump` (`tools/extract/nsp.py`), then `setup.py` and `tools/make_game_folder.py` run
+on it. `./smo-recomp --help` lists the steps; each resumes.
+
+## What you need
 
 - **Linux x86-64** (developed on Arch Linux, Wayland with niri) and a GPU with Vulkan 1.3 (developed on NVIDIA). The
   renderer uses `VK_EXT_graphics_pipeline_library`, `VK_EXT_extended_dynamic_state3`,

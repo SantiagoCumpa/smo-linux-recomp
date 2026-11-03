@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# smo-recomp: from your own Super Mario Odyssey files to a folder you play from.
+#
+#   ./smo-recomp --in_dir=<folder with the NSP files> --keys=<prod.keys> --out_dir=<game folder> [--language=es]
+#
+# The first run makes the repository's Python environment (.venv) with the packages the tools need, then runs
+# scripts/install.py, which says what each step does (./smo-recomp --help).
+set -e
+repo="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+py="$repo/.venv/bin/python"
+packages=(lz4 capstone unicorn numpy Pillow cryptography)
+if [ ! -x "$py" ]; then
+    command -v python3 >/dev/null || { echo "python3 is missing (Arch: sudo pacman -S python)" >&2; exit 1; }
+    echo "making the Python environment (.venv)"
+    python3 -m venv "$repo/.venv"
+fi
+if ! "$py" -c 'import lz4, capstone, unicorn, numpy, PIL, cryptography' 2>/dev/null; then
+    echo "installing Python packages: ${packages[*]}"
+    "$py" -m pip install --quiet --disable-pip-version-check "${packages[@]}"
+fi
+exec "$py" "$repo/scripts/install.py" "$@"

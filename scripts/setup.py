@@ -26,7 +26,7 @@ Other commands:  --status (what is done)   --steps (list)   --only <step>
 Linux only. Tools: clang and ld.lld from the PATH (or LLVM_ROOT/bin); libraries through pkg-config (sdl3, vulkan,
 shaderc, ffmpeg, freetype2, fontconfig): sudo pacman -S clang lld sdl3 vulkan-headers vulkan-icd-loader shaderc ffmpeg
 freetype2 fontconfig. Python packages in ./.venv (python -m venv .venv; .venv/bin/pip install lz4 capstone unicorn numpy
-Pillow). Then start the game with scripts/run.py.
+Pillow cryptography). Then start the game with scripts/run.py.
 """
 import argparse
 import glob
@@ -54,7 +54,8 @@ def exists(*parts):
 
 def check_deps(a):
     ok = True
-    for mod, pip in (('lz4', 'lz4'), ('capstone', 'capstone'), ('unicorn', 'unicorn'), ('numpy', 'numpy'), ('PIL', 'Pillow')):
+    for mod, pip in (('lz4', 'lz4'), ('capstone', 'capstone'), ('unicorn', 'unicorn'), ('numpy', 'numpy'), ('PIL', 'Pillow'),
+                     ('cryptography', 'cryptography')):
         try:
             importlib.import_module(mod)
         except ImportError:
