@@ -8,6 +8,8 @@
 /work/
 /cache/
 /userdata*/
+# the game folder of tools/make_game_folder.py (your game's files and saves)
+/smo/
 
 # dumps, keys, firmware
 *.nsp
@@ -68,3 +70,5 @@ functions*.json
 __pycache__/
 *.pyc
 .venv/
+# your own recordings and screenshots for bug reports (game footage: not committed)
+/assets/
