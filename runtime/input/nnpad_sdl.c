@@ -576,11 +576,16 @@ static void sensors(const Dev *d, NnPadState *o) {
     o->accel[2] = -1.0f;
     if (!d->gp || !d->has_accel || !d->has_gyro) return;
     if (!SDL_GetGamepadSensorData(d->gp, SDL_SENSOR_ACCEL, a, 3) || !SDL_GetGamepadSensorData(d->gp, SDL_SENSOR_GYRO, g, 3)) return;
-    /* SDL: x right, y up, z towards the viewer, gravity reads +z when the pad lies face up. The record at rest of nnhid.c is (0, 0, -1)
-     * for a pad lying face up, so the Nintendo frame is taken as SDL's turned 180 degrees about y: (x, y, z) -> (-x, y, -z). */
+    /* SDL (SDL_sensor.h, a gamepad held in front of you): x to the right, y to the top, z towards the player; a pad lying
+     * face up reads gravity on +y. SDL's Switch driver (SDL_hidapi_switch.c) gives (-raw y, raw z, -raw x) of the
+     * controller's IMU; the hid module's record at rest is (0, 0, -1). The Nintendo frame is therefore
+     * accel (-x, z, -y) and, the mapping being a reflection, gyro (x, -z, y): [doc] yuzu input_common/drivers/sdl_driver.cpp,
+     * the mapping Eden uses. Until 2026-11 this was (-x, y, -z) for both: a pad held level read gravity on +y, and the
+     * game's swing detector, started again at every scene with the record at rest, took the difference for a shake
+     * and threw the cap on entering each area. */
     o->has_motion = 1;
-    o->accel[0] = -a[0] / SDL_STANDARD_GRAVITY; o->accel[1] = a[1] / SDL_STANDARD_GRAVITY; o->accel[2] = -a[2] / SDL_STANDARD_GRAVITY;
-    o->gyro[0] = -g[0] / 6.2831853f; o->gyro[1] = g[1] / 6.2831853f; o->gyro[2] = -g[2] / 6.2831853f;
+    o->accel[0] = -a[0] / SDL_STANDARD_GRAVITY; o->accel[1] = a[2] / SDL_STANDARD_GRAVITY; o->accel[2] = -a[1] / SDL_STANDARD_GRAVITY;
+    o->gyro[0] = g[0] / 6.2831853f; o->gyro[1] = -g[2] / 6.2831853f; o->gyro[2] = g[1] / 6.2831853f;
 }
 static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
     float dz = EFF(d, dz), outer = EFF(d, outer), trig = EFF(d, trig);
@@ -1019,13 +1024,13 @@ int nnpad_selftest(const NnHidHooks *h) {
         h->vibrate(0, 0, 0);
         check(g_vj[0].lo == 0 && g_vj[0].hi == 0, "rumble stop reaches the pad");
         float a[3] = {9, 9, 9}, g[3] = {9, 9, 9}; int rest = 0;
-        float acc[3] = {0, 0, SDL_STANDARD_GRAVITY}, gy[3] = {0, 0, 0};
+        float acc[3] = {0, SDL_STANDARD_GRAVITY, 0}, gy[3] = {0, 0, 0};      /* lying face up: SDL reads gravity on +y */
         SDL_SendJoystickVirtualSensorData(js[0], SDL_SENSOR_ACCEL, SDL_GetTicksNS(), acc, 3);
         SDL_SendJoystickVirtualSensorData(js[0], SDL_SENSOR_GYRO, SDL_GetTicksNS(), gy, 3);
         settle();
         h->six(0, a, g, &rest);
         check(fabsf(a[0]) < 0.01f && fabsf(a[1]) < 0.01f && fabsf(a[2] + 1.0f) < 0.01f && fabsf(g[0]) + fabsf(g[1]) + fabsf(g[2]) < 0.01f && rest, "six-axis from a pad with sensors, lying still: accel (0,0,-1) G, gyro 0, at rest");
-        gy[2] = 6.2831853f;
+        gy[1] = 6.2831853f;                        /* a turn about the vertical (SDL y): the Nintendo z */
         SDL_SendJoystickVirtualSensorData(js[0], SDL_SENSOR_GYRO, SDL_GetTicksNS(), gy, 3);
         settle();
         h->six(0, a, g, &rest);

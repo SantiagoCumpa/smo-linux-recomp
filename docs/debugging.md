@@ -60,6 +60,8 @@ The end of every log has the counts that tell whether a run was healthy:
   a start takes. `SMO_VK_NVCACHE=0`: the driver's own folder. An executable of a new name, or one linked again,
   compiles everything once on its first start.
 - `SMO_VK_GLSLDUMP=<folder>` writes the GLSL of every stage translated in the run.
+- `SMO_TEST_SIXAXIS=<ax>,<ay>,<az>` (TEST ONLY): player 1 reports a still motion sensor with that acceleration (in G,
+  Nintendo frame: `0,0,-1` is a pad held level), for testing motion-dependent behaviour without a controller.
 - `SMO_VK_SKIPPROG=<n>[,<n>...]` leaves out the draws whose vertex program has one of these numbers (the `vs #n` of the
   `SMO_VK_PASSSHOT` draw log): halving the list finds the draw that makes a wrong picture. `tests/mx_all.c` with
   `MX_ALL_DUMP=1` writes the GLSL of `.mxs` stage files beside them.

@@ -1046,7 +1046,10 @@ static void hid_GetSixAxisSensorState(Ctx *c) {             /* (SixAxisSensorSta
     wr64(o, 5000000);                                        /* delta time, ns */
     wr64(o + 8, (uint64_t)g_six[id].last);                   /* sampling number */
     {   NnPadState ps;                                       /* a pad with a gyro (SDL): its acceleration (G) at +0x10 and angular velocity (revolutions/s) at +0x1c; angle and direction stay at rest */
-        if (sdl_on() && nnpad_get((int)id, &ps) && ps.has_motion) {
+        static int tst = -1; static float ta[3];             /* SMO_TEST_SIXAXIS=<ax>,<ay>,<az> (TEST ONLY): player 1 reports a still sensor with that acceleration (G, Nintendo frame) */
+        if (tst < 0) { const char *e = getenv("SMO_TEST_SIXAXIS"); tst = e && sscanf(e, "%f,%f,%f", &ta[0], &ta[1], &ta[2]) == 3; }
+        if (tst && id == 0) memcpy((void *)(uintptr_t)(o + 0x10), ta, 12);
+        else if (sdl_on() && nnpad_get((int)id, &ps) && ps.has_motion) {
             memcpy((void *)(uintptr_t)(o + 0x10), ps.accel, 12); memcpy((void *)(uintptr_t)(o + 0x1c), ps.gyro, 12);
         } else { f = -1.0f; memcpy((void *)(uintptr_t)(o + 0x18), &f, 4); }          /* acceleration z at rest */
     }
