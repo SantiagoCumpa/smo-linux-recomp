@@ -2438,6 +2438,12 @@ static void compute_dispatch_run(Prog *p, Stage *st, VStage *v, uint32_t gx, uin
 }
 /* Everything of a draw up to the draw call. topo: NVN primitive. Returns 0 when the draw cannot be done (counted as skipped). */
 static int draw_prepare(unsigned prim) {
+    {   /* debug aid SMO_VK_SKIPPROG=<n>[,<n>...]: draws whose vertex program has one of these numbers (the "vs #n" of the
+         * SMO_VK_PASSSHOT draw log) are left out, to find which draw makes a wrong picture */
+        static int nskip = -1, skip[32];
+        if (nskip < 0) { nskip = 0; const char *e = getenv("SMO_VK_SKIPPROG"); while (e && *e && nskip < 32) { skip[nskip++] = atoi(e); e = strchr(e, ','); if (e) e++; } }
+        for (int k = 0; k < nskip; k++) if (R.prog[0] && R.prog[0]->serial == skip[k]) return 0;
+    }
     {   /* with SMO_VK_PASSSHOT: the state of each draw of that frame (every draw kind passes here) */
             static int want = -2;
             want = passshot_drawlog() ? 1 : -1;
@@ -3000,6 +3006,18 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
     vtx_switches();
     if (count) vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0); else memset(g_vneed, 0, sizeof g_vneed);
     { int64_t t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
+    {   /* DEBUG (temporary) SMO_VK_DRAWARGS=<vs program>: the arguments and the vertices of its plain draws */
+        static int dp = -2; if (dp == -2) dp = getenv("SMO_VK_DRAWARGS") ? atoi(getenv("SMO_VK_DRAWARGS")) : -1;
+        if (dp >= 0 && R.prog[0] && R.prog[0]->serial == dp && passshot_frame()) {
+            printf("drawargs: frame %lld prim %u first %u count %u inst %u base_inst %u | stream0 %llx size %llx stride %u | stream1 %llx size %llx stride %u\n", nvn_front_frame_next(), prim, first, count, inst, base_inst,
+                   (unsigned long long)R.vbuf[0].addr, (unsigned long long)R.vbuf[0].size, R.vstream[0].stride, (unsigned long long)R.vbuf[1].addr, (unsigned long long)R.vbuf[1].size, R.vstream[1].stride);
+            for (uint32_t v = first; v < first + count && v < 64; v++) for (int st = 0; st < 2; st++) {
+                const float *f = (const float *)(uintptr_t)(R.vbuf[st].addr + (uint64_t)v * R.vstream[st].stride);
+                if (R.vbuf[st].addr && (uint64_t)(v + 1) * R.vstream[st].stride <= R.vbuf[st].size) printf("drawargs:   v%u s%d %g %g %g %g\n", v, st, f[0], f[1], f[2], f[3]);
+                else printf("drawargs:   v%u s%d OUTSIDE the buffer\n", v, st);
+            }
+        }
+    }
     occ_draw();
     if (R.prog[2]) gsq_begin();
     vkCmdDraw(R.cmd, count, inst, first, base_inst);
