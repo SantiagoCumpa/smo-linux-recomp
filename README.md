@@ -1,4 +1,34 @@
-# smo-recomp
+# smo-linux-recomp
+
+> **Experimental fork.** This is a fork of [Coz-0/smo-recomp](https://github.com/Coz-0/smo-recomp), the static
+> recompilation of *Super Mario Odyssey* for Windows, ported to **Linux**. The port and every change in this fork
+> (code, tools and documentation) were made **entirely with AI** (Anthropic's Claude, through Claude Code), directed
+> and play-tested by the fork's owner. Expect rough edges: it has been tested on one PC only.
+
+## About this fork
+
+- **Origin:** [Coz-0/smo-recomp](https://github.com/Coz-0/smo-recomp) (Windows). This
+  fork runs it on Linux: POSIX threads and memory, SDL3 window, sound and controllers (Wayland or X11), Vulkan
+  renderer, FFmpeg movies, FreeType fonts; plus fixes found while playing (scene-change freezes and wipes, the
+  Cascade Kingdom mist, Joy-Con motion axes) and a one-command installer from NSP files (`./smo-recomp`, below).
+  [`PORT_TO_LINUX.md`](PORT_TO_LINUX.md) records the work step by step (in Spanish).
+- **Status:** experimental. The game boots, plays and passes the scripted Cap Kingdom run at about 60 fps on the PC
+  below; other kingdoms were played by hand, not exhaustively. Known issues are listed in `PORT_TO_LINUX.md`.
+- **Made with AI:** all of the fork's commits were written by an AI coding assistant (Claude Code), from bug reports,
+  videos and screenshots of the owner's play sessions; nothing was written by hand.
+- **Tested on:**
+
+  | | |
+  |---|---|
+  | Laptop | Acer Nitro ANV15-51 |
+  | CPU | Intel Core i7-13620H (10 cores, 16 threads) |
+  | RAM | 32 GB |
+  | GPU | NVIDIA GeForce RTX 4060 Laptop (8 GB), driver 615.78; Intel UHD Graphics (Raptor Lake-P), PRIME offload |
+  | OS | Arch Linux, kernel 7.2, niri (Wayland), Mesa 26.2, SDL 3.4.18 |
+  | Controllers | keyboard, Joy-Con (Bluetooth) |
+  | Game | *Super Mario Odyssey* 1.4.1 (base game + update in one NSP) |
+
+---
 
 A native Linux x86-64 version of *Super Mario Odyssey* (1.4.1), made by **static recompilation** of the Nintendo
 Switch game, with its own runtime and a Vulkan renderer.
@@ -8,9 +38,9 @@ machine code is translated to C ahead of time and compiled for the PC; the syste
 video, input and file system the game uses are re-implemented by this project's runtime.
 
 > **This repository contains no game code, no game assets, no keys and no firmware.**
-> You need your own copy of the game, dumped from your own console. The build reads the dump's decrypted files: no
-> keys and no firmware are needed. Everything derived from the game is generated on your PC, under `build/`, and never
-> leaves it.
+> You need your own copy of the game, dumped from your own console, and your console's keys to decrypt it (no
+> firmware is needed). Everything derived from the game is generated on your PC, under `build/` and your game folder,
+> and never leaves it.
 
 ## Status
 
