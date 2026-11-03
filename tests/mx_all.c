@@ -6,7 +6,7 @@
  * compiled, not translated (by instruction or feature), refused by the compiler. Prints the first stages of each kind of
  * failure and a summary; exit status = failures.
  *
- *   mx_all <folder of .mxs> [--list]       (--list: one line per stage)
+ *   mx_all <folder of .mxs> [--list]       (--list: one line per stage; MX_ALL_DUMP=1 also writes <stage file>.glsl)
  *
  * Stage file (little endian): "MXS1", u32 stage (0 vertex, 1 fragment, 2 geometry, 3 tess control, 4 tess evaluation,
  * 5 compute), u32 code bytes, u32 constant data bytes, u32 work group x, y, z, u32 shared bytes, u32 local bytes, the
@@ -91,6 +91,10 @@ int main(int argc, char **argv) {
                 if (list) printf("NOT TRANSLATED (%s) ", out.why);
                 good_all = 0;
             } else {
+                if (getenv("MX_ALL_DUMP")) {          /* MX_ALL_DUMP=1: the translated text beside the stage file, as <name>.glsl */
+                    char gp[MAX_PATH + 8]; snprintf(gp, sizeof gp, "%s.glsl", path);
+                    FILE *g = fopen(gp, "wb"); if (g) { fputs(out.glsl, g); fclose(g); }
+                }
                 uint32_t *words = NULL;
                 size_t count = 0;
                 char log[400];

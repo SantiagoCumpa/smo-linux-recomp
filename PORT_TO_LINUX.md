@@ -151,6 +151,15 @@ claves y el NSP desempaquetado se borraron después.
   se va) y `nvn_front_handle` usa la textura nueva del mismo objeto si es idéntica (misma memoria, formato, tamaño).
   Comprobado con `SMO_SHOT_RANGES` en la puerta de la torre (`capk23`): cierre, negro durante toda la carga y
   apertura sobre la escena nueva, como en el emulador. 0 imágenes "made again".
+- **Cuña / cuadrante claro sobre la cascada de Cascade Kingdom** (bordes rectos en el centro de la pantalla, solo visible
+  sobre la neblina; Edén no lo tiene): la composición de la neblina a media resolución (programa #23652) dibuja 9
+  vértices de un rango de 36 bytes (3 vértices). El runtime copiaba los 6 restantes de la memoria del juego tras el
+  rango, y ahí había otra malla: un triángulo real del centro de la pantalla hacia arriba y a la derecha, y la neblina
+  se componía dos veces en ese cuadrante. La consola lee ceros fuera del rango (triángulos sin área). Arreglo en
+  `runtime/gfx/nvn_vk_draw.c`: lo que un dibujo lee pasado el rango son ceros (`SMO_VK_VTXGROW=2` vuelve a lo
+  anterior). Encontrado partiendo los dibujos con `SMO_VK_SKIPPROG` (nuevo), traduciendo los shaders con
+  `mx_all` (`MX_ALL_DUMP=1`, nuevo) y ejecutándolos en CPU con los datos del frame. `capk25` PASS; capturas de toda la
+  prueba de Cap Kingdom sin cambios visibles.
 - Parón de audio intermitente en la carga de Cap Kingdom (frames ~1840–2100, 240–1370 ms sin producir, un hueco de
   80 ms): 4 de 9 ejecuciones (`capk20`, `capk22`–`capk24`), sin relación con los arreglos de arriba. Sin investigar.
 - **Prioridades aplastadas:** `smo-spawner` nacía de un hilo invitado ya en nice 3 y núcleo 0; sin `RLIMIT_NICE` no

@@ -60,6 +60,9 @@ The end of every log has the counts that tell whether a run was healthy:
   a start takes. `SMO_VK_NVCACHE=0`: the driver's own folder. An executable of a new name, or one linked again,
   compiles everything once on its first start.
 - `SMO_VK_GLSLDUMP=<folder>` writes the GLSL of every stage translated in the run.
+- `SMO_VK_SKIPPROG=<n>[,<n>...]` leaves out the draws whose vertex program has one of these numbers (the `vs #n` of the
+  `SMO_VK_PASSSHOT` draw log): halving the list finds the draw that makes a wrong picture. `tests/mx_all.c` with
+  `MX_ALL_DUMP=1` writes the GLSL of `.mxs` stage files beside them.
 - `SMO_SHADERDUMP=<folder>` writes the machine code of stages that could not be translated (`vk_fail_*.bin`); with
   `SMO_VK_DUMP_MINBYTES=<n>` (stages whose GLSL is at least n bytes) or `SMO_VK_DUMP_SERIAL=<n>` (one program; serials
   change from run to run, but not between runs of the same sequence) it writes `vk_prog_*.bin` for the equivalence
@@ -167,7 +170,8 @@ The end of every log has the counts that tell whether a run was healthy:
   ring waits for the GPU at every wrap), `SMO_TEXHASH_ALL=1` (textures are hashed whatever their memory pool),
   `SMO_VK_NO_TEXBARRIER=1` (the game's fragment-order barriers are ignored), `SMO_SYNC_SUBMIT=1` (every submit waits for
   the render thread), `SMO_VK_VTXGROW=0` (vertex streams are copied only as far as the range the game bound, even when
-  the draw reads further; `SMO_VK_VTXCHECK=1` logs each kind of draw that does). `SMO_PRESENT_ASYNC=0` makes the present wait for the render thread again (by default it does not: one frame in flight);
+  the draw reads further; by default what a draw reads past the range is zeros, as on the console; `=2` takes the
+  game's memory past it instead; `SMO_VK_VTXCHECK=1` logs each kind of draw that reads past its range). `SMO_PRESENT_ASYNC=0` makes the present wait for the render thread again (by default it does not: one frame in flight);
   `SMO_VK_OCC_LOG=1` logs the conditional renders that had to wait for an occlusion result.
 
 ## Memory

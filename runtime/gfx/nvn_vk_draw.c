@@ -834,15 +834,19 @@ static void vt_layout(VTex *vt, VkImageLayout to) {
 static int64_t g_texbar, g_texbar_split, g_texbar_skip;
 /* the vertices a draw really reads. nvnCommandBufferBindVertexBuffer names a range, and some of SMO's draws read
  * past it: the composite passes of its half-size buffers (programs #12026 and #23331 in Cascade Kingdom, and 15 more at
- * the title screen) draw 9 vertices from a range of 36 bytes, 3 vertices of 12; the other 6 follow in the game's memory,
- * which is what the console reads. The copy into the stream ring stopped at the range, so the GPU took those 6 vertices
- * from whatever the ring held after it: stray triangles in the half-size buffer, upscaled into a quarter or a half of
- * the screen for a frame (the flicker: single frames with a white or pale wedge, or half the screen white; in Cascade
- * Kingdom 2 to 9 frames in 361 while the camera moved, and 0 since). Each stream is now copied as far as the draw reads:
- * the highest vertex (plain draws: first + count; indexed draws: the largest index, found once per index range and batch)
- * and, for per-instance streams, the highest instance; only inside the game's heap, and by 16 MB at most (else left as
- * bound, counted). SMO_VK_VTXGROW=0: as before; SMO_VK_VTXCHECK=1 logs each kind of draw that reads past its range. */
+ * the title screen) draw 9 vertices from a range of 36 bytes, 3 vertices of 12. The console's vertex fetch stops at
+ * the range and reads zeros past it: the 6 other vertices are all (0, 0, 0) and their triangles have no area. Copied
+ * only as far as the range, the GPU took them from whatever the ring held after it (single frames with a white or pale
+ * wedge, or half the screen white); read from the game's memory past the range (as here until 2026-11), they were the
+ * next mesh's vertices: in Cascade Kingdom (program #23652 at the waterfall) a real triangle from the screen's centre
+ * to its top and right edges, and the mist there was composited twice (a pale quarter of the screen with straight
+ * edges, where Eden shows none). So each stream the draw reads past (the highest vertex: plain draws first + count,
+ * indexed draws the largest index, found once per index range and batch; per-instance streams the highest instance;
+ * inside the game's heap and by 16 MB at most, else left as bound, counted) is copied with zeros after the range.
+ * SMO_VK_VTXGROW=2: the game's memory past the range instead; =0: left as bound; SMO_VK_VTXCHECK=1 logs each kind of
+ * draw that reads past its range. */
 static int g_vtxcheck = -1, g_vtxgrow = -1;
+static int64_t g_vtx_zeroed;                        /* streams of such draws given zeros past the range */
 static int64_t g_vtx_over, g_fr_vtxover, g_vtx_capped, g_imax_scans, g_imax_written;      /* index_max: scans, scans of a cached range a logged host write overlapped */
 static uint64_t g_vneed[16];                       /* bytes of each vertex stream the next draw reads (0: not known) */
 int smo_heap_section_offset(uint64_t addr, uint64_t size, int *section, uint64_t *offset);      /* smo_nn.c: inside the game's committed heap? */
@@ -855,7 +859,7 @@ static unsigned vattr_size(int nf) {               /* bytes of one vertex attrib
 }
 static void vtx_switches(void) {
     if (g_vtxgrow >= 0) return;
-    g_vtxgrow = !(getenv("SMO_VK_VTXGROW") && !atoi(getenv("SMO_VK_VTXGROW")));
+    g_vtxgrow = getenv("SMO_VK_VTXGROW") ? atoi(getenv("SMO_VK_VTXGROW")) : 1;
     g_vtxcheck = getenv("SMO_VK_VTXCHECK") && atoi(getenv("SMO_VK_VTXCHECK"));
 }
 /* The largest index of [addr, addr + count) of index type t (0 8-bit, 1 16-bit, 2 32-bit), restart indices left out;
@@ -932,7 +936,7 @@ static void vtx_need(uint64_t maxv, uint64_t maxi, int indexed) {
             seen[nseen].vs = vs; seen[nseen].fs = fs; seen[nseen].st = st; seen[nseen].size = R.vbuf[st].size; nseen++;
             printf("nvn_vk_vtx: frame %lld: %s draw of programs #%d/#%d reads stream %d (stride %u%s) to byte %llu, the game bound %llu%s\n",
                    nvn_front_frame_next(), indexed ? "indexed" : "plain", vs, fs, st, R.vstream[st].stride, R.vstream[st].divisor ? ", per instance" : "",
-                   (unsigned long long)g_vneed[st], (unsigned long long)R.vbuf[st].size, g_vtxgrow ? " (copied that far)" : "");
+                   (unsigned long long)g_vneed[st], (unsigned long long)R.vbuf[st].size, g_vtxgrow == 1 ? " (zeros past it)" : g_vtxgrow == 2 ? " (copied that far)" : "");
         }
         break;
     }
@@ -2533,6 +2537,18 @@ static int draw_prepare(unsigned prim) {
         BufRef b;
         voff[i] = ~0ull; vbufs[i] = R.ring;
         if (!(streams >> i & 1) || !R.vbuf[i].addr || !R.vbuf[i].size) continue;
+        if (g_vtxgrow == 1 && g_vneed[i] > R.vbuf[i].size) {
+            /* the draw reads past the range the game bound: the console's vertex fetch stops at the range and reads
+             * zeros beyond it, so the copy has the range and then zeros (see vtx_need) */
+            uint64_t sz = R.vbuf[i].size, need = g_vneed[i];
+            uint8_t *tmp = malloc((size_t)need);
+            if (tmp) {
+                memcpy(tmp, P(R.vbuf[i].addr), (size_t)sz); memset(tmp + sz, 0, (size_t)(need - sz));
+                voff[i] = ring_raw(tmp, need); vbufs[i] = R.ring;      /* in this order: a ring wrap submits */
+                free(tmp); g_vtx_zeroed++;
+                continue;
+            }
+        }
         g_rp_kind = 2; from_cb |= buf_ref(R.vbuf[i].addr, g_vtxgrow && g_vneed[i] > R.vbuf[i].size ? g_vneed[i] : R.vbuf[i].size, 1, &b);
         voff[i] = b.off; vbufs[i] = b.buf;
     }
@@ -3006,18 +3022,6 @@ static void vk_draw_arrays(unsigned prim, uint32_t first, uint32_t count, uint32
     vtx_switches();
     if (count) vtx_need((uint64_t)first + count - 1, inst ? (uint64_t)base_inst + inst - 1 : (uint64_t)base_inst, 0); else memset(g_vneed, 0, sizeof g_vneed);
     { int64_t t0 = tk(); int ok = draw_prepare(prim); g_tm[8] += tk() - t0; if (!ok) { R.frame_skipped++; nvn_front_count(1, 1); return; } }
-    {   /* DEBUG (temporary) SMO_VK_DRAWARGS=<vs program>: the arguments and the vertices of its plain draws */
-        static int dp = -2; if (dp == -2) dp = getenv("SMO_VK_DRAWARGS") ? atoi(getenv("SMO_VK_DRAWARGS")) : -1;
-        if (dp >= 0 && R.prog[0] && R.prog[0]->serial == dp && passshot_frame()) {
-            printf("drawargs: frame %lld prim %u first %u count %u inst %u base_inst %u | stream0 %llx size %llx stride %u | stream1 %llx size %llx stride %u\n", nvn_front_frame_next(), prim, first, count, inst, base_inst,
-                   (unsigned long long)R.vbuf[0].addr, (unsigned long long)R.vbuf[0].size, R.vstream[0].stride, (unsigned long long)R.vbuf[1].addr, (unsigned long long)R.vbuf[1].size, R.vstream[1].stride);
-            for (uint32_t v = first; v < first + count && v < 64; v++) for (int st = 0; st < 2; st++) {
-                const float *f = (const float *)(uintptr_t)(R.vbuf[st].addr + (uint64_t)v * R.vstream[st].stride);
-                if (R.vbuf[st].addr && (uint64_t)(v + 1) * R.vstream[st].stride <= R.vbuf[st].size) printf("drawargs:   v%u s%d %g %g %g %g\n", v, st, f[0], f[1], f[2], f[3]);
-                else printf("drawargs:   v%u s%d OUTSIDE the buffer\n", v, st);
-            }
-        }
-    }
     occ_draw();
     if (R.prog[2]) gsq_begin();
     vkCmdDraw(R.cmd, count, inst, first, base_inst);
@@ -4239,7 +4243,7 @@ static void vkd_shutdown(void) {
     R.ring = NULL;
     printf("nvn_vk: drawing part shut down: %lld images, %lld pipelines, %lld shader modules, %d samplers destroyed; %lld bytes of block space lost to fragmentation records\n", (long long)R.images, (long long)R.pipelines, (long long)R.modules, g_nsmp, (long long)g_mem_leak);
     printf("nvn_vk: draws reading vertices past the range the game bound: %lld%s, %lld left as bound (over 16 MB more); index ranges scanned for their largest index: %lld\n",
-           (long long)g_vtx_over, g_vtxgrow > 0 ? " (copied as far as they read)" : g_vtxgrow == 0 ? " (SMO_VK_VTXGROW=0: left as bound)" : "", (long long)g_vtx_capped, (long long)g_imax_scans);
+           (long long)g_vtx_over, g_vtxgrow == 1 ? " (zeros past the range, as the console reads)" : g_vtxgrow == 2 ? " (SMO_VK_VTXGROW=2: the game's memory past the range)" : g_vtxgrow == 0 ? " (SMO_VK_VTXGROW=0: left as bound)" : "", (long long)g_vtx_capped, (long long)g_imax_scans);
     printf("nvn_vk: texture barriers (nvnCommandBufferBarrier, order fragments): %lld, %lld of them inside a pass that samples its own target (the pass ended there), %lld inside other passes (nothing to do)\n", (long long)g_texbar, (long long)g_texbar_split, (long long)g_texbar_skip);
     printf("nvn_vk: stream ring: %lld wraps, %lld waits for a submission still reading the part about to be written%s\n", (long long)R.ring_wraps, (long long)g_ring_waits, g_ring_drain > 0 ? " (SMO_VK_RING_DRAIN=1: every wrap waited for the GPU)" : "");
     printf("nvn_vk: images: %lld textures made with storage use (NVN_TEXTURE_FLAGS_IMAGE), %lld storage views, %lld dispatches that wrote images; draws with a geometry stage: %lld (%lld pipelines); indirect: %lld draws, %lld dispatches\n", (long long)g_storage_tex, (long long)g_img_views, (long long)g_img_disp, (long long)g_gs_draws, (long long)g_gs_pipes, (long long)g_indirect_draws, (long long)g_indirect_disp);
