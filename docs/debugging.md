@@ -366,3 +366,12 @@ The end of every log has the counts that tell whether a run was healthy:
   their memory), with the time, the longest, how many took over 2 ms and the MB read. Measured on an RTX 4060 laptop
   (charger in, 900p) running through Sand, Cascade and Metro: 719 in 5,205 play frames, 26 ms in all, none over 2 ms;
   `tex_ahead` makes the rest during the loading screens (about 16,000 textures, 2 GB).
+- Presents run on a thread of their own, on a second queue of the GPU's family: `vkQueuePresentKHR` waits inside the
+  driver (about 3.7 ms a frame on a laptop whose NVIDIA GPU draws and whose screen is the integrated GPU's), and the
+  render thread goes on with the next frame meanwhile (tests/benchmark.py, Sand Kingdom at 900p: the render thread's
+  present 3.72 → 0.02 ms a frame). The render thread waits for a pending present before it touches the swapchain
+  (acquire, a new swapchain, shutdown); a present that finds the swapchain out of date has it made again at the next
+  frame. `SMO_VK_PRESENT_THREAD=0` presents on the render thread as before (also when the family has one queue).
+  `nvn_vk_present:` lines (every 300 frames) give the present's parts: loading barrier, acquire, submit, queue present,
+  occlusion results.
+

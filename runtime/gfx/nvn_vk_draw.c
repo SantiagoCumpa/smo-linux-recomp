@@ -336,7 +336,8 @@ static int g_occ_sync = -1, g_occ_present = -1;
 static int64_t g_occ_reports, g_occ_waits, g_occ_wait_ticks, g_occ_folds, g_occ_cond, g_occ_cond_waits, g_occ_cond_late, g_occ_present_waits, g_occ_late;
 static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (uint32_t)((g_occ_head - 1) % OCC_MAX)); g_occ_open = 0; } }
 static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
-static int64_t g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
+static int64_t g_tm[12];
+static int64_t g_pt[5];                            /* the present's parts (render thread): loading barrier, acquire, submit, vkQueuePresentKHR, occlusion results */                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static int64_t tk(void) { plat_counter t; plat_qpc(&t); return t.QuadPart; }
 static int64_t g_tk_hz(void) { static int64_t f; if (!f) { plat_counter c; plat_qpf(&c); f = c.QuadPart; } return f; }
 /* report timestamps, the clock nvn_gl.c's now_ns uses (performance counter in nanoseconds) */
@@ -3617,6 +3618,81 @@ static int g_isem;
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; } g_ovl = {.on = -1};
 /* the amiibo menu's picture (vk_menu): an image of its own, blitted over the whole swapchain image */
 static struct { VkImage img; VMem mem; VkBuffer buf; VMem bmem; VkFormat fmt; int w, h, on; } g_menu;
+/* ---- the presentation thread. vkQueuePresentKHR waits inside the driver: about 3.7 ms a frame on a laptop whose NVIDIA
+ * GPU draws and whose screen is the integrated GPU's (PRIME: the driver hands the image over before it returns), all of
+ * it on the render thread (tests/benchmark.py, Sand Kingdom at 900p). Here the render thread submits the frame and hands
+ * the present to this thread, which presents on a queue of its own (V.pqueue: a submission of the next frame never waits
+ * behind it), and goes on with the next frame. Vulkan wants the swapchain and every queue used by one thread at a time
+ * (acquire, present, vkDeviceWaitIdle): present_flush waits until no present is pending, before any of those (the next
+ * frame's acquire is normally 16 ms later: nothing to wait for). A present that finds the swapchain out of date or
+ * suboptimal sets g_sc_stale: the render thread makes it again at its next present. SMO_VK_PRESENT_THREAD=0 (or a family
+ * with one queue): presented on the render thread, as before. */
+static struct {
+    plat_lock_t lock; plat_cond_t cv;
+    int started, pending, quit;
+    uint32_t index; VkSemaphore wait;
+    plat_thread *th;
+} P = {PLAT_LOCK_INIT};
+static volatile int32_t g_sc_stale;                    /* the presentation thread found the swapchain out of date / suboptimal */
+static uint32_t present_main(void *arg) {
+    (void)arg;
+    plat_lock(&P.lock);
+    for (;;) {
+        while (!P.pending && !P.quit) plat_cond_wait_ms(&P.cv, &P.lock, 1000);
+        if (!P.pending && P.quit) break;
+        uint32_t index = P.index;
+        VkSemaphore wait = P.wait;
+        plat_unlock(&P.lock);
+        VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &wait; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
+        int64_t q0 = tk();
+        VkResult r = vkQueuePresentKHR(V.pqueue, &pr);
+        g_pt[3] += tk() - q0;
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) plat_xchg(&g_sc_stale, 1);
+        else vk_ok("vkQueuePresentKHR", r);
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) g_wd_beat = tk();      /* the watchdog's heartbeat = a frame reached the window */
+        plat_lock(&P.lock);
+        P.pending = 0;
+        plat_cond_broadcast(&P.cv);
+    }
+    plat_unlock(&P.lock);
+    return 0;
+}
+static int present_threaded(void) {
+    if (!V.pqueue) return 0;
+    if (!P.started) {
+        plat_cond_init(&P.cv);
+        P.th = plat_thread_start(present_main, NULL, 0);
+        P.started = P.th != NULL;
+        printf("nvn_vk: presents on a thread of their own (a second queue): %s (SMO_VK_PRESENT_THREAD=0: on the render thread)\n", P.started ? "yes" : "NO, the thread was not started");
+        fflush(stdout);
+        if (!P.started) V.pqueue = NULL;
+    }
+    return P.started;
+}
+static void present_flush(void) {                      /* any thread that touches the swapchain or every queue: nothing pending */
+    if (!P.started) return;
+    plat_lock(&P.lock);
+    while (P.pending) plat_cond_wait_ms(&P.cv, &P.lock, 1000);
+    plat_unlock(&P.lock);
+}
+static void present_post(uint32_t index, VkSemaphore wait) {
+    plat_lock(&P.lock);
+    while (P.pending) plat_cond_wait_ms(&P.cv, &P.lock, 1000);      /* (one at a time: the acquire before this one already waited) */
+    P.index = index; P.wait = wait; P.pending = 1;
+    plat_cond_broadcast(&P.cv);
+    plat_unlock(&P.lock);
+}
+static void present_stop(void) {
+    if (!P.started) return;
+    present_flush();
+    plat_lock(&P.lock);
+    P.quit = 1;
+    plat_cond_broadcast(&P.cv);
+    plat_unlock(&P.lock);
+    plat_thread_join(P.th, 3000);
+    P.started = 0;
+}
 /* Where a picture of sw x sh goes in the window: the largest rectangle of its shape, centred (black bars around it on a
  * window of another shape: an ultrawide or 16:10 monitor, a resized window); the whole window with aspect = stretch.
  * out: x0, y0, x1, y1. Returns 1 when it leaves part of the window uncovered (the bars must be cleared). */
@@ -4170,7 +4246,7 @@ static void vk_present2(void *arg, int progress) {
     if (j->win) for (int i = 0; i < j->win->count && i < 8; i++) wintex_note(j->win->tex[i]);
     g_ovl.bar_arg = arg;
     g_wd_where = 1;
-    loading_barrier(frame, R.frame_draws);
+    { int64_t b0 = tk(); loading_barrier(frame, R.frame_draws); g_pt[0] += tk() - b0; }
     g_wd_where = 0;
     g_ovl.bar_arg = NULL;
     g_ovl.thick = 0;
@@ -4231,6 +4307,8 @@ swap: ;
      * taken below has no pending operation (validation: VUID-vkAcquireNextImageKHR-semaphore-01779, three times,
      * all at such presents: with one submission a present the pair came round before its command buffer had been waited for) */
     if (progress) cmd_wait_all();
+    present_flush();                               /* the previous present done before the swapchain is touched (presentation thread) */
+    if (plat_xchg(&g_sc_stale, 0) && V.swapchain) { cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated); }      /* it said: out of date / suboptimal */
     /* The swapchain has the window texture's colour class: a blit between them then keeps the stored values (the OpenGL
      * path blits with FRAMEBUFFER_SRGB off). */
     VkFormat want = vt && (vt->fmt == VK_FORMAT_R8G8B8A8_SRGB || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
@@ -4257,7 +4335,9 @@ swap: ;
     plat_inc(&g_wd_try);
     if (ok) {
         g_wd_where = 2;
+        int64_t a0 = tk();
         r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, acq, NULL, &index);
+        g_pt[1] += tk() - a0;
         if (r == VK_ERROR_OUT_OF_DATE_KHR) { cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated); ok = swapchain_create(); if (ok) r = vkAcquireNextImageKHR(V.device, V.swapchain, 1000000000ull, acq, NULL, &index); }
         if (ok && r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { vk_ok("vkAcquireNextImageKHR", r); ok = 0; }
     }
@@ -4297,20 +4377,25 @@ swap: ;
         if (!g_menu.on) fps_overlay_draw(index);
         int shot = window_shot_record(index);
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        cmd_submit(acq, rend);
+        { int64_t s0 = tk(); cmd_submit(acq, rend); g_pt[2] += tk() - s0; }
         if (shot) window_shot_save();
         VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
         g_wd_where = 4;
-        r = vkQueuePresentKHR(V.queue, &pr);
-        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated); }
-        else vk_ok("vkQueuePresentKHR", r);
-        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { g_wd_beat = tk(); }      /* the watchdog's heartbeat = a frame reached the window */
+        if (present_threaded()) {                  /* the presentation thread presents; this one goes on (see present_main) */
+            present_post(index, rend);
+            if (suboptimal) plat_xchg(&g_sc_stale, 1);
+        } else {
+            { int64_t q0 = tk(); r = vkQueuePresentKHR(V.queue, &pr); g_pt[3] += tk() - q0; }
+            if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || suboptimal) { cmd_wait_all(); swapchain_destroy(); plat_inc(&g_vk_recreated); }
+            else vk_ok("vkQueuePresentKHR", r);
+            if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) { g_wd_beat = tk(); }      /* the watchdog's heartbeat = a frame reached the window */
+        }
         if (!progress) plat_inc(&g_vk_frames);
     }
     g_wd_where = 0;
     if (progress) { g_ovl_presents++; return; }
-    if (g_occ_qn) { int64_t w0 = g_occ_waits; occ_resolve(g_occ_present ? g_occ_qn : 0); g_occ_present_waits += g_occ_waits > w0; }      /* the frame's occlusion counts (read by the game in the next frame) */
+    if (g_occ_qn) { int64_t w0 = g_occ_waits, o0 = tk(); occ_resolve(g_occ_present ? g_occ_qn : 0); g_occ_present_waits += g_occ_waits > w0; g_pt[4] += tk() - o0; }      /* the frame's occlusion counts (read by the game in the next frame) */
     g_tm[4] += tk() - t_present;
     nvn_front_frame_end(R.frame_draws, R.frame_skipped, R.frame_clears);
     passshot_update();                             /* the next frame */
@@ -4351,6 +4436,11 @@ swap: ;
                (long long)frame - 300, (long long)frame, (double)(g_tm[3] - last[3]) * k, (double)(g_tm[2] - last[2]) * k, (double)(g_tm[8] - last[8]) * k, (double)(g_tm[5] - last[5]) * k, (double)(g_tm[6] - last[6]) * k,
                (double)(g_tm[0] - last[0]) * k, (double)(g_tm[1] - last[1]) * k, (double)(g_tm[7] - last[7]) * k, (double)(g_tm[4] - last[4]) * k, (double)(R.dispatches - last_disp) / 300.0, (double)(R.sets - last_sets) / 300.0, (double)(R.sets_reused - last_reused) / 300.0, (double)(R.flushes - last_flush) / 300.0, (long long)g_pipe_miss,
                (long long)(g_hold_n[0] + g_hold_n[1] + g_hold_n[2] + g_hold_n[3]), (double)(g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3]) * k * 300.0, (double)g_hold_max * k * 300.0);
+        {   static int64_t pl[5];
+            printf("nvn_vk_present: frames %lld..%lld ms/frame: loading barrier %.2f, acquire %.2f, submit %.2f, queue present %.2f, occlusion results %.2f\n", (long long)frame - 300, (long long)frame,
+                   (double)(g_pt[0] - pl[0]) * k, (double)(g_pt[1] - pl[1]) * k, (double)(g_pt[2] - pl[2]) * k, (double)(g_pt[3] - pl[3]) * k, (double)(g_pt[4] - pl[4]) * k);
+            memcpy(pl, g_pt, sizeof pl);
+        }
         if (g_gs_draws) printf("nvn_vk_gs: frames %lld..%lld: draws with a geometry stage so far %lld, their pipelines %lld\n", (long long)frame - 300, (long long)frame, (long long)g_gs_draws, (long long)g_gs_pipes);
         { static int64_t sp_last; if (g_sync_pending_cb != sp_last) printf("nvn_vk_sync: frames %lld..%lld: %lld fence waits found compute results not yet in guest memory (landed before returning)\n", (long long)frame - 300, (long long)frame, (long long)(g_sync_pending_cb - sp_last)); sp_last = g_sync_pending_cb; }
         {   static int64_t kl[5];

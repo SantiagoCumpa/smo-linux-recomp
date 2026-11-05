@@ -115,6 +115,7 @@ static struct {
     uint32_t family;
     VkDevice device;
     VkQueue queue;
+    VkQueue pqueue;                                   /* a second queue of the family for the presentation thread (nvn_vk_draw.c present_*), NULL when none */
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     VkSurfaceFormatKHR format;
@@ -230,8 +231,11 @@ int nvn_vk_gpus(char names[][128], int max, int *used) {
 
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
+static void present_flush(void);                      /* nvn_vk_draw.c: the presentation thread has nothing pending */
+static void present_stop(void);
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
+    present_flush();
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
@@ -434,10 +438,19 @@ int nvn_vk_init(void *window) {
     printf("%s\n", r == VK_INCOMPLETE ? " (list cut at 512: NO may be wrong)" : "");
     if (!has_name(dext, ndext, "VK_KHR_swapchain")) { printf("nvn_vk: the device has no VK_KHR_swapchain\n"); fflush(stdout); plat_exit(5); }
 
-    float prio = 1.0f;
+    float prio[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo qi;
     memset(&qi, 0, sizeof qi);
-    qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO; qi.queueFamilyIndex = V.family; qi.queueCount = 1; qi.pQueuePriorities = &prio;
+    int two_queues = 0;
+    {   /* the presentation thread presents on a queue of its own (present_main), so that its wait in vkQueuePresentKHR never
+         * holds the render thread's submissions: when the family has two queues and SMO_VK_PRESENT_THREAD is not 0 */
+        VkQueueFamilyProperties qf[32];
+        uint32_t nqf = 32;
+        const char *e = getenv("SMO_VK_PRESENT_THREAD");
+        vkGetPhysicalDeviceQueueFamilyProperties(V.gpu, &nqf, qf);
+        two_queues = !(e && !atoi(e)) && V.family < nqf && qf[V.family].queueCount >= 2;
+    }
+    qi.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO; qi.queueFamilyIndex = V.family; qi.queueCount = two_queues ? 2 : 1; qi.pQueuePriorities = prio;
     const char *dev_exts[1] = {"VK_KHR_swapchain"};
     VkDeviceCreateInfo di;
     memset(&di, 0, sizeof di);
@@ -446,6 +459,8 @@ int nvn_vk_init(void *window) {
     r = vkCreateDevice(V.gpu, &di, NULL, &V.device);
     if (r != VK_SUCCESS) vk_fatal("vkCreateDevice", r);
     vkGetDeviceQueue(V.device, V.family, 0, &V.queue);
+    V.pqueue = NULL;
+    if (two_queues) vkGetDeviceQueue(V.device, V.family, 1, &V.pqueue);
 
     /* surface format: 8-bit BGRA / RGBA UNORM, sRGB colour space (the window texture's values are shown as they are, as the OpenGL blit does) */
     VkSurfaceFormatKHR fmts[64];
@@ -512,6 +527,7 @@ static void wait_last_submit(void) {
 /* Clears the next swapchain image to one colour and presents it. Never waits for the display (see the present mode). */
 static void present_colour(const float rgba[4]) {
     if (!V.alive) return;
+    present_flush();
     wait_last_submit();
     if (!V.swapchain && !swapchain_create()) { plat_inc(&g_vk_skipped); return; }
     uint32_t index = 0;
@@ -579,6 +595,7 @@ void nvn_vk_flush(int finish) { if (V.alive && finish) wait_last_submit(); }
 void nvn_vk_shutdown(void) {
     if (!V.alive) return;
     V.alive = 0;
+    present_stop();                                       /* nvn_vk_draw.c: nothing pending, the thread ended (vkDeviceWaitIdle needs every queue) */
     vk_ok("vkDeviceWaitIdle", vkDeviceWaitIdle(V.device));
     vkd_shutdown();
     if (V.swapchain) vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
