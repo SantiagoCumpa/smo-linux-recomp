@@ -14,8 +14,8 @@ The folder (default: smo/ at the repository root; ignored by git, it holds your 
       game/elf/           main.elf and sdk.elf (and the other modules); game/exefs/main.npdm
       romfs/              the game's data (from your dump)
       manual/             the electronic manual, if your dump has it
-      config/             graphics.ini, controllers.ini (taken from build/config the first time, then yours)
-      userdata/           saves (taken from build/userdata the first time, then never touched)
+      config/             graphics.ini, controllers.ini (written with the defaults at the first start, then yours)
+      userdata/           saves (empty the first time, then never touched)
       cache/              shader and pipeline caches (vk/, nvidia/, mesa/; seeded from build/cache the first time)
       logs/               smo.log of the last run, smo.1.log .. smo.4.log of the runs before it
       tmp/, run/          the game's temporary files
@@ -202,17 +202,11 @@ def main():
     if os.path.isdir(manual) and (a.refresh_romfs or not os.path.isdir(os.path.join(out, 'manual'))):
         copy_tree(manual, os.path.join(out, 'manual'))
 
-    # the player's: taken the first time only
+    # the player's: made empty the first time, then never touched. Not taken from build/config and build/userdata: those
+    # are the repository's test settings and saves; the game writes graphics.ini and controllers.ini with their defaults
+    # (full screen, the game's own 900p) at its first start
     for sub in ('config', 'userdata'):
-        src, dst = T.build(sub), os.path.join(out, sub)
-        if not os.path.isdir(dst):
-            if os.path.isdir(src):
-                copy_tree(src, dst)
-                for name in os.listdir(dst):             # the save's work folders of a run that was killed
-                    if name.startswith('save.work.'):
-                        shutil.rmtree(os.path.join(dst, name), ignore_errors=True)
-            else:
-                os.makedirs(dst)
+        os.makedirs(os.path.join(out, sub), exist_ok=True)
     for sub in ('vk', 'nvidia', 'mesa'):
         src, dst = T.build('cache', sub), os.path.join(out, 'cache', sub)
         if os.path.isdir(src) and (a.refresh_cache or not os.path.isdir(dst)):
