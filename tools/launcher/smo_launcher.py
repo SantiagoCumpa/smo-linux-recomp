@@ -18,23 +18,25 @@ import subprocess
 import sys
 
 # (value written, label shown); the first entry is the default when the file does not say
-RESOLUTIONS = [('900p', '900p · 1600×900 (la del juego)'), ('720p', '720p · 1280×720'), ('1080p', '1080p · 1920×1080'),
+RESOLUTIONS = [('900p', '900p · 1600×900 (the game\'s own)'), ('720p', '720p · 1280×720'), ('1080p', '1080p · 1920×1080'),
                ('1440p', '1440p · 2560×1440 (2K)'), ('2160p', '2160p · 3840×2160 (4K)')]
-WINDOW_MODES = [('borderless_fullscreen', 'Pantalla completa'), ('fullscreen', 'Pantalla completa, siempre encima'),
-                ('borderless_window', 'Ventana sin marco'), ('windowed', 'Ventana')]
+WINDOW_MODES = [('borderless_fullscreen', 'Full screen'), ('fullscreen', 'Full screen, always on top'),
+                ('borderless_window', 'Borderless window'), ('windowed', 'Window')]
 WINDOW_SIZES = [('1280x720', '1280×720'), ('1600x900', '1600×900'), ('1920x1080', '1920×1080'), ('2560x1440', '2560×1440'),
                 ('3840x2160', '3840×2160')]
-VSYNC = [('clock', 'Reloj del juego (menor latencia)'), ('on', 'Activada'), ('off', 'Desactivada'), ('mailbox', 'Mailbox')]
-GPUS = [('auto', 'Automática (la dedicada primero)'), ('NVIDIA', 'NVIDIA'), ('AMD', 'AMD'), ('Intel', 'Intel')]
-ANISO = [('game', 'La del juego'), ('2', '2×'), ('4', '4×'), ('8', '8×'), ('16', '16×')]
-SHADER_WAIT = [('hold', 'Esperar (imagen correcta, algún tirón)'), ('skip', 'Saltar (sin tirones, faltan efectos un momento)')]
-UNFOCUSED = [('run', 'Seguir jugando'), ('pause', 'Pausar, como el menú HOME')]
-LANGUAGES = [('', 'El del sistema'), ('es', 'Español (España)'), ('es-419', 'Español (Latinoamérica)'),
+VSYNC = [('clock', 'Game clock (lowest latency)'), ('on', 'On'), ('off', 'Off'), ('mailbox', 'Mailbox')]
+GPUS = [('auto', 'Automatic (discrete first)'), ('NVIDIA', 'NVIDIA'), ('AMD', 'AMD'), ('Intel', 'Intel')]
+ANISO = [('game', 'The game\'s own'), ('2', '2×'), ('4', '4×'), ('8', '8×'), ('16', '16×')]
+SHADER_WAIT = [('hold', 'Wait (correct picture, some stutter)'), ('skip', 'Skip (no stutter, effects missing for a moment)')]
+UNFOCUSED = [('run', 'Keep playing'), ('pause', 'Pause, like the HOME menu')]
+FPS_OVERLAY = [('off', 'Off'), ('top_left', 'Top left'), ('top_right', 'Top right'), ('bottom_left', 'Bottom left'),
+               ('bottom_right', 'Bottom right')]
+LANGUAGES = [('', 'System language'), ('es', 'Español (España)'), ('es-419', 'Español (Latinoamérica)'),
              ('en-US', 'English (US)'), ('en-GB', 'English (UK)'), ('fr', 'Français'), ('fr-CA', 'Français (Canada)'),
              ('de', 'Deutsch'), ('it', 'Italiano'), ('nl', 'Nederlands'), ('ru', 'Русский'), ('ja', '日本語'),
              ('ko', '한국어'), ('zh-Hans', '简体中文'), ('zh-Hant', '繁體中文')]
 GRAPHICS_KEYS = ('resolution', 'window', 'width', 'height', 'vsync', 'gpu', 'anisotropic_filtering', 'profile',
-                 'shader_wait', 'frame_time_overlay', 'unfocused', 'screen_saver')
+                 'shader_wait', 'fps_overlay', 'frame_time_overlay', 'unfocused', 'screen_saver')
 ENV_KEYS = ('SMO_LANGUAGE', 'SMO_LAUNCHER')
 SCALE_TO_RES = {0.8: '720p', 1.0: '900p', 1.2: '1080p', 1.6: '1440p', 2.4: '2160p'}
 
@@ -141,7 +143,7 @@ class Settings:
                 return '900p'
         defaults = {'window': 'borderless_fullscreen', 'width': '1280', 'height': '720', 'vsync': 'clock', 'gpu': 'auto',
                     'anisotropic_filtering': 'game', 'profile': 'custom', 'shader_wait': 'hold',
-                    'frame_time_overlay': 'off', 'unfocused': 'run', 'screen_saver': 'off_while_playing'}
+                    'fps_overlay': 'off', 'frame_time_overlay': 'off', 'unfocused': 'run', 'screen_saver': 'off_while_playing'}
         return self.ini.get(key, defaults.get(key, ''))
 
     def set(self, key, value):
@@ -192,36 +194,40 @@ def run_window(folder):
             toolbar.add_top_bar(header)
 
             page = Adw.PreferencesPage()
-            screen = Adw.PreferencesGroup(title='Pantalla')
-            self.res = self.combo(screen, 'resolution', 'Resolución interna', RESOLUTIONS,
-                                  'A qué resolución dibuja el juego; por encima de 900p hay más detalle y más carga de GPU')
-            self.mode = self.combo(screen, 'window', 'Modo', WINDOW_MODES, 'F11 o doble clic cambian durante el juego')
+            screen = Adw.PreferencesGroup(title='Display')
+            self.res = self.combo(screen, 'resolution', 'Internal resolution', RESOLUTIONS,
+                                  'The resolution the game draws at; above 900p: more detail and more GPU load')
+            self.mode = self.combo(screen, 'window', 'Mode', WINDOW_MODES, 'F11 or a double-click switch while playing')
             size = '%sx%s' % (s.get('width'), s.get('height'))
-            self.size = self.combo_value(screen, 'Tamaño de la ventana', WINDOW_SIZES, size, 'Solo en los modos de ventana')
-            self.combo(screen, 'vsync', 'Sincronización vertical', VSYNC)
+            self.size = self.combo_value(screen, 'Window size', WINDOW_SIZES, size, 'Window modes only')
+            self.combo(screen, 'vsync', 'Vertical sync', VSYNC)
             page.add(screen)
 
-            gfx = Adw.PreferencesGroup(title='Gráficos')
-            self.combo(gfx, 'gpu', 'GPU', GPUS, 'En un portátil con dos GPU, Automática usa la dedicada')
-            self.aniso = self.combo(gfx, 'anisotropic_filtering', 'Filtrado anisotrópico', ANISO)
-            self.low = self.switch(gfx, 'profile', 'Perfil para GPU débil', ('low', 'custom'),
-                                   'Dibuja a la mitad de resolución; ignora resolución y filtrado')
-            self.combo(gfx, 'shader_wait', 'Shaders aún no preparados', SHADER_WAIT)
-            self.switch(gfx, 'frame_time_overlay', 'Tiempo por frame en el título', ('on', 'off'))
+            gfx = Adw.PreferencesGroup(title='Graphics')
+            self.combo(gfx, 'gpu', 'GPU', GPUS, 'On a laptop with two GPUs, Automatic uses the discrete one')
+            self.aniso = self.combo(gfx, 'anisotropic_filtering', 'Anisotropic filtering', ANISO)
+            self.low = self.switch(gfx, 'profile', 'Weak GPU profile', ('low', 'custom'),
+                                   'Draws at half resolution; resolution and filtering are ignored')
+            self.combo(gfx, 'shader_wait', 'Shaders not ready yet', SHADER_WAIT)
             page.add(gfx)
 
-            system = Adw.PreferencesGroup(title='Sistema')
-            self.combo(system, 'unfocused', 'Al cambiar a otra ventana', UNFOCUSED)
-            self.switch(system, 'screen_saver', 'Evitar que la pantalla se apague', ('off_while_playing', 'allow'),
-                        'Mientras la ventana del juego está activa; el mando no cuenta como actividad para el escritorio')
-            self.combo(system, 'SMO_LANGUAGE', 'Idioma del juego', LANGUAGES)
-            self.switch(system, 'SMO_LAUNCHER', 'Mostrar este launcher al iniciar', ('1', '0'),
-                        'Desactivado, ./smo inicia el juego directamente (./smo --launcher lo vuelve a mostrar)')
+            perf = Adw.PreferencesGroup(title='Performance')
+            self.combo(perf, 'fps_overlay', 'FPS counter', FPS_OVERLAY, 'F10 shows or hides it while playing')
+            self.switch(perf, 'frame_time_overlay', 'Frame time in the window title', ('on', 'off'))
+            page.add(perf)
+
+            system = Adw.PreferencesGroup(title='System')
+            self.combo(system, 'unfocused', 'When another window is active', UNFOCUSED)
+            self.switch(system, 'screen_saver', 'Keep the screen on', ('off_while_playing', 'allow'),
+                        'While the game window is active; a gamepad does not count as activity for the desktop')
+            self.combo(system, 'SMO_LANGUAGE', 'Game language', LANGUAGES)
+            self.switch(system, 'SMO_LAUNCHER', 'Show this launcher at start', ('1', '0'),
+                        'When off, ./smo starts the game directly (./smo --launcher shows it again)')
             page.add(system)
 
-            files = Adw.PreferencesGroup(title='Archivos')
-            for title, rel in (('Carpeta de partidas', os.path.join('userdata', 'save')), ('Capturas (F12)', os.path.join('userdata', 'album')),
-                               ('Último log', os.path.join('logs', 'smo.log')), ('Ajustes', 'config')):
+            files = Adw.PreferencesGroup(title='Files')
+            for title, rel in (('Saves', os.path.join('userdata', 'save')), ('Screenshots (F12)', os.path.join('userdata', 'album')),
+                               ('Last log', os.path.join('logs', 'smo.log')), ('Settings', 'config')):
                 row = Adw.ActionRow(title=title, subtitle=rel, activatable=True)
                 row.add_suffix(Gtk.Image.new_from_icon_name('document-open-symbolic'))
                 row.connect('activated', lambda _r, p=os.path.join(folder, rel): open_path(p if os.path.exists(p) else os.path.dirname(p)))
@@ -233,7 +239,7 @@ def run_window(folder):
                           margin_start=12, margin_end=12)
             self.status = Gtk.Label(xalign=0, hexpand=True, wrap=True)
             self.status.add_css_class('dim-label')
-            play = Gtk.Button(label='Jugar')
+            play = Gtk.Button(label='Play')
             play.add_css_class('suggested-action')
             play.add_css_class('pill')
             play.connect('clicked', self.on_play)
@@ -285,8 +291,8 @@ def run_window(folder):
             self.aniso.set_sensitive(not low)
             self.size.set_sensitive(self.value(self.mode) in ('borderless_window', 'windowed'))
             res = self.value(self.res)
-            self.status.set_label('Perfil para GPU débil: se dibuja a 800×450.' if low else
-                                  'Mucha carga de GPU: baja la resolución si el juego no llega a 60 fps.' if res in ('1440p', '2160p') else '')
+            self.status.set_label('Weak GPU profile: the game draws at 800×450.' if low else
+                                  'High GPU load: lower the resolution if the game does not reach 60 FPS.' if res in ('1440p', '2160p') else '')
 
         def save(self):
             for key, row in self.rows.items():
@@ -301,7 +307,7 @@ def run_window(folder):
                 self.save()
                 start_game(folder)
             except OSError as e:
-                self.status.set_label('No se pudo iniciar el juego: %s' % e)
+                self.status.set_label('Could not start the game: %s' % e)
                 return
             self.get_application().quit()
 

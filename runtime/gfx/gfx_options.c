@@ -91,9 +91,14 @@ static const char *const k_default_ini =
 ";   profile is active.\n"
 "profile = custom\n"
 "\n"
+"; fps_overlay = off | top_left | top_right | bottom_left | bottom_right\n"
+";   A frame counter drawn over the picture in that corner: frames per second and milliseconds per frame (green at 55\n"
+";   and above, yellow from 40, red below). F10 shows and hides it while the game runs.\n"
+"fps_overlay = off\n"
+"\n"
 "; frame_time_overlay = off | on\n"
 ";   on: the average frame time of the last second in the window title ('.. fps - 16.67 ms per frame') and as a\n"
-";   'frame-time:' line in the log. (Bars drawn into the picture are not implemented yet.)\n"
+";   'frame-time:' line in the log. For a counter in the picture itself: fps_overlay.\n"
 "frame_time_overlay = off\n";
 
 #define GFX_LOW_SCALE 0.5f
@@ -163,6 +168,13 @@ static void opt_load(void) {
         }
         else if (!strcasecmp(key, "screen_saver")) o->keep_awake_playing = strcasecmp(val, "allow") != 0;
         else if (!strcasecmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
+        else if (!strcasecmp(key, "fps_overlay")) {
+            static const char *const k_pos[5] = {"off", "top_left", "top_right", "bottom_left", "bottom_right"};
+            int found = -1;
+            for (int i = 0; i < 5; i++) if (!strcasecmp(val, k_pos[i])) found = i;
+            if (!strcasecmp(val, "on")) found = 3;
+            if (found < 0) unknown++; else o->fps_overlay = found;
+        }
         else if (!strcasecmp(key, "frame_time_overlay")) o->overlay = !strcasecmp(val, "on") || !strcmp(val, "1");
         else if (!strcasecmp(key, "profile")) o->profile = !strcasecmp(val, "low");
         else if (!strcasecmp(key, "shader_wait")) o->shader_skip = !strcasecmp(val, "skip");
@@ -177,9 +189,9 @@ static void opt_load(void) {
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
     static const char *const k_win[4] = {"windowed", "borderless_fullscreen", "fullscreen", "borderless_window"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
-    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s screen_saver=%s%s\n", o->path,
+    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s fps_overlay=%d screen_saver=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height,
-           o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off",
+           o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->fps_overlay,
            o->keep_awake_playing ? "off_while_playing" : "allow", unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 2.4f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 2.4: the nearest of the two is used\n", o->scale);

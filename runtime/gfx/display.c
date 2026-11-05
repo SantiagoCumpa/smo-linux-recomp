@@ -102,6 +102,20 @@ static void window_fullscreen(int on) {
     fflush(stdout);
 }
 
+/* The frame counter over the picture (nvn_vk_draw.c fps_overlay_draw): its corner, 0 = hidden. graphics.ini fps_overlay
+ * gives the start; F10 hides it, or shows it in that corner (bottom left when the file says off). */
+static volatile int32_t g_fps_pos = -1;
+int display_fps_overlay(void) {
+    if (g_fps_pos < 0) plat_xchg(&g_fps_pos, gfx_options()->fps_overlay);
+    return g_fps_pos;
+}
+static void fps_overlay_toggle(void) {
+    int on = display_fps_overlay() != 0, pos = gfx_options()->fps_overlay ? gfx_options()->fps_overlay : 3;
+    plat_xchg(&g_fps_pos, on ? 0 : pos);
+    printf("display: frame counter %s (F10)\n", on ? "hidden" : "shown");
+    fflush(stdout);
+}
+
 void *display_hwnd(void) { return g_win; }
 void display_toggle_fullscreen(void) { plat_xchg(&g_req_full_toggle, 1); }         /* any thread: applied by the event loop */
 void display_set_title(const char *t) {                                             /* any thread */
@@ -192,6 +206,7 @@ static void window_event(const SDL_Event *e) {
     case SDL_EVENT_KEY_DOWN:
         if (e->key.repeat) break;
         if (e->key.scancode == SDL_SCANCODE_F11) { window_fullscreen(!g_win_full); break; }
+        if (e->key.scancode == SDL_SCANCODE_F10) { fps_overlay_toggle(); break; }
         if (e->key.scancode == SDL_SCANCODE_F12) { void smo_capture_request(void); smo_capture_request(); break; }   /* F12 = the console's Capture button */
         {   /* the amiibo menu's key (controllers.ini [hotkeys], F1 by default) */
             int nnpad_hotkey_vk(int which); void amiibo_menu_request(void);

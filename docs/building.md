@@ -132,7 +132,7 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
 - **The game folder's launcher:** `tools/make_game_folder.py` makes a folder whose `./smo` opens a window (GTK4 +
   libadwaita: `pacman -S python-gobject gtk4 libadwaita`) with the options of `config/graphics.ini` and `smo.env`:
   resolution up to 4K, full screen or window, window size, vsync, GPU, anisotropic filtering, the weak-GPU profile,
-  shaders not ready, the frame-time title, what happens when the window loses the focus, the screen saver and the
+  shaders not ready, the FPS counter and the frame-time title, what happens when the window loses the focus, the screen saver and the
   game's language; then **Play**. It rewrites only the lines it changes (comments stay). `./smo --play`, `./smo-run`
   or `SMO_LAUNCHER=0` in `smo.env` start the game without it; `smo.desktop` is a menu entry for the folder.
   Without the window: `python3 launcher/smo_launcher.py --show` / `--set resolution=1080p window=windowed`.
@@ -145,6 +145,10 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   game's own; above it the game's screen-sized targets are drawn larger (more detail, more GPU work: 2160p draws 5.8
   times the pixels), below it smaller. `resolution_scale` (0.25 to 2.4) says the same as a factor and is used when
   there is no `resolution` line; `SMO_VK_SCALE` wins over both.
+- FPS counter: `fps_overlay = top_left | top_right | bottom_left | bottom_right` in `graphics.ini` draws frames per
+  second and milliseconds per frame in that corner (green at 55 FPS and above, yellow from 40, red below), over the
+  picture but not into captures. F10 shows and hides it while the game runs (in the bottom-left corner when the file
+  says `off`).
 - The screen does not dim or lock while the game's window is shown and active (`screen_saver = off_while_playing`):
   a pad is not activity the desktop sees. On Wayland it is an idle inhibitor on the window; `screen_saver = allow`
   leaves it to the desktop. The log says `display: screen saver held off (playing)` / `allowed again`.

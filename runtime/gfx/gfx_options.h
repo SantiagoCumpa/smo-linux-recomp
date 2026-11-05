@@ -13,6 +13,7 @@ typedef struct {
                               * sets it too and wins; env SMO_VK_SCALE wins over both) */
     int handheld;            /* 1: the game is told it runs handheld = it makes its own 1280x720 render targets instead of 1920x1080 */
     int aniso;               /* 0 = the game's own value; 2, 4, 8, 16 = at least that on samplers that filter between mip levels */
+    int fps_overlay;         /* fps_overlay: 0 off, 1 top_left, 2 top_right, 3 bottom_left, 4 bottom_right (F10 shows / hides it while playing) */
     int overlay;             /* 1: frame time in the title bar and a "frame-time:" log line every second */
     int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a scene the draw is left out until they are ready; nvn_vk_pipelines.c skip_on; env SMO_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
