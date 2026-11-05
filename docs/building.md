@@ -146,8 +146,8 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   times the pixels), below it smaller. `resolution_scale` (0.25 to 2.4) says the same as a factor and is used when
   there is no `resolution` line; `SMO_VK_SCALE` wins over both.
 - FPS counter: `fps_overlay = top_left | top_right | bottom_left | bottom_right` in `graphics.ini` draws frames per
-  second and milliseconds per frame in that corner (green at 55 FPS and above, yellow from 40, red below), over the
-  picture but not into captures. F10 shows and hides it while the game runs (in the bottom-left corner when the file
+  second and milliseconds per frame in that corner (green at 55 FPS and above, yellow from 40, red below), small text
+  on a translucent box over the picture, not in captures. F10 shows and hides it while the game runs (in the bottom-left corner when the file
   says `off`).
 - The screen does not dim or lock while the game's window is shown and active (`screen_saver = off_while_playing`):
   a pad is not activity the desktop sees. On Wayland it is an idle inhibitor on the window; `screen_saver = allow`

@@ -3647,15 +3647,17 @@ static void overlay_draw(uint32_t index) {
     }
 }
 /* the FRAME COUNTER (graphics.ini fps_overlay, F10: display.c): frames per second and milliseconds per frame in a corner of
- * the window, drawn like the progress bar after the blit of the game's picture (never into the game's textures, so
- * captures do not have it). The text is drawn on the CPU with a 5x7 font into a small image (FPS_W x FPS_H), uploaded
- * when it changes (twice a second) and blitted up with whole-pixel scaling (nearest). Counted: presents of game frames
+ * the window, drawn after the blit of the game's picture (never into the game's textures, so captures do not have it).
+ * A pipeline of our own draws coloured rectangles into the swapchain image (dynamic rendering, alpha blending): a
+ * translucent box, then the text, a 5x7 font whose lit runs of pixels are rectangles of `k` window pixels (2 at 1080p,
+ * 4 at 2160p), each over a soft shadow. The text changes twice a second. Counted: presents of game frames
  * (g_vk_frames), not the loading screen's repeats. */
-#define FPS_W 100
-#define FPS_H 11
-#define FPS_SLOTS 4
 int display_fps_overlay(void);                 /* display.c: 0 hidden, 1..4 the corner */
-static struct { VkImage img; VMem mem; VkBuffer buf; VMem bmem; int made, slot, dirty, w; int64_t t0, f0; char text[24]; float fps; } g_fps;
+static struct {
+    VkPipeline pipe; VkPipelineLayout layout; VkFormat fmt; int failed;
+    VkImage key[16]; VkImageView view[16];     /* a view of each swapchain image, made when first drawn into */
+    int64_t t0, f0; char text[24]; float fps;
+} g_fps;
 static const uint8_t *fps_glyph(char ch) {
     static const uint8_t digits[10][7] = {
         {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
@@ -3668,77 +3670,137 @@ static const uint8_t *fps_glyph(char ch) {
     if (ch >= '0' && ch <= '9') return digits[ch - '0'];
     return ch == 'F' ? F : ch == 'P' ? P : ch == 'S' ? S : ch == 'm' ? m : ch == 's' ? s : ch == '.' ? dot : blank;
 }
-/* the text into slot g_fps.slot of the upload buffer; returns the width in pixels used */
-static int fps_render(uint8_t *px) {
-    uint8_t bg[4] = {16, 16, 16, 255}, white[4] = {235, 235, 235, 255}, num[4];
-    if (g_fps.fps >= 55.0f) { num[0] = 90; num[1] = 220; num[2] = 110; } else if (g_fps.fps >= 40.0f) { num[0] = 240; num[1] = 200; num[2] = 60; }
-    else { num[0] = 240; num[1] = 80; num[2] = 70; }
-    num[3] = 255;
-    for (int i = 0; i < FPS_W * FPS_H; i++) memcpy(px + i * 4, bg, 4);
-    int x = 2, number = 1;
-    for (const char *c = g_fps.text; *c && x + 5 <= FPS_W - 2; c++, x += 6) {
-        if (*c == ' ') number = 0;                     /* the first word (the frame rate) in its colour, the rest white */
-        const uint8_t *g = fps_glyph(*c), *col = number ? num : white;
-        for (int r = 0; r < 7; r++)
-            for (int b = 0; b < 5; b++)
-                if (g[r] >> (4 - b) & 1) memcpy(px + ((r + 2) * FPS_W + x + b) * 4, col, 4);
+static int fps_pipeline(void) {                   /* once, and again if the swapchain's format changes; 0 if it cannot be made */
+    if (g_fps.pipe && g_fps.fmt == V.format.format) return 1;
+    if (g_fps.failed) return 0;
+    g_fps.pipe = NULL;          /* a new swapchain format (not met so far): the old pipeline is left, the command buffer may still use it */
+    static const char *vs =
+        "#version 450\nlayout(push_constant) uniform P { vec4 r; vec4 c; } p;\n"
+        "void main() { const vec2 q[6] = vec2[](vec2(0,0), vec2(1,0), vec2(0,1), vec2(1,0), vec2(1,1), vec2(0,1));\n"
+        "  gl_Position = vec4(mix(p.r.xy, p.r.zw, q[gl_VertexIndex]), 0.0, 1.0); }\n";
+    static const char *fs =
+        "#version 450\nlayout(push_constant) uniform P { vec4 r; vec4 c; } p;\nlayout(location = 0) out vec4 o;\n"
+        "void main() { o = p.c; }\n";
+    uint64_t h;
+    VkShaderModule mv = module_from_glsl(0, vs, "frame counter (vertex)", &h, NULL), mf = module_from_glsl(1, fs, "frame counter (fragment)", &h, NULL);
+    if (!mv || !mf) { g_fps.failed = 1; printf("nvn_vk: the frame counter's shaders could not be made: no counter\n"); return 0; }
+    if (!g_fps.layout) {
+        VkPushConstantRange pr = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+        VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        li.pushConstantRangeCount = 1; li.pPushConstantRanges = &pr;
+        VKC(vkCreatePipelineLayout(V.device, &li, NULL, &g_fps.layout));
     }
-    return x + 1 < FPS_W ? x + 1 : FPS_W;
+    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}, {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = mv; st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = mf; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineColorBlendAttachmentState ba;
+    memset(&ba, 0, sizeof ba);
+    ba.blendEnable = VK_TRUE; ba.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA; ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    ba.colorBlendOp = VK_BLEND_OP_ADD; ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO; ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE; ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    ba.colorWriteMask = 0xf;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &ba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    ds.dynamicStateCount = 2; ds.pDynamicStates = dyn;
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    ri.colorAttachmentCount = 1; ri.pColorAttachmentFormats = &V.format.format;
+    VkGraphicsPipelineCreateInfo gi = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gi.pNext = &ri; gi.stageCount = 2; gi.pStages = st; gi.pVertexInputState = &vi; gi.pInputAssemblyState = &ia; gi.pViewportState = &vp;
+    gi.pRasterizationState = &rs; gi.pMultisampleState = &ms; gi.pColorBlendState = &cb; gi.pDynamicState = &ds; gi.layout = g_fps.layout;
+    VkResult r = vkCreateGraphicsPipelines(V.device, NULL, 1, &gi, NULL, &g_fps.pipe);
+    vkDestroyShaderModule(V.device, mv, NULL); vkDestroyShaderModule(V.device, mf, NULL);
+    if (r != VK_SUCCESS) { g_fps.pipe = NULL; g_fps.failed = 1; printf("nvn_vk: the frame counter's pipeline could not be made (%s): no counter\n", vk_result_name(r)); return 0; }
+    g_fps.fmt = V.format.format;
+    return 1;
+}
+static VkImageView fps_view(uint32_t index) {      /* swapchain images change when the swapchain is made again: views follow */
+    if (index >= 16) return NULL;
+    if (g_fps.key[index] != V.images[index] || !g_fps.view[index]) {
+        if (g_fps.view[index]) vkDestroyImageView(V.device, g_fps.view[index], NULL);      /* its image is gone: never used again */
+        VkImageViewCreateInfo vi = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = V.images[index]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = V.format.format;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+        g_fps.view[index] = NULL;
+        if (vkCreateImageView(V.device, &vi, NULL, &g_fps.view[index]) != VK_SUCCESS) { g_fps.view[index] = NULL; return NULL; }
+        g_fps.key[index] = V.images[index];
+    }
+    return g_fps.view[index];
+}
+static void fps_rect(int x, int y, int w, int h, const float rgba[4]) {       /* window pixels -> clip space */
+    float pc[8], W = (float)V.extent.width, H = (float)V.extent.height;
+    pc[0] = (float)x / W * 2.0f - 1.0f; pc[1] = (float)y / H * 2.0f - 1.0f; pc[2] = (float)(x + w) / W * 2.0f - 1.0f; pc[3] = (float)(y + h) / H * 2.0f - 1.0f;
+    memcpy(&pc[4], rgba, 16);
+    vkCmdPushConstants(R.cmd, g_fps.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
+    vkCmdDraw(R.cmd, 6, 1, 0, 0);
 }
 static void fps_overlay_draw(uint32_t index) {
     int pos = display_fps_overlay();
     int64_t now = tk();
     static int64_t hz;
     if (!hz) { plat_counter f; plat_qpf(&f); hz = f.QuadPart; }
-    if (!g_fps.t0) { g_fps.t0 = now; g_fps.f0 = g_vk_frames; snprintf(g_fps.text, sizeof g_fps.text, "-- FPS"); g_fps.dirty = 1; }
+    if (!g_fps.t0) { g_fps.t0 = now; g_fps.f0 = g_vk_frames; snprintf(g_fps.text, sizeof g_fps.text, "-- FPS"); }
     if (now - g_fps.t0 >= hz / 2) {                      /* twice a second */
         int64_t frames = g_vk_frames - g_fps.f0;
         double secs = (double)(now - g_fps.t0) / (double)hz;
         g_fps.fps = (float)(frames / secs);
         if (frames > 0) snprintf(g_fps.text, sizeof g_fps.text, "%d FPS %.1f ms", (int)(g_fps.fps + 0.5f), secs * 1000.0 / (double)frames);
         else snprintf(g_fps.text, sizeof g_fps.text, "0 FPS");
-        g_fps.t0 = now; g_fps.f0 = g_vk_frames; g_fps.dirty = 1;
+        g_fps.t0 = now; g_fps.f0 = g_vk_frames;
     }
-    if (!pos) return;
-    if (!g_fps.made) {
-        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        VkMemoryRequirements rq;
-        ci.imageType = VK_IMAGE_TYPE_2D; ci.format = VK_FORMAT_R8G8B8A8_UNORM; ci.extent.width = FPS_W; ci.extent.height = FPS_H; ci.extent.depth = 1;
-        ci.mipLevels = 1; ci.arrayLayers = 1; ci.samples = VK_SAMPLE_COUNT_1_BIT; ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT; ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VKC(vkCreateImage(V.device, &ci, NULL, &g_fps.img));
-        vkGetImageMemoryRequirements(V.device, g_fps.img, &rq);
-        g_fps.mem = vmem_alloc(rq, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-        VKC(vkBindImageMemory(V.device, g_fps.img, g_fps.mem.mem, g_fps.mem.off));
-        g_fps.buf = vbuf_new((uint64_t)FPS_W * FPS_H * 4 * FPS_SLOTS, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &g_fps.bmem);
-        image_barrier(g_fps.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        g_fps.made = 1; g_fps.dirty = 1;
-    }
-    if (g_fps.dirty) {          /* a slot of the ring: the copy of FPS_SLOTS changes ago (two seconds) has long finished */
-        VkBufferImageCopy c;
-        g_fps.slot = (g_fps.slot + 1) % FPS_SLOTS;
-        uint64_t off = (uint64_t)g_fps.slot * FPS_W * FPS_H * 4;
-        g_fps.w = fps_render((uint8_t *)g_fps.bmem.map + off);
-        memset(&c, 0, sizeof c);
-        c.bufferOffset = off;
-        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
-        c.imageExtent.width = FPS_W; c.imageExtent.height = FPS_H; c.imageExtent.depth = 1;
-        image_barrier(g_fps.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(R.cmd, g_fps.buf, g_fps.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
-        image_barrier(g_fps.img, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        g_fps.dirty = 0;
-    }
-    int W = (int)V.extent.width, H = (int)V.extent.height, k = H / 360 > 2 ? H / 360 : 2;      /* 3 at 1080p, 6 at 2160p */
-    int bw = g_fps.w * k, bh = FPS_H * k, m = H / 60, x0, y0;
+    if (!pos || !fps_pipeline()) return;
+    VkImageView view = fps_view(index);
+    if (!view) return;
+    int W = (int)V.extent.width, H = (int)V.extent.height, k = H / 540 > 1 ? H / 540 : 1;      /* 2 at 1080p, 4 at 2160p */
+    int n = (int)strlen(g_fps.text), pad = 2 * k, bw = (n * 6 - 1) * k + 2 * pad, bh = 7 * k + 2 * pad, m = H / 80, x0, y0;
     if (bw + 2 * m > W || bh + 2 * m > H) return;
     x0 = pos == 2 || pos == 4 ? W - m - bw : m;
     y0 = pos == 3 || pos == 4 ? H - m - bh : m;
-    VkImageBlit b;
-    memset(&b, 0, sizeof b);
-    b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
-    b.srcOffsets[1].x = g_fps.w; b.srcOffsets[1].y = FPS_H; b.srcOffsets[1].z = 1;
-    b.dstOffsets[0].x = x0; b.dstOffsets[0].y = y0; b.dstOffsets[1].x = x0 + bw; b.dstOffsets[1].y = y0 + bh; b.dstOffsets[1].z = 1;
-    vkCmdBlitImage(R.cmd, g_fps.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    static const float box[4] = {0.0f, 0.0f, 0.0f, 0.40f}, shadow[4] = {0.0f, 0.0f, 0.0f, 0.55f}, white[4] = {0.94f, 0.94f, 0.94f, 1.0f};
+    float num[4] = {0.35f, 0.86f, 0.43f, 1.0f};           /* green at 55 and above, yellow from 40, red below */
+    if (g_fps.fps < 40.0f && g_fps.fps > 0.0f) { num[0] = 0.94f; num[1] = 0.31f; num[2] = 0.27f; }
+    else if (g_fps.fps < 55.0f && g_fps.fps > 0.0f) { num[0] = 0.94f; num[1] = 0.78f; num[2] = 0.24f; }
+
+    image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = view; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea.extent = V.extent; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(R.cmd, &ri);
+    VkViewport vpt = {0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f};
+    VkRect2D sc = {{0, 0}, V.extent};
+    vkCmdSetViewport(R.cmd, 0, 1, &vpt);
+    vkCmdSetScissor(R.cmd, 0, 1, &sc);
+    vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fps.pipe);
+    fps_rect(x0, y0, bw, bh, box);
+    for (int layer = 0; layer < 2; layer++) {             /* the shadow (one text pixel down and right), then the text */
+        int number = 1, off = layer ? 0 : (k + 1) / 2;
+        for (int i = 0; i < n; i++) {
+            if (g_fps.text[i] == ' ') number = 0;           /* the frame rate in its colour, the rest white */
+            const uint8_t *g = fps_glyph(g_fps.text[i]);
+            const float *col = layer == 0 ? shadow : number ? num : white;
+            int gx = x0 + pad + i * 6 * k;
+            for (int r = 0; r < 7; r++)
+                for (int b = 0; b < 5; b++) {
+                    if (!(g[r] >> (4 - b) & 1)) continue;
+                    int e = b;
+                    while (e + 1 < 5 && (g[r] >> (4 - (e + 1)) & 1)) e++;      /* a run of lit pixels: one rectangle */
+                    fps_rect(gx + b * k + off, y0 + pad + r * k + off, (e - b + 1) * k, k, col);
+                    b = e;
+                }
+        }
+    }
+    vkCmdEndRendering(R.cmd);
+    image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 }
 /* the console's Capture button (F12 in the game window; a pad's share / capture button: display.c and
  * nnpad_sdl.c call smo_capture_request). The frame being presented is read back like a SMO_SHOT picture, made 8-bit

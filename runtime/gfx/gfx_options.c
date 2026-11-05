@@ -92,7 +92,7 @@ static const char *const k_default_ini =
 "profile = custom\n"
 "\n"
 "; fps_overlay = off | top_left | top_right | bottom_left | bottom_right\n"
-";   A frame counter drawn over the picture in that corner: frames per second and milliseconds per frame (green at 55\n"
+";   A small frame counter on a translucent box in that corner: frames per second and milliseconds per frame (green at 55\n"
 ";   and above, yellow from 40, red below). F10 shows and hides it while the game runs.\n"
 "fps_overlay = off\n"
 "\n"
