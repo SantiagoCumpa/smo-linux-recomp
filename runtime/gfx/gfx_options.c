@@ -1,4 +1,4 @@
-/* Graphics options: config\graphics.ini.
+/* Graphics options: config/graphics.ini.
  *
  * Path: SMO_GRAPHICS_CONFIG=<file> when set; else graphics.ini beside the file SMO_CONFIG names (SMO_CONFIG is the
  * path of controllers.ini, nnpad_sdl.c); else <exe folder>\..\config\graphics.ini. Written with the defaults and their
@@ -21,15 +21,16 @@ static const char *const k_default_ini =
 ";   Vulkan is the only renderer of the Linux build.\n"
 "renderer = vulkan\n"
 "\n"
-"; window = borderless_window | borderless_fullscreen | windowed | fullscreen\n"
+"; window = borderless_fullscreen | borderless_window | windowed | fullscreen\n"
 ";   borderless_window:     a window without a frame or title bar, the size below, centred by the compositor.\n"
 ";                          Double-click it for borderless_fullscreen and back.\n"
 ";   borderless_fullscreen: no frame, covers the monitor the window is on (the desktop keeps its resolution).\n"
+";                          The default.\n"
 ";   windowed:              a normal window with a title bar, the client size below.\n"
 ";   fullscreen:            as borderless_fullscreen, and always on top. (Exclusive fullscreen with a mode change is\n"
 ";                          not implemented.)\n"
 ";   F11 switches between covering the monitor and the window while the game runs.\n"
-"window = borderless_window\n"
+"window = borderless_fullscreen\n"
 "width = 1280\n"
 "height = 720\n"
 "\n"
@@ -38,6 +39,11 @@ static const char *const k_default_ini =
 ";   run:   it keeps running; pads and the keyboard count only while the window is active.\n"
 ";   pause: it stops until the window is active again, as the console stops the game while the HOME menu is open.\n"
 "unfocused = run\n"
+"\n"
+"; screen_saver = off_while_playing | allow\n"
+";   off_while_playing: the screen does not dim, lock or sleep while the game's window is shown and active (a pad is\n"
+";   not activity the desktop sees). allow: the desktop's own rules, except during the game's ending.\n"
+"screen_saver = off_while_playing\n"
 "\n"
 "; vsync = clock | on | off | mailbox      (Vulkan)\n"
 ";   clock:   frames are shown at once (mailbox when the GPU offers it, else immediate) and the game is paced by the\n"
@@ -56,10 +62,16 @@ static const char *const k_default_ini =
 ";   What nn::oe::GetOperationMode answers. Leave it at docked: handheld is not measured on PC.\n"
 "console_mode = docked\n"
 "\n"
+"; resolution = 720p | 900p | 1080p | 1440p | 2160p      (Vulkan)\n"
+";   The internal resolution the game draws at. 900p (1600x900) is the game's own; above it the picture is drawn with\n"
+";   more detail (more GPU work), below it softer (less). 720p = 1280x720, 1080p = 1920x1080, 1440p = 2560x1440,\n"
+";   2160p = 3840x2160. When set, it wins over resolution_scale.\n"
+"resolution = 900p\n"
+"\n"
 "; resolution_scale = 1.0\n"
-";   Internal resolution scale, 0.25 to 1.0 (Vulkan only; OpenGL ignores it). 1.0 = the game's own (its picture is\n"
-";   1600x900). 0.75 = 1200x675, 0.5 = 800x450: the main switch for a weak GPU. The whole picture is drawn smaller, the\n"
-";   2D interface too (it gets softer), and is scaled to the window size.\n"
+";   The same as a factor of 1600x900, 0.25 to 2.4 (Vulkan only): 0.5 = 800x450, 1.2 = 1920x1080, 2.4 = 3840x2160.\n"
+";   Used when there is no resolution line. 0.5 or 0.75 is the main switch for a weak GPU. The whole picture is drawn\n"
+";   at that size, the 2D interface too, and is scaled to the window size.\n"
 "resolution_scale = 1.0\n"
 "\n"
 "; anisotropic_filtering = game | 2 | 4 | 8 | 16      (Vulkan)\n"
@@ -116,7 +128,8 @@ static void opt_load(void) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 3;
+    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 1; o->keep_awake_playing = 1;
+    float res_scale = 0;          /* from 'resolution': wins over resolution_scale wherever the two stand */
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -141,6 +154,14 @@ static void opt_load(void) {
         else if (!strcasecmp(key, "gpu")) { if (strcasecmp(val, "auto")) snprintf(o->gpu, sizeof o->gpu, "%s", val); }
         else if (!strcasecmp(key, "console_mode")) o->handheld = !strcasecmp(val, "handheld");
         else if (!strcasecmp(key, "resolution_scale")) { float v = (float)atof(val); if (v > 0) o->scale = v; }
+        else if (!strcasecmp(key, "resolution")) {
+            static const struct { const char *name; float scale; } k_res[] = {
+                {"720p", 0.8f}, {"900p", 1.0f}, {"1080p", 1.2f}, {"1440p", 1.6f}, {"2k", 1.6f}, {"2160p", 2.4f}, {"4k", 2.4f}};
+            int found = 0;
+            for (size_t i = 0; i < sizeof k_res / sizeof k_res[0]; i++) if (!strcasecmp(val, k_res[i].name)) { res_scale = k_res[i].scale; found = 1; }
+            if (!found) unknown++;
+        }
+        else if (!strcasecmp(key, "screen_saver")) o->keep_awake_playing = strcasecmp(val, "allow") != 0;
         else if (!strcasecmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
         else if (!strcasecmp(key, "frame_time_overlay")) o->overlay = !strcasecmp(val, "on") || !strcmp(val, "1");
         else if (!strcasecmp(key, "profile")) o->profile = !strcasecmp(val, "low");
@@ -149,18 +170,19 @@ static void opt_load(void) {
         else unknown++;
     }
     if (f) fclose(f);
+    if (res_scale > 0) o->scale = res_scale;
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
     }
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
     static const char *const k_win[4] = {"windowed", "borderless_fullscreen", "fullscreen", "borderless_window"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
-    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s%s\n", o->path,
+    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s screen_saver=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height,
            o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off",
-           unknown ? " (lines with an unknown key were ignored)" : "");
+           o->keep_awake_playing ? "off_while_playing" : "allow", unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
-    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 1.0f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 1.0: the nearest of the two is used\n", o->scale);
+    if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 2.4f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 2.4: the nearest of the two is used\n", o->scale);
     if (o->renderer) printf("graphics options: renderer=opengl is not available on Linux: Vulkan is used\n");
     fflush(stdout);
 }

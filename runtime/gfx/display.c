@@ -212,9 +212,19 @@ static void display_pump(uint32_t wait_ms) {
     if (plat_xchg(&g_req_title, 0)) { char t[192]; plat_lock(&g_title_lock); snprintf(t, sizeof t, "%s", g_title_req); plat_unlock(&g_title_lock); SDL_SetWindowTitle(g_win, t); }
     {   int32_t m = plat_xchg(&g_req_minimise, 0);
         if (m == 1) SDL_MinimizeWindow(g_win); else if (m == 2) SDL_RestoreWindow(g_win); }
-    {   static int awake;
-        int want = g_keep_awake != 0;
-        if (want != awake) { if (want) SDL_DisableScreenSaver(); else SDL_EnableScreenSaver(); awake = want; } }
+    {   /* The screen saver is held off while a source asks (the game's ending) and, with screen_saver =
+         * off_while_playing, while the window is shown, active and not minimised: a pad is not activity the desktop
+         * sees. On Wayland SDL holds an idle inhibitor on the window's surface (D-Bus ScreenSaver as the fallback). */
+        static int awake;
+        int32_t ff = g_focus_flags;
+        int playing = gfx_options()->keep_awake_playing && (ff & 1) && (ff & 4) && !(ff & 2);
+        int want = g_keep_awake != 0 || playing;
+        if (want != awake) {
+            if (want) SDL_DisableScreenSaver(); else SDL_EnableScreenSaver();
+            awake = want;
+            printf("display: screen saver %s\n", want ? (playing ? "held off (playing)" : "held off (the game asks)") : "allowed again");
+            fflush(stdout);
+        } }
 }
 /* boot.c, main thread: runs the event loop until the guest's main thread t ends (1) or ms milliseconds pass (0). */
 int display_wait_thread(plat_thread *t, uint32_t ms) {

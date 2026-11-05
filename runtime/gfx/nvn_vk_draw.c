@@ -775,7 +775,7 @@ static float rs_scale(void) {
         const char *e = getenv("SMO_VK_SCALE");
         float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
         if (v < 0.25f) v = 0.25f;
-        if (v > 1.0f) v = 1.0f;                    /* above 1.0 (supersampling) is not offered: not tested */
+        if (v > 2.4f) v = 2.4f;                    /* 2.4 = 3840x2160: the launcher's highest resolution */
         g_rs = v;
     }
     return g_rs;
@@ -1157,7 +1157,10 @@ static VTex *vt_get2(Tex *t, int sync) {
         if (RS_ON && (b->target == 1 || b->target == 4 || b->target == 5) && vt->layers == 1 && !vt->decode && rs_screen_class(vt->w, vt->h) && !(rs_ui_native() && wintex_is(t)) &&
             (vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT || (f.kind != 4 && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)))) {      /* a screen-class target */
             int gw = vt->w, gh = vt->h, lv = 1;
-            vt->w = (int)((float)gw * rs_scale() + 0.5f); vt->h = (int)((float)gh * rs_scale() + 0.5f);
+            float sc = rs_scale();
+            uint32_t lim = V.props.limits.maxImageDimension2D;           /* above 1.0 a target may outgrow the device's limit */
+            if (lim && (float)(gw > gh ? gw : gh) * sc > (float)lim) sc = (float)lim / (float)(gw > gh ? gw : gh);
+            vt->w = (int)((float)gw * sc + 0.5f); vt->h = (int)((float)gh * sc + 0.5f);
             if (vt->w < 1) vt->w = 1; if (vt->h < 1) vt->h = 1;
             vt->rs = 1; vt->sx = (float)vt->w / (float)gw; vt->sy = (float)vt->h / (float)gh;
             while ((vt->w >> lv) || (vt->h >> lv)) lv++;

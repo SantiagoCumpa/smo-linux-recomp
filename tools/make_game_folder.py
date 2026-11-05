@@ -7,7 +7,11 @@ install folder), outside the build tree:
 The folder (default: smo/ at the repository root; ignored by git, it holds your game's files):
 
     smo/
-      smo                 the launcher: run it (or double-click it) to play
+      smo                 run it (or double-click it, or smo.desktop) to play: the launcher window with the options,
+                          then the game (./smo --play: the game at once)
+      smo-run             the game itself, without the launcher
+      launcher/           the launcher (GTK4 + libadwaita, tools/launcher/smo_launcher.py)
+      smo.desktop         a menu entry: copy it to ~/.local/share/applications to have the game in the app menu
       bin/                smo_native and libsmo_game.so; the game runs with this as its folder
       game/elf/           main.elf and sdk.elf (and the other modules); game/exefs/main.npdm
       romfs/              the game's data (from your dump)
@@ -18,7 +22,7 @@ The folder (default: smo/ at the repository root; ignored by git, it holds your 
       logs/               smo.log of the last run, smo.1.log .. smo.4.log of the runs before it
       tmp/, run/          the game's temporary files
       smo-folder.json     what built this folder: commit, date, the game version
-      smo.env             settings the launcher reads (--language: SMO_LANGUAGE)
+      smo.env             settings the scripts read (SMO_LANGUAGE, SMO_LAUNCHER=0: no launcher window)
 
 The runtime finds everything relative to bin/ (romfs, userdata and config through its exe folder, the Vulkan cache
 as ../cache/vk from the working folder), so the folder can be moved anywhere. Making it again updates bin/ and game/
@@ -40,8 +44,8 @@ import target as T  # noqa: E402
 
 LANGUAGES = ('ja', 'en-US', 'en-GB', 'fr', 'fr-CA', 'de', 'it', 'es', 'es-419', 'zh-Hans', 'zh-Hant', 'ko', 'nl', 'ru')   # the game's (nnmisc.c)
 
-LAUNCHER = r'''#!/usr/bin/env bash
-# Super Mario Odyssey (smo-recomp): run the game from this folder. Arguments are passed to the game.
+RUN_SCRIPT = r'''#!/usr/bin/env bash
+# Super Mario Odyssey (smo-recomp): run the game from this folder, without the launcher. Arguments are passed to the game.
 # SMO_PRIME=0 runs on the default GPU instead of the discrete one (NVIDIA PRIME offload).
 set -e
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -61,9 +65,43 @@ cd "$here/bin"
 exec ./smo_native ../game/elf/main.elf 0 "$@" >"$here/logs/smo.log" 2>&1
 '''
 
+LAUNCHER = r'''#!/usr/bin/env bash
+# Super Mario Odyssey (smo-recomp): the launcher window (options, then Play), or the game at once:
+#   ./smo --play       the game without the window (also when smo.env has SMO_LAUNCHER=0)
+#   ./smo --launcher   the window even with SMO_LAUNCHER=0
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+[ -f "$here/smo.env" ] && . "$here/smo.env"
+mode=window
+case "${1:-}" in
+    --play) mode=play; shift ;;
+    --launcher) mode=window; shift ;;
+    *) [ "${SMO_LAUNCHER:-1}" = 0 ] && mode=play ;;
+esac
+if [ "$mode" = window ]; then
+    if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Adw' 2>/dev/null; then
+        exec python3 "$here/launcher/smo_launcher.py" --folder "$here"
+    fi
+    echo "smo: the launcher needs python-gobject, gtk4 and libadwaita (pacman -S python-gobject gtk4 libadwaita); starting the game" >&2
+fi
+exec "$here/smo-run" "$@"
+'''
+
+DESKTOP = '''[Desktop Entry]
+Type=Application
+Name=Super Mario Odyssey
+Comment=smo-recomp: the launcher, then the game
+Exec="{folder}/smo"
+Path={folder}
+Icon=applications-games
+Terminal=false
+Categories=Game;
+'''
+
 README = '''Super Mario Odyssey, recompiled (smo-recomp)
 
-Play: run ./smo in this folder (from a terminal or your file manager).
+Play: run ./smo in this folder (from a terminal or your file manager). It opens the launcher: resolution (up to 4K),
+full screen or window, GPU and the other options, then Play. ./smo --play starts the game at once; so does ./smo-run.
+smo.desktop is a menu entry for this folder: copy it to ~/.local/share/applications.
 
   config/graphics.ini, config/controllers.ini   settings (F1 in the game opens the help)
   userdata/save/                                your saves: back this folder up
@@ -178,10 +216,16 @@ def main():
     for sub in ('logs', 'tmp', 'run', os.path.join('cache', 'vk'), os.path.join('cache', 'nvidia'), os.path.join('cache', 'mesa')):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
 
+    for name, text in (('smo', LAUNCHER), ('smo-run', RUN_SCRIPT)):
+        path = os.path.join(out, name)
+        with open(path + '.new', 'w', encoding='utf-8') as f:
+            f.write(text)
+        os.chmod(path + '.new', 0o755)
+        os.replace(path + '.new', path)
     launcher = os.path.join(out, 'smo')
-    with open(launcher, 'w', encoding='utf-8') as f:
-        f.write(LAUNCHER)
-    os.chmod(launcher, 0o755)
+    copy_tree(os.path.join(REPO, 'tools', 'launcher', 'smo_launcher.py'), os.path.join(out, 'launcher', 'smo_launcher.py'))
+    with open(os.path.join(out, 'smo.desktop'), 'w', encoding='utf-8') as f:
+        f.write(DESKTOP.format(folder=out))
     env_file = os.path.join(out, 'smo.env')
     if a.language:
         with open(env_file, 'w', encoding='utf-8') as f:

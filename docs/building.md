@@ -129,11 +129,25 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   run's folder continues from there. Without it, saves go to `build/userdata/save`.
 - `--seq <file>` plays an input sequence (see [`scripted-runs.md`](scripted-runs.md)); `--env NAME=VALUE` sets one of
   the runtime's switches (see [`debugging.md`](debugging.md)).
+- **The game folder's launcher:** `tools/make_game_folder.py` makes a folder whose `./smo` opens a window (GTK4 +
+  libadwaita: `pacman -S python-gobject gtk4 libadwaita`) with the options of `config/graphics.ini` and `smo.env`:
+  resolution up to 4K, full screen or window, window size, vsync, GPU, anisotropic filtering, the weak-GPU profile,
+  shaders not ready, the frame-time title, what happens when the window loses the focus, the screen saver and the
+  game's language; then **Play**. It rewrites only the lines it changes (comments stay). `./smo --play`, `./smo-run`
+  or `SMO_LAUNCHER=0` in `smo.env` start the game without it; `smo.desktop` is a menu entry for the folder.
+  Without the window: `python3 launcher/smo_launcher.py --show` / `--set resolution=1080p window=windowed`.
 - Graphics and controller settings live in `build/config/graphics.ini` and `build/config/controllers.ini` (written
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
-- The window: by default a borderless window of the size in `graphics.ini` (on Wayland the compositor places it; a
-  tiling compositor such as niri tiles it). F11, or a double-click on it, switches between that and fullscreen;
-  `window = borderless_fullscreen` starts that way, and `windowed` (with a title bar) and `fullscreen` are there too.
+- The window: by default the game covers its monitor (`window = borderless_fullscreen`). F11, or a double-click on
+  it, switches between that and a window; `window = borderless_window` (no frame, the size in `graphics.ini`; a tiling
+  compositor such as niri tiles it), `windowed` (with a title bar) and `fullscreen` (always on top) start that way.
+- Internal resolution: `resolution = 720p | 900p | 1080p | 1440p | 2160p` in `graphics.ini`. 900p (1600x900) is the
+  game's own; above it the game's screen-sized targets are drawn larger (more detail, more GPU work: 2160p draws 5.8
+  times the pixels), below it smaller. `resolution_scale` (0.25 to 2.4) says the same as a factor and is used when
+  there is no `resolution` line; `SMO_VK_SCALE` wins over both.
+- The screen does not dim or lock while the game's window is shown and active (`screen_saver = off_while_playing`):
+  a pad is not activity the desktop sees. On Wayland it is an idle inhibitor on the window; `screen_saver = allow`
+  leaves it to the desktop. The log says `display: screen saver held off (playing)` / `allowed again`.
   The game keeps running while its window does not have the focus or is minimised (pads and keyboard count only while
   it has the focus); `unfocused = pause` in `graphics.ini` stops it then instead, as the console stops a game behind
   its HOME menu.
