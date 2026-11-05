@@ -153,7 +153,9 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
 - `--seq <file>` plays an input sequence (see [`scripted-runs.md`](scripted-runs.md)); `--env NAME=VALUE` sets one of
   the runtime's switches (see [`debugging.md`](debugging.md)).
 - **The game folder:** `tools/make_game_folder.py` makes a folder whose `./smo` starts the game (`smo.desktop` is a menu
-  entry for it). Every setting is in the game's own settings menu (F1, below), kept in `config/graphics.ini`.
+  entry for it). Its log goes to `logs/smo.log` (the four runs before: `smo.1.log` .. `smo.4.log`); started from
+  a terminal, `./smo` shows it there as well. Ctrl+C (or a TERM) closes the game as its window's close button does (a
+  second one ends it at once). Every setting is in the game's own settings menu (F1, below), kept in `config/graphics.ini`.
 - Graphics and controller settings live in `build/config/graphics.ini` and `build/config/controllers.ini` (written
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
 - The window: by default the game covers its monitor (`window = borderless_fullscreen`). F11, or a double-click on

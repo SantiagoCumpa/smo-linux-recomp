@@ -3,7 +3,9 @@
  * SDL wants its video calls and its event loop on the program's main thread: display_init makes the window there and
  * boot.c's main thread then runs display_wait_thread, which pumps the window's events while the game runs. Other threads
  * ask for window changes (title, fullscreen, minimise) through requests the event loop applies. */
+#include <signal.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include "plat.h"
@@ -87,6 +89,7 @@ int display_closing(void) { return g_closing != 0; }  /* smo_amiibo.c: the menu 
  * default, a borderless window of the configured size. F11, or a double-click, switches between covering the monitor
  * (SDL's desktop fullscreen) and the window. On the main thread (the event loop). */
 static int g_win_full;                                /* the window covers its monitor now */
+static volatile sig_atomic_t g_sig_quit;               /* SIGINT / SIGTERM received (quit_signal): the event loop closes the game */
 static volatile int32_t g_req_full_toggle, g_req_title, g_req_minimise;   /* requests of other threads, applied by the event loop */
 static volatile int32_t g_focus_flags;                 /* DISPLAY_FOCUSED 1, DISPLAY_MINIMISED 2, DISPLAY_SHOWN 4 */
 static volatile int32_t g_keep_awake;                  /* sources that hold the screen saver off (bit mask) */
@@ -259,6 +262,16 @@ static void display_pump(uint32_t wait_ms) {
         window_event(&e);
         while (SDL_PollEvent(&e)) window_event(&e);
     }
+    {   static int taken;
+        if (g_sig_quit && !taken) {                     /* Ctrl+C / TERM: as the window's close button */
+            SDL_Event q;
+            memset(&q, 0, sizeof q);
+            q.type = SDL_EVENT_QUIT;
+            taken = 1;
+            printf("\n%s received: closing the game\n", g_sig_quit == SIGINT ? "Ctrl+C (SIGINT)" : "SIGTERM");
+            window_event(&q);
+        }
+    }
     if (plat_xchg(&g_req_full_toggle, 0)) window_fullscreen(!g_win_full);
     if (plat_xchg(&g_req_window, 0)) window_apply();
     {   /* the mouse pointer is hidden while the window covers its monitor (whichever way it got there: graphics.ini, F11, a
@@ -381,8 +394,22 @@ static void vsync_test_key(void) {
     }
 }
 
+/* Ctrl+C in the terminal (SIGINT) or a TERM: the game closes as when its window is closed (the event loop takes the
+ * request: display_pump). A second one, when that close is stuck, ends the process at once. SDL's own handlers are off
+ * (the crash report owns the fault signals), so these two are ours (g_sig_quit: above). */
+static void quit_signal(int sig) {
+    if (g_sig_quit) { static const char m[] = "\nsecond interrupt: ending now\n"; (void)!write(2, m, sizeof m - 1); _exit(128 + sig); }
+    g_sig_quit = sig;
+}
 void hitch_init(void); void hitch_pacing(int on);      /* hitch.c: SMO_HITCH */
 void display_init(void) {
+    {   struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = quit_signal;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
     plat_qpf(&g_freq);
     /* the console's waits with a time-out (nn::os::TimedWaitEvent, ...: os_threads.c) end at the time asked for: Linux
      * timers are precise to tens of microseconds (Windows needed timeBeginPeriod(1) here). The window and SDL's event

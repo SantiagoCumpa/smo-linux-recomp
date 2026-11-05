@@ -46,7 +46,8 @@ LANGUAGES = ('ja', 'en-US', 'en-GB', 'fr', 'fr-CA', 'de', 'it', 'es', 'es-419', 
 
 RUN_SCRIPT = r'''#!/usr/bin/env bash
 # Super Mario Odyssey (smo-recomp): run the game from this folder. Arguments are passed to the game. Its settings are in the
-# game's own menu (F1, or a pad's HOME button), kept in config/graphics.ini.
+# game's own menu (F1, or a pad's HOME button), kept in config/graphics.ini. The log goes to logs/smo.log (the four before
+# it: smo.1.log .. smo.4.log) and, when started from a terminal, to the terminal as well.
 # SMO_PRIME=0 runs on the default GPU instead of the discrete one (NVIDIA PRIME offload).
 set -e
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -83,6 +84,15 @@ if [ "${1:-}" = "--compile-shaders" ]; then
 fi
 for i in 3 2 1; do [ -f "$here/logs/smo.$i.log" ] && mv -f "$here/logs/smo.$i.log" "$here/logs/smo.$((i + 1)).log"; done
 [ -f "$here/logs/smo.log" ] && mv -f "$here/logs/smo.log" "$here/logs/smo.1.log"
+if [ -t 1 ]; then
+    # started from a terminal: the log is shown there as well as written to logs/smo.log. Ctrl+C (or a TERM) goes to the
+    # whole group: the game closes as when its window is closed; the copy (tee) ignores it and ends when the game's
+    # output does (killed first, it would kill the game at its next line), and this script waits for both
+    echo "log: $here/logs/smo.log"
+    trap ':' INT TERM                              # (a handler, not ignored: the game gets the signal as usual)
+    ./smo_native ../game/elf/main.elf 0 "$@" 2>&1 | ( trap '' INT TERM; exec tee "$here/logs/smo.log" )
+    exit "${PIPESTATUS[0]}"
+fi
 exec ./smo_native ../game/elf/main.elf 0 "$@" >"$here/logs/smo.log" 2>&1
 '''
 
@@ -109,7 +119,8 @@ the internal resolution between native and a scaled one (logs/smo.log says when 
 
   config/graphics.ini, config/controllers.ini   settings (the settings menu writes graphics.ini)
   userdata/save/                                your saves: back this folder up
-  logs/smo.log                                  the log of the last run (attach it to a bug report)
+  logs/smo.log                                  the log of the last run (attach it to a bug report); started
+                                                from a terminal, ./smo shows it there too
   cache/                                        shader caches; deleting it only makes the next start slower
                                                 (then run ./smo --compile-shaders again)
 
