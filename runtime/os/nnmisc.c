@@ -184,7 +184,7 @@ static uint32_t oe_watch(void * pause) {
             }
             test_phase++;
             phase_at = plat_ms(); phase_polls = g_oe_poll_count;
-            if (test_phase < 3) printf("nn::oe: focus test: the window is %s (unfocused = %s, handling mode %d)\n", k_test_state[test_phase], pause ? "pause" : "run", g_oe_focus_mode);
+            if (test_phase < 3) printf("nn::oe: focus test: the window is %s (unfocused = %s, handling mode %d)\n", k_test_state[test_phase], pause ? "pause" : "run (SMO_UNFOCUSED)", g_oe_focus_mode);
             fflush(stdout);
         }
         int flags = display_focus_flags();
@@ -192,7 +192,7 @@ static uint32_t oe_watch(void * pause) {
         int ours = !testing && (flags & 1);
         if (ours) g_oe_was_foreground = 1;
         int minimised = (flags & 2) != 0;
-        int pausing = pause || gfx_options()->pause_unfocused;      /* the settings menu may switch it while playing */
+        int pausing = pause != NULL;                       /* (the thread argument: 1 = pause while unfocused) */
         int runnable = !pausing || !g_oe_was_foreground || ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
@@ -215,9 +215,11 @@ static void oe_track_focus(void) {
     static volatile int32_t watcher;
     uint64_t now = plat_ms();
     if (enabled < 0) { const char *e = getenv("SMO_FOCUS_NOTIFY"); enabled = !(e && e[0] == '0'); }
-    if (enabled && plat_cas(&watcher, 1, 0) == 0) {     /* the watcher: pauses the game while unfocused = pause (the settings menu
-                                                         * may switch it on later, so it always runs; 20 ms polls), and the test */
-        int pause = gfx_options()->pause_unfocused;
+    if (enabled && plat_cas(&watcher, 1, 0) == 0) {     /* the watcher: pauses the game while its window is not active (20 ms polls), and the test */
+        /* as the console's HOME menu: the game stops while its window is not the active one (always; SMO_UNFOCUSED=run,
+         * TEST ONLY, keeps a test copy running behind other windows: scripts/run.py sets it) */
+        const char *e = getenv("SMO_UNFOCUSED");
+        int pause = !(e && !strcmp(e, "run"));
         plat_thread_detach(plat_thread_start(oe_watch, (void *)(intptr_t)pause, 0));
     }
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;

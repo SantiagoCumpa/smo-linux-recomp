@@ -123,6 +123,34 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
 - **Caches stay in the repository:** the translated shaders in `build/cache/vk`, and the driver's own caches in
   `build/cache` (`run.py` sets `XDG_CACHE_HOME`, `__GL_SHADER_DISK_CACHE_PATH` and `MESA_SHADER_CACHE_DIR`).
   Temporary files go to `build/tmp`.
+- **Mods: the base game and what changes it.** With every mod off the program is the console's game, recompiled: it
+  draws at the game's own 900p, filters each texture as the game asks, waits for every shader and runs only the
+  game's own (lifted) code. Everything that changes that is a mod, switched on or off in the settings menu's Mods tab
+  (from the next start), and listed in `config/mods.ini` (`<folder> = on | off`, read when the game starts; a new mod is
+  added at the end with its default). The repository's default mods are in `defaults/mods/` (one folder each, a
+  `mod.ini` with `name`, `description`, `default`):
+  | Mod | Default | What it is |
+  |---|---|---|
+  | `hd-resolution` | on | `feature = hd_resolution`: the internal resolution of `graphics.ini` / the menu (720p to 2160p); off: 900p |
+  | `anisotropic-filtering` | on | `feature = anisotropic_filtering`: `anisotropic_filtering` of `graphics.ini` / the menu |
+  | `async-shaders` | off | `feature = async_shaders`: a draw whose shader is not ready is left out instead of waited for |
+  | `fast-sampler-sort` | on | `library = fast_sampler_sort.so`: native code (its `src/`) in place of two hot game functions, the same results |
+
+  A *feature* mod switches on a change the runtime itself makes (its code stays where it works, in the renderer:
+  `smo_mod_feature()` in `runtime/core/mods.c`). A *code* mod is C of its own (`src/`), compiled by
+  `tools/lifter/build_mods.py` (run by `build_exe.py`) into a shared library against this build's headers and
+  `build/gen/image.h` (the game's addresses), loaded before the game runs when the mod is on, and given
+  `runtime/core/smo_mod_api.h` (the lifted function at a guest address, its code's end, a trap, the features). A mod's
+  `romfs/` replaces or adds files of the game's RomFS by the same path; a folder in the emulators' layout
+  (`mods/<name>/romfs/...`, also `mods/<title id>/<name>/...` copied from an emulator's load folder) is a mod without a
+  `mod.ini` (on). The file system (`runtime/fs/nnfs.c`) looks for a file in each mod that is on, in the order of
+  `mods.ini`, then in the game's RomFS (a directory lists the entries of all of them). `exefs/` (code patches for
+  emulators, `.ips` / `.pchtxt`) is not applied. `tools/make_game_folder.py` puts the default mods in the game
+  folder's `mods/` every time (marked `.default`; the player's own mods are left alone); a build run from the
+  repository finds them in `build/mods`. The log's `mods:` lines say which are on and what each does. A mod that
+  replaces shader archives changes the shaders: `./smo --compile-shaders` then makes its own.
+- **Defaults:** `defaults/config/graphics.ini` and `controllers.ini` are the settings a new game folder starts with; the
+  program embeds them when it is built (`build/gen/defaults_embed.h`) and writes the same text when a file is missing.
 - **Shaders compiled ahead (`./smo --compile-shaders`):** the game hands most of its shader programs over at start
   (the `.sharcb` archives and the effects), and those are made then. The materials of the objects and kingdoms
   (`ShaderData/*.bfsha`: 20,816 programs, 18,046 of them in `alRenderMaterial`) are handed over while you play, the
@@ -172,14 +200,14 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   there is no `resolution` line; `SMO_VK_SCALE` wins over both.
 - Settings menu: F1 while you play, or a pad's HOME button. The game waits and a menu in the game's own style shows
   three tabs: Display (internal resolution, window mode, window size in the window modes, vertical sync, performance
-  overlay and its position), Graphics (the GPU, from the Vulkan devices of the PC; anisotropic filtering; whether a draw
-  waits for a shader that is not ready) and System (what the game does while another window is active, the game's
+  overlay and its position), Graphics (the GPU, from the Vulkan devices of the PC; anisotropic filtering) and System (the game's
   language, and where the saves, captures, settings and logs are). Up / down choose a row, left / right change its
-  value (it then says `(not applied)`), L / R switch tabs, **A applies** every change shown: written to `graphics.ini`
-  and, for the window, vertical sync, overlay and unfocused behaviour, applied at once. Resolution, GPU, filtering,
-  shaders and language take effect at the next start (`(after restart)`); A once more restarts the game in place
-  (progress since the last save is lost). B (or F1, HOME, Escape) closes and drops what was not applied. Settings go to `graphics.ini` (comments kept); the menu's key is `settings_menu` in `controllers.ini`
-  `[hotkeys]`. (`profile = low`, the weak-GPU set, is a key of the file only.)
+  value (it then says `(not applied)`), L / R switch tabs, **+ (Enter) applies** every change shown: written to `graphics.ini`
+  and, for the window, vertical sync and overlay, applied at once. Resolution, GPU, filtering,
+  mods and language take effect at the next start (`(after restart)`); + once more restarts the game in place
+  (progress since the last save is lost). In the Mods tab A switches the chosen mod on or off (the guide at the bottom
+  shows A only there). B (or F1, HOME, Escape) closes and drops what was not applied. Settings go to `graphics.ini` (comments kept); the menu's key is `settings_menu` in `controllers.ini`
+  `[hotkeys]`.
 - Performance overlay: `performance_overlay = off | fps | detailed` in `graphics.ini` (and the menu): fps = frames per
   second and milliseconds per frame (green at 55 FPS and above, yellow from 40, red below); detailed = also the internal
   resolution, CPU load and temperature, GPU load and temperature, video memory and RAM (NVIDIA through the driver's
@@ -188,9 +216,8 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   `fps_overlay = <corner>` still works (fps in that corner).
 - The screen does not dim, lock or sleep while the game runs: a pad is not activity the desktop sees (on Wayland an
   idle inhibitor on the window). The log says `display: screen saver held off while the game runs`.
-  The game keeps running while its window does not have the focus or is minimised (pads and keyboard count only while
-  it has the focus); `unfocused = pause` in `graphics.ini` stops it then instead, as the console stops a game behind
-  its HOME menu.
+  The game pauses while its window does not have the focus or is minimised, as the console stops a game behind its HOME
+  menu (not a setting; test copies started by `scripts/run.py` keep running: `SMO_UNFOCUSED=run`).
 - Help (the pause menu's Action Guide) opens in your desktop's web browser (`xdg-open`). Unlike the console, the game
   keeps running while it is open, and the guide's Choose Mode item does not lead back into the game.
 - Text entry (a name the game asks for) opens a `zenity` or `kdialog` dialog when one is installed; without them the

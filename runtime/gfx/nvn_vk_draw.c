@@ -773,7 +773,10 @@ static int64_t g_rs_images, g_rs_stages, g_rs_fcs, g_rs_tf, g_rs_up, g_rs_down, 
 static float rs_scale(void) {
     if (g_rs < 0) {
         const char *e = getenv("SMO_VK_SCALE");
-        float v = e && atof(e) > 0 ? (float)atof(e) : gfx_options()->scale;
+        int smo_mod_feature(const char *);                 /* mods.c */
+        int hd = smo_mod_feature("hd_resolution");       /* the "HD resolution" mod: without it the game's own 900p, as the console */
+        float v = e && atof(e) > 0 ? (float)atof(e) : hd ? gfx_options()->scale : 1.0f;
+        if (!(e && atof(e) > 0) && !hd && gfx_options()->scale != 1.0f) printf("nvn_vk_scale: graphics.ini asks for scale %.3f, but the HD resolution mod is off: the game's own 900p\n", (double)gfx_options()->scale);
         if (v < 0.25f) v = 0.25f;
         if (v > 2.4f) v = 2.4f;                    /* 2.4 = 3840x2160: the launcher's highest resolution */
         g_rs = v;
@@ -1399,7 +1402,9 @@ static VkSampler sampler_get(const SamplerParams *p) {
     float aniso = p->aniso;
     {   /* anisotropic_filtering in graphics.ini = at least that on samplers that filter linearly between mip levels (not shadow-compare samplers) */
         static int64_t raised;
-        float want = (float)gfx_options()->aniso;
+        int smo_mod_feature(const char *);                 /* mods.c: the "Anisotropic filtering" mod (without it: each sampler as the game set it) */
+        static int on = -1; if (on < 0) on = smo_mod_feature("anisotropic_filtering");
+        float want = on ? (float)gfx_options()->aniso : 0.0f;
         if (want > aniso && minf >= 4 && p->cmode != 1) { aniso = want; raised++; if (raised == 1 || raised % 100 == 0) printf("nvn_vk: anisotropic_filtering=%d: %lld samplers raised so far (this one from %.0f)\n", gfx_options()->aniso, (long long)raised, p->aniso); }
     }
     if (aniso > 1.0f && D.f2.features.samplerAnisotropy) { ci.anisotropyEnable = VK_TRUE; ci.maxAnisotropy = aniso > V.props.limits.maxSamplerAnisotropy ? V.props.limits.maxSamplerAnisotropy : aniso; }

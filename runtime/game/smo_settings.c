@@ -2,7 +2,7 @@
  *
  * Three tabs. Display: internal resolution, window mode, window size (window modes only), vertical sync, performance
  * overlay and its position. Graphics: the GPU (the Vulkan devices of this PC), anisotropic filtering, whether a draw waits
- * for a shader not ready yet. System: what the game does while another window is active, the game's language, and where
+ * for a shader not ready yet. System: the game's language, and where
  * its files are (saves, captures, settings, logs; read only).
  *
  * As the amiibo menu (smo_amiibo.c), whose machinery it shares: the game is held after a presented frame (nvn_gl.c
@@ -11,17 +11,17 @@
  * and shown over the whole window (UiMenuJob). It is composed at most 1920 pixels wide (the window scales it), so a 4K
  * internal resolution does not make it slow.
  *
- * Left / right only show another choice ("(not applied)"); A applies them all: each is written to config/graphics.ini
+ * Left / right only show another choice ("(not applied)"); + (Enter) applies them all: each is written to config/graphics.ini
  * (gfx_options_save: the line of that key, comments kept) and what the running game can take changes at once: the window
  * mode and size (display.c, on the event loop), vertical sync (the swapchain is made again, nvn_vk.c), the performance
  * overlay, the unfocused behaviour (nnmisc.c reads it while it watches). The internal resolution, the GPU, anisotropic
- * filtering, shaders and the language are read when the game starts: they then say "(after restart)", and A once more
+ * filtering, shaders and the language are read when the game starts: they then say "(after restart)", and + once more
  * starts the game again in place (boot.c smo_restart; progress since the last save is lost, the menu says so). Closing
  * the menu drops what was not applied. The language is also written to the game folder's smo.env, which ./smo reads and
  * which would otherwise win.
  *
- * Controls: up / down (stick, +Control Pad, the keyboard's arrows) select a row, left / right change its choice, A
- * applies (or restarts), L / R (ZL / ZR, Q / E) switch tabs, B, Escape, HOME or F1 again
+ * Controls: up / down (stick, +Control Pad, the keyboard's arrows) select a row, left / right change its choice, + (Enter)
+ * applies (or restarts), A switches a mod on or off (Mods tab), L / R (ZL / ZR, Q / E) switch tabs, B, Escape, HOME or F1 again
  * close. Labels are English, drawn with the game's fonts. TEST AID: SMO_SETTINGS_SHOT_DIR=<folder> saves each new picture
  * of the menu as a PNG. */
 #include <ctype.h>
@@ -55,15 +55,17 @@ const char *oe_language(void);                           /* nnmisc.c */
 const char *fs_user_root(void);                          /* nnfs.c */
 int tex_write_png(const char *path, const uint8_t *rgba, int w, int h);
 
-enum { B_A = 0, B_B = 1, B_L = 6, B_R = 7, B_ZL = 8, B_ZR = 9, B_LEFT = 12, B_UP = 13, B_RIGHT = 14, B_DOWN = 15,
+enum { B_A = 0, B_B = 1, B_L = 6, B_R = 7, B_PLUS = 10, B_ZL = 8, B_ZR = 9, B_LEFT = 12, B_UP = 13, B_RIGHT = 14, B_DOWN = 15,
        B_SL_LEFT = 16, B_SL_UP = 17, B_SL_RIGHT = 18, B_SL_DOWN = 19 };
 #define BIT(b) (1ull << (b))
 
 /* ---------------------------------------------------------------- the settings */
-enum { K_RES, K_MODE, K_SIZE, K_VSYNC, K_PERF, K_CORNER, K_GPU, K_ANISO, K_SHADERS, K_UNFOCUSED, K_LANG,
-       K_PATH_SAVE, K_PATH_ALBUM, K_PATH_CONFIG, K_PATH_LOGS };
-enum { TAB_DISPLAY, TAB_GRAPHICS, TAB_SYSTEM, TABS };
-static const char *const k_tab[TABS] = {"Display", "Graphics", "System"};
+enum { K_RES, K_MODE, K_SIZE, K_VSYNC, K_PERF, K_CORNER, K_GPU, K_ANISO, K_LANG,
+       K_PATH_SAVE, K_PATH_ALBUM, K_PATH_CONFIG, K_PATH_LOGS, K_PATH_MODS, K_MOD0 /* K_MOD0 + i: the i-th mod (nnfs.c fs_mod_*) */ };
+#define MODS_MAX 32
+enum { TAB_DISPLAY, TAB_GRAPHICS, TAB_SYSTEM, TAB_MODS, TABS };
+static const char *const k_tab[TABS] = {"Display", "Graphics", "System", "Mods"};
+#define VISIBLE_ROWS 7                                    /* rows that fit above the footer; a longer tab scrolls with the choice */
 #define MAXCH 20
 typedef struct { char value[128], label[128]; } Choice;
 typedef struct {
@@ -73,7 +75,7 @@ typedef struct {
     Choice ch[MAXCH];
     char path[PATH_MAX];                                  /* the path rows */
 } Item;
-static Item g_items[16];
+static Item g_items[16 + 1 + MODS_MAX];
 static char (*g_next)[128];                               /* by key: the value saved for the next start (items_load) */
 static int g_nitems;
 
@@ -154,13 +156,7 @@ static void items_load(void) {
     it = item_add(K_ANISO, TAB_GRAPHICS, "Anisotropic filtering", 1);
     choice(it, "game", "The game's own"); choice(it, "2", "2x"); choice(it, "4", "4x"); choice(it, "8", "8x"); choice(it, "16", "16x");
     it->cur = go->aniso == 2 ? 1 : go->aniso == 4 ? 2 : go->aniso == 8 ? 3 : go->aniso == 16 ? 4 : 0;
-    it = item_add(K_SHADERS, TAB_GRAPHICS, "Shaders not ready yet", 1);
-    choice(it, "hold", "Wait (correct picture, some stutter)"); choice(it, "skip", "Skip (no stutter, effects late)");
-    it->cur = go->shader_skip ? 1 : 0;
     /* ---- System */
-    it = item_add(K_UNFOCUSED, TAB_SYSTEM, "When another window is active", 0);
-    choice(it, "run", "Keep playing"); choice(it, "pause", "Pause, as the HOME menu does");
-    it->cur = go->pause_unfocused ? 1 : 0;
     it = item_add(K_LANG, TAB_SYSTEM, "Game language", 1);
     static const char *const k_lang[][2] = {{"system", "System language"}, {"en-US", "English (US)"}, {"en-GB", "English (UK)"},
         {"es", "Spanish (Spain)"}, {"es-419", "Spanish (Latin America)"}, {"fr", "French"}, {"fr-CA", "French (Canada)"}, {"de", "German"},
@@ -184,8 +180,23 @@ static void items_load(void) {
     it = item_add(K_PATH_LOGS, TAB_SYSTEM, "Logs", 0);
     snprintf(buf, sizeof buf, "%s/../logs", plat_exe_dir());
     if (access(buf, F_OK) == 0) path_of(it->path, buf); else snprintf(it->path, sizeof it->path, "the terminal that started the game");
+    /* ---- Mods: every mod found (mods.c: the order of config/mods.ini), then the folder */
+    {   int mods_count(void); const char *mods_name(int); int mods_is_on(int); int mods_usable(int, int *); int mods_has_files_only(int); const char *mods_dir(void);
+        int nm = mods_count();
+        if (nm > MODS_MAX) nm = MODS_MAX;
+        for (int i = 0; i < nm; i++) {
+            int files = 0, usable = mods_usable(i, &files);
+            it = item_add(K_MOD0 + i, TAB_MODS, mods_name(i), 1);
+            if (!usable) { choice(it, "x", "Code patches for emulators: not supported"); it->cur = 0; continue; }
+            if (mods_has_files_only(i)) snprintf(buf, sizeof buf, "On (%d file%s)", files, files == 1 ? "" : "s"); else snprintf(buf, sizeof buf, "On");
+            choice(it, "off", "Off"); choice(it, "on", buf);          /* a switch: right = on */
+            it->cur = mods_is_on(i) ? 1 : 0;
+        }
+        it = item_add(K_PATH_MODS, TAB_MODS, "Mods folder", 0);
+        path_of(it->path, mods_dir());
+    }
     /* what the game runs with is what the file had at the first opening; a value saved since for the next start is shown */
-    static char run[32][128], next[32][128];
+    static char run[K_MOD0 + MODS_MAX][128], next[K_MOD0 + MODS_MAX][128];
     static int have_run;
     for (int i = 0; i < g_nitems; i++) {
         Item *e = &g_items[i];
@@ -201,15 +212,20 @@ static void items_load(void) {
     have_run = 1;
     g_next = next;
 }
-static int item_is_path(const Item *it) { return it->key >= K_PATH_SAVE && it->key <= K_PATH_LOGS; }
+static int item_is_path(const Item *it) { return it->key >= K_PATH_SAVE && it->key <= K_PATH_MODS; }
 static int item_enabled(const Item *it) {
     if (it->key == K_SIZE) {                              /* only in the window modes: the mode shown (it may not be applied yet) */
         for (int i = 0; i < g_nitems; i++) if (g_items[i].key == K_MODE) return g_items[i].cur >= 2;
         return window_mode_now() == 0 || window_mode_now() == 3;
     }
+    if (it->key >= K_MOD0) return it->n > 1;                /* a mod with code patches only: shown, not switchable */
+    {   int smo_mod_feature(const char *);                 /* options of a mod: only while it is on (this run) */
+        if (it->key == K_RES) return smo_mod_feature("hd_resolution");
+        if (it->key == K_ANISO) return smo_mod_feature("anisotropic_filtering");
+    }
     return !item_is_path(it);
 }
-static int unsaved(void) {                                /* changes shown, not applied yet (A applies them) */
+static int unsaved(void) {                                /* changes shown, not applied yet (+ applies them) */
     for (int i = 0; i < g_nitems; i++) if (g_items[i].cur != g_items[i].saved) return 1;
     return 0;
 }
@@ -238,6 +254,9 @@ static void apply(Item *it) {
     const char *v = it->ch[it->cur].value;
     switch (it->key) {
     case K_RES: gfx_options_save("resolution", v); break;
+    default:
+        if (it->key >= K_MOD0 && it->n > 1) { void mods_set(int, int); mods_set(it->key - K_MOD0, it->cur == 1); }
+        break;
     case K_MODE: {
         static const int k_mode[4] = {1, 2, 3, 0};        /* choice -> window_mode */
         go->window_mode = k_mode[it->cur & 3];
@@ -260,9 +279,7 @@ static void apply(Item *it) {
     case K_PERF: go->perf_overlay = it->cur; gfx_options_save("performance_overlay", v); display_set_perf_overlay(it->cur, 0); break;
     case K_CORNER: go->overlay_corner = it->cur + 1; gfx_options_save("overlay_corner", v); display_set_perf_overlay(display_perf_overlay(), it->cur + 1); break;
     case K_GPU: gfx_options_save("gpu", v); break;
-    case K_SHADERS: gfx_options_save("shader_wait", v); break;
     case K_ANISO: gfx_options_save("anisotropic_filtering", v); break;
-    case K_UNFOCUSED: go->pause_unfocused = it->cur; gfx_options_save("unfocused", v); break;
     case K_LANG: {
         int sys = !strcmp(v, "system");
         gfx_options_save("language", v);
@@ -289,7 +306,7 @@ static struct {
     int tried, ok;
     UiFont *title, *msg, *dev;
     UiImage cursor, corner, corner_sh, arrow, bg, frame;
-    uint16_t footer[256];
+    uint16_t footer[256], footer_mods[256];
     int tab, sel;                                         /* the tab shown; the row chosen in it */
 } S;
 static const float k_title = 0.62f, k_tab_scale = 0.50f;  /* layout units per font pixel (TitleFont60, MessageFont38) */
@@ -301,7 +318,8 @@ static int menu_load(void) {
     size_t fn = 0, sn = 0;
     uint8_t *fonts = ui_lang_arc("LayoutData/FontData.szs", &fn), *sys = ui_lang_arc("MessageData/SystemMessage.szs", &sn);
     if (fonts) { S.title = ui_font_in(fonts, fn, "TitleFont60.bffnt"); S.msg = ui_font_in(fonts, fn, "MessageFont38.bffnt"); S.dev = ui_font_in(fonts, fn, "DeviceFont80.bffnt"); }
-    ui_u16(S.footer, "\uE0E4\uE0E5 Tab   \uE101 Select   \uE0E1 Close   \uE0E0 Apply", 256);     /* the game's footer icons (DeviceFont) */
+    ui_u16(S.footer, "\uE0E4\uE0E5 Tab   \uE101 Select   \uE0E1 Close   \uE0EF Apply", 256);     /* the game's footer icons (DeviceFont) */
+    ui_u16(S.footer_mods, "\uE0E4\uE0E5 Tab   \uE101 Select   \uE0E0 On / Off   \uE0E1 Close   \uE0EF Apply", 256);      /* the Mods tab: A switches a mod */
     S.ok = S.title && S.msg && S.dev &&
            ui_layout_tex("CursorParts", "CmCursor00^w", &S.cursor) && ui_layout_tex("SelectMenuParts", "CmSelectCorner^s", &S.corner) &&
            ui_layout_tex("SelectMenuParts", "CmSelectCornerSh^s", &S.corner_sh) && ui_layout_tex("CursorArrowParts", "CmArrow^s", &S.arrow);
@@ -340,6 +358,14 @@ static void fit_path(char *out, size_t cap, const char *p, const UiFont *f, floa
 #define SEL_SCALE (29.3f / 46.0f)
 #define ROW_SCALE (21.3f / 46.0f)
 
+/* a rounded bar (a circle when it is as wide as high): rows of the menu's units, each as wide as the round ends allow */
+static void pill(UiImage *d, UiXf xf, float x0, float y0, float x1, float y1, uint32_t rgba) {
+    float r = (y1 - y0) * 0.5f, cy = (y0 + y1) * 0.5f, step = 0.5f;
+    for (float y = y0; y < y1; y += step) {
+        float dy = (y + step * 0.5f) - cy, cut = r - sqrtf(r * r - dy * dy > 0 ? r * r - dy * dy : 0);
+        if (x0 + cut < x1 - cut) ui_draw(d, xf, x0 + cut, y, x1 - cut, y + step, NULL, 0, 0, 0, 0, rgba);
+    }
+}
 static void menu_draw(void) {
     UiImage *d = &S.frame;
     if (d->w != S.bg.w || d->h != S.bg.h || !d->px) { ui_image_free(d); d->w = S.bg.w; d->h = S.bg.h; d->ch = 4; d->px = malloc((size_t)d->w * d->h * 4); }
@@ -361,24 +387,26 @@ static void menu_draw(void) {
     }
     ui_draw(d, scr, -590.0f, 176.0f, 590.0f, 178.0f, NULL, 0, 0, 0, 0, 0xffffff70);      /* a thin line under the tabs */
     /* the rows */
-    Item *rows[24];
+    Item *rows[16 + 1 + MODS_MAX];
     int n = tab_rows(S.tab, rows);
     if (S.sel >= n) S.sel = n - 1;
     UiXf lx = ui_xf_mul(scr, ui_xf_move(LIST_X, LIST_Y));
     UiFontInfo ti; ui_font_info(S.title, &ti);
     float vsc_row = k_msg * 1.05f, rx = ITEM_X + BAR_W - 26.0f;
-    for (int r = 0; r < n; r++) {
+    int first = S.sel >= VISIBLE_ROWS ? S.sel - VISIBLE_ROWS + 1 : 0, shown = n - first < VISIBLE_ROWS ? n - first : VISIBLE_ROWS;      /* a long tab scrolls with the choice */
+    for (int r = first; r < first + shown; r++) {
         Item *it = rows[r];
         int chosen = r == S.sel, enabled = item_enabled(it), path = item_is_path(it);
         int arrows = enabled && !path;
-        float cy = -ROW_STEP * (float)r, lsc = chosen ? SEL_SCALE : ROW_SCALE;
+        float cy = -ROW_STEP * (float)(r - first), lsc = chosen ? SEL_SCALE : ROW_SCALE;
         float lbase = cy + 4.0f - (float)ti.ascent * 0.33f * lsc;
         char label[160], value[PATH_MAX + 8];
         snprintf(label, sizeof label, "%s", it->label);      /* (the game's fonts have no '*' or ';': plain words below) */
         float vsc = path ? vsc_row * 0.82f : vsc_row;
         if (path) fit_path(value, sizeof value, it->path, S.msg, vsc, 660.0f);
         else snprintf(value, sizeof value, "%s%s", it->ch[it->cur].label, it->cur != it->saved ? " (not applied)" : it->restart && it->saved != it->start ? " (after restart)" : "");
-        if (!enabled && !path) snprintf(value, sizeof value, "Only in the window modes");
+        if (!enabled && !path) snprintf(value, sizeof value, "%s", it->key == K_SIZE ? "Only in the window modes" : it->key == K_RES ? "Needs the HD resolution mod (Mods tab)" :
+                                                                   it->key == K_ANISO ? "Needs the Anisotropic filtering mod (Mods tab)" : it->ch[it->cur].label);      /* (a mod with code patches only says so) */
         float vbase = cy + 4.0f - (float)mi.ascent * 0.33f * vsc;
         uint32_t fg = chosen ? 0x4d4241ff : enabled || path ? 0xffffffff : 0xffffff80;
         if (chosen) {
@@ -389,6 +417,21 @@ static void menu_draw(void) {
             ui_draw(d, lx, ccx - cw * 0.5f, ccy - ch * 0.5f, ccx + cw * 0.5f, ccy + ch * 0.5f, &S.cursor, 0, 0, (float)S.cursor.w, (float)S.cursor.h, 0xffffffff);
         }
         text_u(d, lx, S.title, label, ITEM_X + 74.0f, lbase, lsc, fg, !chosen);
+        if (it->key >= K_MOD0 && it->n == 2) {           /* a mod: a switch (right and gold = on), its state beside it */
+            int on = it->cur == 1;
+            float sw = 66.0f, sh = 32.0f, x1 = rx + 4.0f, x0 = x1 - sw, r = sh * 0.5f;
+            uint32_t track = on ? 0xbaa000ff : chosen ? 0xb8b2acff : 0x8c8681c0;
+            pill(d, lx, x0, cy - r, x1, cy + r, track);
+            float kx = on ? x1 - r : x0 + r, kr = r - 4.0f;
+            pill(d, lx, kx - kr + 1.0f, cy - kr - 2.0f, kx + kr + 1.0f, cy + kr - 2.0f, 0x00000038);      /* the knob's shadow */
+            pill(d, lx, kx - kr, cy - kr, kx + kr, cy + kr, 0xffffffff);
+            char st[96];
+            int mods_has_files_only(int);
+            snprintf(st, sizeof st, "%s", it->cur != it->saved ? "not applied" : it->restart && it->saved != it->start ? "after restart" : "");
+            if (!st[0] && on && mods_has_files_only(it->key - K_MOD0)) snprintf(st, sizeof st, "%s", it->ch[1].label + 3);      /* "(12 files)" */
+            if (st[0]) { float w = text_w(S.msg, st, vsc); text_u(d, lx, S.msg, st, x0 - 16.0f - w, vbase, vsc, fg, !chosen); }
+            continue;
+        }
         float vw = text_w(S.msg, value, vsc), vx = rx - vw - (arrows ? 30.0f : 0.0f);
         text_u(d, lx, S.msg, value, vx, vbase, vsc, fg, !chosen);
         if (arrows) {                                     /* the arrows: left when there is a choice before, right after */
@@ -399,19 +442,24 @@ static void menu_draw(void) {
         }
     }
     /* under the rows, while there is something for A to do: what it does now */
-    const char *todo = unsaved() ? "\uE0E0 Apply the changes" :
-                       restart_pending() ? "Some changes apply after a restart.   \uE0E0 Restart now (progress since the last save is lost)" : NULL;
+    const char *todo = unsaved() ? "\uE0EF Apply the changes" :
+                       restart_pending() ? "Some changes apply after a restart.   \uE0EF Restart now (progress since the last save is lost)" : NULL;
+    if (!todo && n && S.sel < n && rows[S.sel]->key >= K_MOD0) {      /* a mod chosen: what it does (its mod.ini) */
+        const char *mods_desc(int); const char *dsc = mods_desc(rows[S.sel]->key - K_MOD0);
+        if (dsc && dsc[0]) todo = dsc;
+    }
     if (todo) {
         uint16_t t[160];
         ui_u16(t, todo, 160);
-        float y = LIST_Y - ROW_STEP * (float)n - 30.0f, sc = k_msg * 1.05f;
+        float y = LIST_Y - ROW_STEP * (float)shown - 30.0f, sc = k_msg * 1.05f;
         ui_shadow_text(d, scr, S.msg, S.dev, t, LIST_X + ITEM_X + 74.0f, y - (float)mi.ascent * 0.33f * sc, sc, 0xffffffff);
     }
     /* the footer, as the game's menus: white, a gold line on top, the guide on the right in gold */
     ui_draw(d, scr, -640.0f, -360.0f, 640.0f, -302.0f, NULL, 0, 0, 0, 0, 0xffffffff);
     ui_draw(d, scr, -640.0f, -306.0f, 640.0f, -302.0f, NULL, 0, 0, 0, 0, 0xbaa000ff);
-    float fsc = 16.8f / 32.0f, fw = ui_text(NULL, scr, S.msg, S.dev, S.footer, -1, 0, 0, fsc, 0);
-    ui_text(d, scr, S.msg, S.dev, S.footer, -1, 578.0f - fw, -339.0f, fsc, 0xbaa000ff);
+    const uint16_t *foot = S.tab == TAB_MODS ? S.footer_mods : S.footer;      /* A only where it does something: the Mods tab */
+    float fsc = 16.8f / 32.0f, fw = ui_text(NULL, scr, S.msg, S.dev, foot, -1, 0, 0, fsc, 0);
+    ui_text(d, scr, S.msg, S.dev, foot, -1, 578.0f - fw, -339.0f, fsc, 0xbaa000ff);
 }
 
 /* ---------------------------------------------------------------- the menu */
@@ -459,7 +507,7 @@ void settings_menu_run(void *pj) {
         if ((vdir || hdir) && (press & dirs)) { vstep = vdir; hstep = hdir; held = 0; repeat = 0; }
         else if ((vdir || hdir) && ++held >= 30 && ++repeat % 5 == 1) { vstep = vdir; hstep = hdir; }   /* the pause menu's key repeat */
         if (!vdir && !hdir) held = repeat = 0;
-        Item *rows[24];
+        Item *rows[16 + 1 + MODS_MAX];
         int n = tab_rows(S.tab, rows);
         if (vstep) { S.sel = (S.sel + vstep + n) % n; changed = 1; }
         if (press & (BIT(B_L) | BIT(B_ZL))) { S.tab = (S.tab + TABS - 1) % TABS; S.sel = 0; changed = 1; }
@@ -471,7 +519,8 @@ void settings_menu_run(void *pj) {
             int c = it->cur + hstep;
             if (c >= 0 && c < it->n) { it->cur = c; changed = 1; }
         }
-        if ((press & BIT(B_A)) || hid_menu_key(1)) {        /* A applies what is shown; with nothing left, restarts if needed */
+        if ((press & BIT(B_A)) && it->key >= K_MOD0 && it->n == 2) { it->cur ^= 1; changed = 1; }      /* A: a mod's switch on / off */
+        if ((press & BIT(B_PLUS)) || hid_menu_key(1)) {     /* + (Enter) applies what is shown; with nothing left, restarts if needed */
             if (unsaved()) { apply_all(); changed = 1; }
             else if (restart_pending()) { restart = 1; break; }
         }

@@ -1,4 +1,7 @@
-/* smo_fast.c - host versions of hot game code, put into the loaded game DLL at start-up.
+/* fast_sampler_sort.c - the "Fast sampler sort" mod (defaults/mods/fast-sampler-sort): host versions of hot game code,
+ * put into the loaded game library at start-up. A code mod (runtime/core/smo_mod_api.h): built into
+ * fast_sampler_sort.so by tools/lifter/build_mods.py, loaded by runtime/core/mods.c when the mod is on. It changes no
+ * result of the game's: the same order, the same answers, in less time. Off, the game's own (lifted) code runs.
  *
  * THE SAMPLER LIST SORT. agl::driver::NVNMgr::registerSampler_ [main] adds a sampler to the manager's list and then
  * sorts the WHOLE list again by its 16-bit key with sead::PtrArrayImpl::sort, a cocktail-shaker sort that calls the
@@ -16,16 +19,20 @@
  * and its rel32 is pointed at a stub within 2 GB that jumps to the host function. Nothing else in the DLL changes, and
  * nothing at all when the call is not found exactly once (said in the log).
  *
- * SMO_FAST=0 leaves the game's code alone. SMO_FAST_CHECK=1 also runs the lifted sort on the same list and stops the
- * game if the two orders ever differ (counts at exit). */
+ * SMO_FAST_CHECK=1 also runs the lifted sort on the same list and stops the game if the two orders ever differ (counts
+ * at exit). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "plat.h"
-#include "runtime.h"
-#include "hostrt.h"
+#include <errno.h>
+#include <unistd.h>
 #include <link.h>
 #include <sys/mman.h>
+#include "runtime.h"
+#include "hostrt.h"                                 /* GUEST_BASE and build/gen/image.h GAME_SYM_*: this game build's addresses (declarations only: the mod calls the runtime through SmoModApi) */
+#include "smo_mod_api.h"
+
+static const SmoModApi *g_api;
 
 /* Rewrites the rel32 of a call instruction in the game library's code (r-x pages: made writable for the store, then
  * r-x again). 1 on success. */
@@ -66,15 +73,7 @@ static void (*g_lifted_sort)(Ctx *);
 static int g_check;
 static int64_t g_sorts, g_items, g_swaps, g_other, g_checked;
 
-static void (*host_fn_of(uint64_t guest))(Ctx *) {          /* the lifted function at a guest address (fn_table is sorted) */
-    int lo = 0, hi = fn_table_count - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        if (fn_table[mid].addr == guest) return fn_table[mid].fn;
-        if (fn_table[mid].addr < guest) lo = mid + 1; else hi = mid - 1;
-    }
-    return NULL;
-}
+static void (*host_fn_of(uint64_t guest))(Ctx *) { return g_api->game_fn(guest); }      /* the lifted function at a guest address */
 
 /* compareSamplerKey_(a, b) [main]: the 16-bit key at offset 0x62 of a minus that of b */
 static inline int key_cmp(uint64_t a, uint64_t b) { return (int)rd16(a + 0x62) - (int)rd16(b + 0x62); }
@@ -110,7 +109,7 @@ static void sampler_sort(Ctx *c) {
     g_sorts++; g_items += n;
     if (!g_check) { g_swaps += shaker_sort_keys(p, n); return; }
     uint64_t *before = malloc((size_t)n * 8), *mine = malloc((size_t)n * 8);
-    if (!before || !mine) guest_trap("smo_fast: out of host memory for SMO_FAST_CHECK", c->x[30]);
+    if (!before || !mine) g_api->trap("smo_fast: out of host memory for SMO_FAST_CHECK", c->x[30]);
     memcpy(before, p, (size_t)n * 8);
     g_swaps += shaker_sort_keys(p, n);
     memcpy(mine, p, (size_t)n * 8);
@@ -121,7 +120,7 @@ static void sampler_sort(Ctx *c) {
             printf("smo_fast: CHECK FAILED: sampler list sort #%lld of %d entries differs from the game's at index %d (%llx, game %llx)\n",
                    (long long)g_sorts, n, i, (unsigned long long)mine[i], (unsigned long long)p[i]);
             fflush(stdout);
-            guest_trap("smo_fast: the host sampler list sort differs from the game's (SMO_FAST_CHECK)", c->x[30]);
+            g_api->trap("smo_fast: the host sampler list sort differs from the game's (SMO_FAST_CHECK)", c->x[30]);
         }
     g_checked++;
     free(before); free(mine);
@@ -174,8 +173,9 @@ static uint8_t *alloc_near(uint8_t *site) {
         for (int s = 0; s < 2; s++) {
             uintptr_t a = s ? base + d : base - d;
             if (!s && base < d) continue;
-            void *m = plat_alloc((void *)a, 0x1000, PLAT_RW);     /* exactly there or nothing */
-            if (m) return m;
+            void *m = mmap((void *)a, 0x1000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);      /* exactly there or nothing */
+            if (m != MAP_FAILED && m == (void *)a) return m;
+            if (m != MAP_FAILED) munmap(m, 0x1000);
         }
     }
     return NULL;
@@ -214,7 +214,7 @@ static void install_register(void) {
                 void (*fn)(Ctx *) = sampler_register;
                 if (!(stub = alloc_near(q))) break;
                 memcpy(stub, jmp_abs, 6); memcpy(stub + 6, &fn, 8);
-                plat_protect(stub, 0x1000, PLAT_RX);
+                mprotect(stub, 0x1000, PROT_READ | PROT_EXEC);
             }
             int64_t rel64 = stub - (q + 5);
             if (rel64 != (int32_t)rel64 || !patch_rel32(q + 1, (int32_t)rel64)) continue;
@@ -225,20 +225,20 @@ static void install_register(void) {
     printf("smo_fast: registerSampler_'s taken-slot answer in host code at %d of %d call sites (the free-slot search of registerSampler)\n", patched, sites);
 }
 
-void smo_fast_install(void) {
-    const char *e = getenv("SMO_FAST");
-    if (e && !atoi(e)) { printf("smo_fast: off (SMO_FAST=0): the game's sampler list sort runs as lifted\n"); return; }
+__attribute__((visibility("default"))) int smo_mod_init(const SmoModApi *api) {
+    g_api = api;
+    if (api->version < SMO_MOD_API_VERSION) { printf("smo_fast: the runtime's mod interface is older (%d) than this mod's (%d): not installed\n", api->version, SMO_MOD_API_VERSION); return 1; }
     if (!SYM_SORT || !SYM_REGISTER || !SYM_KEYCMP) {   /* gen_tables.py: not in this main.elf (a stripped update) */
         printf("smo_fast: off: the game's sampler list functions are not known; its sort runs as lifted\n");
-        return;
+        return 1;
     }
     g_check = getenv("SMO_FAST_CHECK") && atoi(getenv("SMO_FAST_CHECK"));
     g_lifted_sort = host_fn_of(SYM_SORT);
     uint8_t *caller = (uint8_t *)(uintptr_t)host_fn_of(SYM_REGISTER);
-    uint8_t *end = caller ? (uint8_t *)host_fn_end((uintptr_t)caller) : NULL, *at = NULL;
+    uint8_t *end = caller ? (uint8_t *)g_api->game_fn_end((SmoGameFn)(uintptr_t)caller) : NULL, *at = NULL;
     if (!g_lifted_sort || !end || end <= caller || end - caller > 0x100000) {
         printf("smo_fast: NOT installed: the lifted registerSampler_ or sead::PtrArrayImpl::sort was not found, or its code's end is not known\n");
-        return;
+        return 1;
     }
     int found = 0;
     for (uint8_t *q = caller; q + 5 <= end; q++) {        /* call rel32 whose target is the lifted sort */
@@ -246,22 +246,23 @@ void smo_fast_install(void) {
         memcpy(&rel, q + 1, 4);
         if (q[0] == 0xE8 && q + 5 + rel == (uint8_t *)(uintptr_t)g_lifted_sort) { at = q; found++; }
     }
-    if (found != 1) { printf("smo_fast: NOT installed: %d calls of the sort in the lifted registerSampler_ (%d bytes of code), expected exactly 1\n", found, (int)(end - caller)); return; }
+    if (found != 1) { printf("smo_fast: NOT installed: %d calls of the sort in the lifted registerSampler_ (%d bytes of code), expected exactly 1\n", found, (int)(end - caller)); return 1; }
     uint8_t *stub = alloc_near(at);
-    if (!stub) { printf("smo_fast: NOT installed: no page within 2 GB of the game's code for the jump\n"); return; }
+    if (!stub) { printf("smo_fast: NOT installed: no page within 2 GB of the game's code for the jump\n"); return 1; }
     void (*target)(Ctx *) = sampler_sort;
     static const uint8_t jmp_abs[6] = {0xFF, 0x25, 0, 0, 0, 0};      /* jmp [rip + 0], then the 8-byte address */
     memcpy(stub, jmp_abs, 6); memcpy(stub + 6, &target, 8);
-    plat_protect(stub, 0x1000, PLAT_RX);
+    mprotect(stub, 0x1000, PROT_READ | PROT_EXEC);
     int64_t rel64 = stub - (at + 5);
-    if (rel64 != (int32_t)rel64) { printf("smo_fast: NOT installed: the stub is out of rel32 range\n"); return; }
-    if (!patch_rel32(at + 1, (int32_t)rel64)) { printf("smo_fast: NOT installed: the game's code cannot be written (%s)\n", strerror(errno)); return; }
-    printf("smo_fast: agl::driver::NVNMgr::registerSampler_ sorts its sampler list in host code (SMO_FAST=0: the game's own code%s)\n",
+    if (rel64 != (int32_t)rel64) { printf("smo_fast: NOT installed: the stub is out of rel32 range\n"); return 1; }
+    if (!patch_rel32(at + 1, (int32_t)rel64)) { printf("smo_fast: NOT installed: the game's code cannot be written (%s)\n", strerror(errno)); return 1; }
+    printf("smo_fast: agl::driver::NVNMgr::registerSampler_ sorts its sampler list in host code (the mod off: the game's own code%s)\n",
            g_check ? "; SMO_FAST_CHECK=1: every sort compared with the game's" : ", SMO_FAST_CHECK=1: compare with it");
     install_register();
+    return 0;
 }
 
-void smo_fast_report(FILE *out) {
+__attribute__((visibility("default"))) void smo_mod_report(FILE *out) {
     if (g_reg_skipped) fprintf(out, "smo_fast: registerSampler's free-slot walk: %lld taken slots jumped over\n", g_reg_skipped);
     if (g_reg_taken || g_reg_free) fprintf(out, "smo_fast: registerSampler_ calls: %lld on a taken slot answered in host code, %lld on a free slot passed to the game's code\n",
                                             (long long)g_reg_taken, (long long)g_reg_free);

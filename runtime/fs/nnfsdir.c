@@ -36,19 +36,20 @@
 typedef struct { char name[0x301]; int is_file; int64_t size; } HostEntry;
 typedef struct { uint32_t magic; int count, pos; HostEntry *entries; } HostDir;
 
-int fs_dir_roots(const char *guest, char roots[2][PATH_MAX], uint32_t *result);   /* nnfs.c: mount table + save data journal view */
+#define FS_DIR_ROOTS 18                             /* nnfs.c: up to 16 RomFS mods, or a save data working folder, + the mount's own */
+int fs_dir_roots(const char *guest, char roots[][PATH_MAX], uint32_t *result);   /* nnfs.c: mount table + save data journal view + RomFS mods */
 int fs_dir_hidden(const char *guest_dir, const char *name);
 
 static int entry_cmp(const void *a, const void *b) { return strcasecmp(((const HostEntry *)a)->name, ((const HostEntry *)b)->name); }
 static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *out, const char *path, int mode) -> Result */
     uint64_t out = A0;
     int mode = (int)A2;
-    char roots[2][PATH_MAX], pattern[PATH_MAX + 4];
+    char (*roots)[PATH_MAX] = malloc(sizeof(char[FS_DIR_ROOTS][PATH_MAX])), pattern[PATH_MAX + 4];
     uint32_t result = 0;
     if (out) wr64(out, 0);
     /* the folders that make up this directory: for journaled save data the working folder, then the committed one */
     int nroots = fs_dir_roots((const char *)(uintptr_t)A1, roots, &result);
-    if (result) { RET(result); return; }
+    if (result) { free(roots); RET(result); return; }
     HostDir *d = calloc(1, sizeof *d);
     int cap = 0;
     d->magic = DIR_MAGIC;
@@ -87,7 +88,7 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
     /* readdir order depends on the file system: the entries are sorted by name without regard to case (the order NTFS
      * listed them in), so every run and every PC sees the same order */
     if (d->count > 1) qsort(d->entries, (size_t)d->count, sizeof(HostEntry), entry_cmp);
-    if (nroots == 2) {                                       /* drop the entries the open mode does not ask for */
+    if (nroots >= 2) {                                       /* drop the entries the open mode does not ask for (several folders: save data's two, or RomFS mods over the game's) */
         int n = 0;
         for (int k = 0; k < d->count; k++) if (d->entries[k].is_file ? (mode & 2) : (mode & 1)) d->entries[n++] = d->entries[k];
         d->count = n;
@@ -95,6 +96,7 @@ static void fs_OpenDirectory(Ctx *c) {                    /* (DirectoryHandle *o
 
     trace_printf("     fs OpenDirectory \"%s\" mode %d -> %d entries\n", (const char *)(uintptr_t)A1, mode, d->count);
     wr64(out, P(d));
+    free(roots);
     RET(0);
 }
 static HostDir *dir_of(uint64_t handle) {

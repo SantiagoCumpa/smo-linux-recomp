@@ -364,7 +364,8 @@ static VStage *stage_ensure(const SSrc *src, uint64_t hb, const uint32_t *key, u
  * out, a worker makes what was missing, and the draw appears in a later frame. Every draw left out is counted
  * ("nvn_vk_skip:" lines, "nvn_vk_skipf:" per frame, total at exit). Compute stages are never skipped. Off by
  * default: the picture is wrong for the frames in which something is left out. */
-static int skip_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_NOHOLD"); on = e ? atoi(e) != 0 : gfx_options()->shader_skip; } return on; }
+int smo_mod_feature(const char *);                       /* mods.c: the "Asynchronous shaders" mod (SMO_VK_NOHOLD=1 / =0 wins, for tests) */
+static int skip_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_NOHOLD"); on = e ? atoi(e) != 0 : smo_mod_feature("async_shaders"); } return on; }
 static int scene_recent(void);
 static int skip_active(void) { return skip_on() && scene_recent(); }
 static int64_t g_skip_n, g_skip_frames, g_skip_fr_n, g_skip_stage, g_skip_pipe;

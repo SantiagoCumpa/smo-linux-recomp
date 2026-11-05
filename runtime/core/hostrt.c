@@ -552,7 +552,7 @@ void report_and_exit(int code) {
     os_thread_report(stdout);
     { void smo_heap_report(FILE *out); smo_heap_report(stdout); }   /* smo_nn.c */
     { void smo_audio_report(FILE *out); smo_audio_report(stdout); }   /* smo_audio.c */
-    { void smo_fast_report(FILE *out); smo_fast_report(stdout); }     /* smo_fast.c */
+    { void mods_report(FILE *out); mods_report(stdout); }             /* mods.c: what the code mods say */
     { void nerve_report(FILE *out); nerve_report(stdout); }   /* smo_nerve.c */
     { void fontll_report(FILE *out); fontll_report(stdout); }   /* nnfontll.c */
     if (g_trace) { print_import_summary(g_trace); print_hostfn_summary(g_trace); fclose(g_trace); }

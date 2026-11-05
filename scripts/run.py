@@ -146,6 +146,8 @@ def main():
             os.chmod(tmp, 0o755)
             os.replace(tmp, exe)
         env = game_env(T, dict(os.environ))
+        if a.exe != T.EXE:
+            env.setdefault('SMO_UNFOCUSED', 'run')     # a test copy keeps running behind other windows (the game pauses while unfocused)
         for kv in a.env:
             k, v = kv.split('=', 1)
             env[k] = v

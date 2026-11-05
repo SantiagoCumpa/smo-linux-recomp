@@ -201,7 +201,7 @@ static uint32_t guest_main(void * arg) {
     { uint64_t os_main_thread_type(void); memcpy(tls + 0x1f8, &(uint64_t){os_main_thread_type()}, 8); }   /* [sdk 0x3349dc..e0] nn::os::detail::ThreadManager(): the main thread's ThreadType pointer */
     g_main_ctx = &c;
     { void os_apply_main_sched(void); os_apply_main_sched(); }                  /* os_threads.c: SMO_OS_CONSOLE_CORES=1 */
-    { void smo_fast_install(void); smo_fast_install(); }                        /* smo_fast.c: host versions of hot game code (before the game runs) */
+    { void mods_load_code(void); mods_load_code(); }                            /* mods.c: the code mods that are on (before the game runs) */
     { void hitch_set_main(Ctx *c); hitch_set_main(&c); }      /* hitch.c: SMO_HITCH */
     g_main_stack_base = (uint64_t)stack;
     g_main_stack_size = stack_size;

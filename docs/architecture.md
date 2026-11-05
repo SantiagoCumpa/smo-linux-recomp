@@ -110,8 +110,7 @@ and runs their self-test (`SMO_SDK_SELFTEST=1`).
   messages.
 - `smo_guide.c`: the game's Help. The Windows build showed it inside the game window with WebView2; on Linux it opens
   in the desktop's web browser and the game is not held while it is open.
-- `smo_fast.c`: host code in place of a hot game function (the sort of the sampler list), with a check mode that
-  compares both.
+- (`mods.c`, in core: the mods; the former `smo_fast.c` is now the code mod `defaults/mods/fast-sampler-sort`.)
 - `smo_selftest.c`: `SMO_IMPORT_SELFTEST=1`, a check of the handlers written from the game's import list rather than
   met in play.
 

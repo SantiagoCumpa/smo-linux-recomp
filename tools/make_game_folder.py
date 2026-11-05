@@ -14,8 +14,10 @@ The folder (default: smo/ at the repository root; ignored by git, it holds your 
       game/elf/           main.elf and sdk.elf (and the other modules); game/exefs/main.npdm
       romfs/              the game's data (from your dump)
       manual/             the electronic manual, if your dump has it
-      config/             graphics.ini, controllers.ini (written with the defaults at the first start, then yours)
+      config/             graphics.ini, controllers.ini (from the repository's defaults/config the first time, then yours)
       userdata/           saves (empty the first time, then never touched)
+      mods/               the mods: the default ones (from the repository's defaults/mods, made again each time) and
+                          yours (RomFS mods in the emulators' layout, mods/<name>/romfs/...); config/mods.ini: on / off
       cache/              shader and pipeline caches (vk/, nvidia/, mesa/; seeded from build/cache the first time)
       logs/               smo.log of the last run, smo.1.log .. smo.4.log of the runs before it
       tmp/, run/          the game's temporary files
@@ -119,10 +121,18 @@ the internal resolution between native and a scaled one (logs/smo.log says when 
 
   config/graphics.ini, config/controllers.ini   settings (the settings menu writes graphics.ini)
   userdata/save/                                your saves: back this folder up
+  mods/                                         mods that replace the game's files (see Mods below)
   logs/smo.log                                  the log of the last run (attach it to a bug report); started
                                                 from a terminal, ./smo shows it there too
   cache/                                        shader caches; deleting it only makes the next start slower
                                                 (then run ./smo --compile-shaders again)
+
+Mods: with every mod off this is the console's game. The settings menu (F1, Mods) has a switch for each mod (used
+from the next start; config/mods.ini keeps them). The program's own mods are already there: HD resolution,
+Anisotropic filtering, Asynchronous shaders (off) and Fast sampler sort. To add a mod made for emulators, put it in
+its own folder under mods/ with its romfs/ folder inside (mods/<name>/romfs/...; a folder copied from an emulator's
+load/0100000000010000/ works too). The order of config/mods.ini decides which wins when two replace the same file.
+Only romfs/ is used: exefs/ code patches for emulators are not applied.
 
 This folder holds files from your own copy of the game: do not share it.
 Made by tools/make_game_folder.py of the smo-recomp repository; run it again to update the game (saves, settings and
@@ -216,8 +226,27 @@ def main():
     # the player's: made empty the first time, then never touched. Not taken from build/config and build/userdata: those
     # are the repository's test settings and saves; the game writes graphics.ini and controllers.ini with their defaults
     # (full screen, the game's own 900p) at its first start
-    for sub in ('config', 'userdata'):
+    for sub in ('config', 'userdata', 'mods'):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
+    # the default mods (defaults/mods, built into build/mods by tools/lifter/build_mods.py): made again in mods/ every time
+    # (they are the program's, as bin/ is); the player's own mods there are left alone. Which are on: config/mods.ini.
+    built = T.build('mods')
+    if os.path.isdir(built):
+        shipped = [d for d in sorted(os.listdir(built)) if os.path.exists(os.path.join(built, d, '.default'))]
+        for d in shipped:
+            copy_tree(os.path.join(built, d), os.path.join(out, 'mods', d))
+        for d in os.listdir(os.path.join(out, 'mods')):
+            if d not in shipped and os.path.exists(os.path.join(out, 'mods', d, '.default')):
+                shutil.rmtree(os.path.join(out, 'mods', d))
+                print('removed the default mod %s (no longer one)' % d)
+    else:
+        print('no build/mods: run tools/lifter/build_exe.py (it builds the default mods)')
+    # defaults/config: the settings a new game folder starts with (a file the player already has is kept; the program
+    # embeds the same text and writes it when a file is missing)
+    for name in sorted(os.listdir(os.path.join(REPO, 'defaults', 'config'))):
+        dst = os.path.join(out, 'config', name)
+        if not os.path.exists(dst):
+            shutil.copy2(os.path.join(REPO, 'defaults', 'config', name), dst)
     for sub in ('vk', 'nvidia', 'mesa'):
         src, dst = T.build('cache', sub), os.path.join(out, 'cache', sub)
         if os.path.isdir(src) and (a.refresh_cache or not os.path.isdir(dst)):

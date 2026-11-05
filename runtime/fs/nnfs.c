@@ -10,6 +10,10 @@
  *   MountCacheStorage  -> <userdata>/cache                          (journaled like save data)
  * <userdata> is $SMO_USERDATA or <exe folder>/../userdata (tests point SMO_USERDATA at a copy of the user's save).
  *
+ * ROMFS MODS (mods.c). A file of the RomFS is looked for in the romfs/ folder of each mod that is on, in the order of
+ * config/mods.ini, then in the game's own RomFS, each with the case-insensitive fallback; a directory lists the
+ * entries of all of them (the first one of a name wins).
+ *
  * SAVE DATA JOURNAL. On the console, writes to save data are not permanent until nn::fs::Commit: they go to a journal,
  * Commit applies all of them together, and uncommitted writes are gone at the next mount. Here:
  *   - <userdata>/save is the COMMITTED state and is never written outside Commit.
@@ -99,6 +103,9 @@ static void fs_roots(void) {
 const char *fs_user_root(void) { fs_roots(); return g_user_root; }
 const char *fs_rom_root(void) { fs_roots(); return g_rom_root; }           /* smo_ui.c: the game's own files for the host menus */
 
+/* ---- RomFS mods (mods.c): the romfs/ folders of the mods that are on, first wins */
+int mods_romfs_roots(const char *const **roots);
+
 static int is_dir(const char *p) { struct stat st; return stat(p, &st) == 0 && S_ISDIR(st.st_mode); }
 static int exists(const char *p) { struct stat st; return stat(p, &st) == 0; }
 static void make_parents(const char *path) {             /* creates every missing folder above `path` */
@@ -154,6 +161,8 @@ static int ci_resolve(const char *root, const char *rel, char *out) {
 /* smo_ui.c: a file of the RomFS by its path in it, found as the game's own reads find it (case-insensitive fallback) */
 int fs_rom_file(const char *rel, char *out) {
     char full[PATH_MAX];
+    const char *const *mr; int nm = mods_romfs_roots(&mr);
+    for (int i = 0; i < nm; i++) { snprintf(full, sizeof full, "%s/%s", mr[i], rel); if (exists(full)) { snprintf(out, PATH_MAX, "%s", full); return 1; } if (ci_resolve(mr[i], rel, out)) return 1; }
     snprintf(full, sizeof full, "%s/%s", fs_rom_root(), rel);
     if (exists(full)) { snprintf(out, PATH_MAX, "%s", full); return 1; }
     return ci_resolve(fs_rom_root(), rel, out);
@@ -218,6 +227,10 @@ static int view_path(Mount *m, const char *rel, char *out) {
         join(out, m->work, rel);
         if (exists(out)) return 1;
     }
+    if (m->kind == MK_ROM && rel[0]) {             /* RomFS mods first (the first one that is on and holds the file) */
+        const char *const *mr; int nm = mods_romfs_roots(&mr);
+        for (int i = 0; i < nm; i++) { join(out, mr[i], rel); if (exists(out) || ci_resolve(mr[i], rel, out)) return 1; }
+    }
     join(out, m->root, rel);
     if (exists(out)) return 1;
     return m->kind == MK_ROM && rel[0] && ci_resolve(m->root, rel, out);
@@ -241,7 +254,7 @@ int fs_host_path(const char *guest, char *out, size_t n) {
     return ok;
 }
 /* Used by nnfsdir.c: the host folders to list for a guest directory (working folder first), 0 = no such directory. */
-int fs_dir_roots(const char *guest, char roots[2][PATH_MAX], uint32_t *result) {
+int fs_dir_roots(const char *guest, char roots[][PATH_MAX], uint32_t *result) {      /* roots: room for FS_DIR_ROOTS */
     Mount *m; char rel[PATH_MAX], host[PATH_MAX];
     int n = 0;
     fs_lock();
@@ -249,6 +262,7 @@ int fs_dir_roots(const char *guest, char roots[2][PATH_MAX], uint32_t *result) {
     if (!*result) {
         if (!view_path(m, rel, host) || !is_dir(host)) *result = RESULT_PATH_NOT_FOUND;
         else {
+            if (m->kind == MK_ROM) { const char *const *mr; int nm = mods_romfs_roots(&mr); for (int i = 0; i < nm; i++) { join(roots[n], mr[i], rel); if (is_dir(roots[n]) || (rel[0] && ci_resolve(mr[i], rel, roots[n]) && is_dir(roots[n]))) n++; } }      /* the mods' folders first */
             if (m->work[0]) { join(roots[n], m->work, rel); if (is_dir(roots[n])) n++; }
             if (!m->work[0] || !tomb_hides(m, rel)) { join(roots[n], m->root, rel); if (is_dir(roots[n])) n++; }
         }
@@ -499,6 +513,8 @@ static void fs_QueryMountRomCacheSize(Ctx *c) {          /* (size_t *out) */
     uint64_t dir_bytes = 0x18, file_bytes = 0;
     fs_roots();
     romfs_walk(g_rom_root, &dirs, &files, &dir_bytes, &file_bytes);
+    {   const char *const *mr; int nm = mods_romfs_roots(&mr);
+        for (int i = 0; i < nm; i++) romfs_walk(mr[i], &dirs, &files, &dir_bytes, &file_bytes);      }      /* (a file both hold counts twice: the cache is a little larger than needed) */
     uint64_t size = 4ull * romfs_buckets(dirs) + dir_bytes + 4ull * romfs_buckets(files) + file_bytes;
     trace_printf("     fs QueryMountRomCacheSize: %u directories, %u files -> %llu bytes\n", dirs, files, (unsigned long long)size);
     wr64(A0, size);

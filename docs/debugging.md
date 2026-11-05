@@ -166,8 +166,8 @@ The end of every log has the counts that tell whether a run was healthy:
   log's `nn::os: thread priorities as nice values ...` line says which. Raising `RLIMIT_NICE` for your user (e.g.
   `/etc/security/limits.d`) gives the game's threads room above other programs. Nice values are weights, not strict
   priorities: the stress test (`tests/stress_stages.py`) is the measure.
-- `SMO_FAST=0` leaves the game's own code where `runtime/game/smo_fast.c` puts host code in its place (the sort of the
-  sampler list of `agl::driver::NVNMgr`); `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
+- The "Fast sampler sort" mod (`defaults/mods/fast-sampler-sort`, off in the Mods tab: the game's own code) puts host
+  code in place of the sort of the sampler list of `agl::driver::NVNMgr`; `SMO_FAST_CHECK=1` runs the game's code as well and stops the game if the
   results ever differ. The game's `main` has no symbols for these functions: `tools/lifter/gen_tables.py` finds them
   by what they do (`find_sampler_sort`), and the log says so when the fast path stays off.
 - Switches that bring back an older behaviour, for comparisons: `SMO_VK_OCC_SYNC=1` (every occlusion report waits for the
@@ -336,7 +336,8 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_FOCUS_TEST=<start s>,<seconds>` (test): from `<start>` the window counts as not active (another program has the
   focus) for `<seconds>`, then it is minimised for `<seconds>` and restored; `nn::oe: focus test:` lines give how often
   the game's main loop ran in each period (once per frame). A test copy needs `SMO_SHOW=1` for the minimised part.
-  `graphics.ini` `unfocused = run` (the default) keeps the game running then; `pause` stops it as the console does.
+  The game pauses then, as the console does; `SMO_UNFOCUSED=run` (TEST ONLY; `scripts/run.py` sets it for test copies)
+  keeps it running.
 - `SMO_STRICT=1` lists, at start, every import bound to a handler that does nothing and every function import without a
   handler, and stops (exit code 5); `SMO_STRICT=report` lists them and goes on. The `strict check:` line of every log
   counts them.
