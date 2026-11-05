@@ -1666,12 +1666,13 @@ static void scan_list(uint64_t handle, int depth, Scan *s) {
         off += m->size;
     }
 }
-/* SMO_VK_MT=1: the look-ahead runs on a thread of its own while the render thread replays the same batch (it used to run
- * first, on the render thread: about 1 ms a frame in New Donk City). It only queues stages and pipelines for the workers;
+/* The look-ahead runs on a thread of its own while the render thread replays the same batch (it used to run first, on the
+ * render thread: about 1 ms a frame in New Donk City; tests/benchmark.py, Sand Kingdom at 900p: the replay 4.00 -> 3.74 ms a
+ * frame, and a run through three kingdoms with the same holds and long frames). On by default; SMO_VK_MT=0: as before. It only queues stages and pipelines for the workers;
  * what it reads that the replay may change at the same time (a texture's VTex being made) can at worst make a guess that is
  * not needed. scan_async_wait() before the batch's job returns: the lists stay valid while it reads them. */
 static struct { plat_thread *thread; plat_event *go, *done; const uint64_t *handles; int count, busy; Scan s; } SA;
-static int mt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_MT"); on = e && atoi(e) > 0; } return on; }
+static int mt_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("SMO_VK_MT"); on = !(e && !atoi(e)); } return on; }
 static uint32_t scan_thread(void *arg) {
     (void)arg;
     os_pin_host_thread();
