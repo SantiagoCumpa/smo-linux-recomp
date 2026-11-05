@@ -141,7 +141,9 @@ docs/             building, architecture, debugging, scripted runs
 - Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed
   `IPA`).
 - The first runs on Linux: the checks of the table above, measured again (`PORT_TO_LINUX.md`, Verification).
-- Other physical controllers (PlayStation, Switch Pro) and other GPUs (AMD, Intel).
+- Other physical controllers (PlayStation, Switch Pro) and AMD GPUs. (An Intel GPU was checked: the integrated Raptor
+  Lake graphics (Mesa) of the development laptop, `gpu = Intel`, played Sand, Cascade and Metro with a correct
+  picture, 0 Vulkan call failures and 0 operations not implemented, at about 52 fps, 45 in New Donk City.)
 - What the 1.4.1 update adds: Balloon World, the Snapshot Mode filters, the Labo VR mode.
 
 ## Contributing
