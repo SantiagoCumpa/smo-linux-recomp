@@ -214,6 +214,11 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   NVML library, AMD through sysfs, the CPU through /proc and hwmon). Small text on a translucent box over the picture in
   the `overlay_corner` (top_left by default; also top_right, bottom_left, bottom_right, top_center, bottom_center), not in captures. F10 shows and hides it while the game runs. Older files'
   `fps_overlay = <corner>` still works (fps in that corner).
+- On battery: a laptop holds its GPU and CPU to less power without the charger, and the game is slower (about 37
+  instead of 60 FPS measured on an RTX 4060 laptop GPU held to 35 W). The log says so at start and whenever the
+  charger is plugged in or out (`power:` lines), and the detailed overlay adds a yellow `BATTERY GPU <n>W` line (the
+  GPU's power limit now, from NVML). Read from `/sys/class/power_supply` (`runtime/gfx/perf_stats.c`
+  `perf_on_battery`; `SMO_POWER_SUPPLY=<folder>` points a test at a folder laid out the same way).
 - The screen does not dim, lock or sleep while the game runs: a pad is not activity the desktop sees (on Wayland an
   idle inhibitor on the window). The log says `display: screen saver held off while the game runs`.
   The game pauses while its window does not have the focus or is minimised, as the console stops a game behind its HOME

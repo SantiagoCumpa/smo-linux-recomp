@@ -284,6 +284,23 @@ static void display_pump(uint32_t wait_ms) {
             fflush(stdout);
         }
     }
+    {   /* the power supply: a laptop on its battery holds the GPU and CPU to less power (the game is slower then); said
+         * in the log at start and whenever the charger is plugged in or out (perf_stats.c; the detailed overlay says it too) */
+        static uint64_t last_check;
+        static int last = -2;
+        uint64_t now = plat_ms();
+        if (now - last_check >= 5000) {
+            int perf_on_battery(void);
+            int b = perf_on_battery();
+            last_check = now;
+            if (b != last) {
+                if (b == 1) printf("power: on battery: the GPU and CPU are power-limited (plug the charger in for full speed)\n");
+                else if (b == 0) printf("power: %s\n", last == 1 ? "charger plugged in: full power again" : "on the charger");
+                fflush(stdout);
+                last = b;
+            }
+        }
+    }
     if (plat_xchg(&g_req_title, 0)) { char t[192]; plat_lock(&g_title_lock); snprintf(t, sizeof t, "%s", g_title_req); plat_unlock(&g_title_lock); SDL_SetWindowTitle(g_win, t); }
     {   int32_t m = plat_xchg(&g_req_minimise, 0);
         if (m == 1) SDL_MinimizeWindow(g_win); else if (m == 2) SDL_RestoreWindow(g_win); }

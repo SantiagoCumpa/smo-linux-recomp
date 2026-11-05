@@ -3687,11 +3687,11 @@ static void overlay_draw(uint32_t index) {
 int display_fps_overlay(void);                 /* display.c: 0 hidden, 1..6 the position (corners, top / bottom centre) */
 int display_perf_overlay(void);                /* display.c: 0 hidden, 1 fps, 2 detailed */
 #include "perf_stats.h"
-#define OVL_LINES 6
+#define OVL_LINES 7
 static struct {
     VkPipeline pipe; VkPipelineLayout layout; VkFormat fmt; int failed;
     VkImage key[16]; VkImageView view[16];     /* a view of each swapchain image, made when first drawn into */
-    int64_t t0, f0; char text[OVL_LINES][32]; int lines; float fps;
+    int64_t t0, f0; char text[OVL_LINES][32]; int lines, warn_line; float fps;      /* warn_line: a line in yellow (on battery), -1 none */
 } g_fps;
 static const uint8_t *fps_glyph(char ch) {
     /* rows top to bottom, 5 bits each (bit 4 = left column) */
@@ -3799,7 +3799,7 @@ static void ovl_value(char *out, size_t cap, const char *label, int v, const cha
     if (v < 0) snprintf(out, cap, "%s --", label); else snprintf(out, cap, "%s %d%s", label, v, unit);
 }
 static void ovl_update(int level, double secs, int64_t frames) {
-    g_fps.lines = 1;
+    g_fps.lines = 1; g_fps.warn_line = -1;
     if (frames > 0) snprintf(g_fps.text[0], sizeof g_fps.text[0], "%d FPS %.1f ms", (int)(g_fps.fps + 0.5f), secs * 1000.0 / (double)frames);
     else snprintf(g_fps.text[0], sizeof g_fps.text[0], "0 FPS");
     if (level < 2) return;
@@ -3817,6 +3817,11 @@ static void ovl_update(int level, double secs, int64_t frames) {
     if (ps.ram_used_mb >= 0 && ps.ram_total_mb > 0) snprintf(g_fps.text[5], sizeof g_fps.text[5], "RAM %.1f/%.1f GB", ps.ram_used_mb / 1024.0, ps.ram_total_mb / 1024.0);
     else snprintf(g_fps.text[5], sizeof g_fps.text[5], "RAM --");
     g_fps.lines = 6;
+    if (ps.on_battery == 1) {                              /* a laptop on its battery holds the GPU and CPU to less power */
+        if (ps.gpu_power_limit_w > 0) snprintf(g_fps.text[6], sizeof g_fps.text[6], "BATTERY GPU %dW", ps.gpu_power_limit_w);
+        else snprintf(g_fps.text[6], sizeof g_fps.text[6], "BATTERY");
+        g_fps.warn_line = 6; g_fps.lines = 7;
+    }
 }
 static void fps_overlay_draw(uint32_t index) {
     int pos = display_fps_overlay(), level = display_perf_overlay();
@@ -3824,7 +3829,7 @@ static void fps_overlay_draw(uint32_t index) {
     static int64_t hz;
     static int last_level;
     if (!hz) { plat_counter f; plat_qpf(&f); hz = f.QuadPart; }
-    if (!g_fps.t0) { g_fps.t0 = now; g_fps.f0 = g_vk_frames; snprintf(g_fps.text[0], sizeof g_fps.text[0], "-- FPS"); g_fps.lines = 1; }
+    if (!g_fps.t0) { g_fps.t0 = now; g_fps.f0 = g_vk_frames; snprintf(g_fps.text[0], sizeof g_fps.text[0], "-- FPS"); g_fps.lines = 1; g_fps.warn_line = -1; }
     if (now - g_fps.t0 >= hz / 2 || level != last_level) {   /* twice a second, and at once when the level changes */
         int64_t frames = g_vk_frames - g_fps.f0;
         double secs = (double)(now - g_fps.t0) / (double)hz;
@@ -3867,10 +3872,11 @@ static void fps_overlay_draw(uint32_t index) {
         for (int l = 0; l < lines; l++) {
             const char *t = g_fps.text[l];
             int len = (int)strlen(t), number = l == 0;    /* the frame rate in its colour, the rest white */
+            static const float warn[4] = {0.94f, 0.78f, 0.24f, 1.0f};      /* the battery line: yellow */
             for (int i = 0; i < len; i++) {
                 if (t[i] == ' ') number = 0;
                 const uint8_t *g = fps_glyph(t[i]);
-                const float *col = layer == 0 ? shadow : number ? num : white;
+                const float *col = layer == 0 ? shadow : number ? num : l == g_fps.warn_line ? warn : white;
                 int gx = x0 + pad + i * 6 * k, gy = y0 + pad + l * line_h;
                 for (int r = 0; r < 7; r++)
                     for (int bb = 0; bb < 5; bb++) {

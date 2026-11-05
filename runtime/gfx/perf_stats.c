@@ -10,6 +10,8 @@
  *  GPU (NVIDIA)    NVML, libnvidia-ml.so.1 (the driver's own library, opened with dlopen; not linked): utilisation,
  *                  temperature, memory used / total of the first device whose name matches the Vulkan device's
  *  GPU (AMD)       /sys/class/drm/card<n>/device: gpu_busy_percent, mem_info_vram_used / _total, hwmon temp1_input
+ *  power supply    /sys/class/power_supply/<n>/type and online: on battery when a Battery is there and no Mains or USB
+ *                  supply is online (perf_on_battery); the GPU's power limit from NVML (nvmlDeviceGetEnforcedPowerLimit)
  * Nothing is written anywhere. */
 #include <dirent.h>
 #include <dlfcn.h>
@@ -117,6 +119,7 @@ static struct {
     int (*util)(void *, NvmlUtil *);
     int (*temp)(void *, int, unsigned *);
     int (*mem)(void *, NvmlMem *);
+    int (*plimit)(void *, unsigned *);             /* milliwatts */
 } N;
 static void nvml_open(const char *vk_name) {
     N.tried = 1;
@@ -129,6 +132,7 @@ static void nvml_open(const char *vk_name) {
     N.util = (int (*)(void *, NvmlUtil *))dlsym(h, "nvmlDeviceGetUtilizationRates");
     N.temp = (int (*)(void *, int, unsigned *))dlsym(h, "nvmlDeviceGetTemperature");
     N.mem = (int (*)(void *, NvmlMem *))dlsym(h, "nvmlDeviceGetMemoryInfo");
+    N.plimit = (int (*)(void *, unsigned *))dlsym(h, "nvmlDeviceGetEnforcedPowerLimit");
     unsigned n = 0;
     if (!init || !count || !byidx || !N.util || init() != 0 || count(&n) != 0 || !n) return;
     for (unsigned i = 0; i < n && !N.dev; i++) {          /* the device Vulkan uses, by name; else the first */
@@ -164,8 +168,32 @@ static int amd_find(void) {
     return g_amd_dev[0] != 0;
 }
 
+int perf_on_battery(void) {
+    const char *root = getenv("SMO_POWER_SUPPLY");        /* TEST ONLY: a folder laid out as /sys/class/power_supply */
+    if (!root || !root[0]) root = "/sys/class/power_supply";
+    DIR *d = opendir(root);
+    struct dirent *e;
+    int battery = 0, supply_known = 0, online = 0;
+    char p[300], v[64];
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        snprintf(p, sizeof p, "%s/%s/type", root, e->d_name);
+        if (!read_line(p, v, sizeof v)) continue;
+        if (!strcmp(v, "Battery")) { battery = 1; continue; }
+        if (strcmp(v, "Mains") && strncmp(v, "USB", 3)) continue;
+        snprintf(p, sizeof p, "%s/%s/online", root, e->d_name);
+        long long on = read_ll(p);
+        if (on >= 0) supply_known = 1;
+        if (on > 0) online = 1;
+    }
+    if (d) closedir(d);
+    if (online) return 0;
+    return battery && supply_known ? 1 : -1;
+}
+
 void perf_stats_sample(PerfStats *s, const char *gpu_name) {
     memset(s, 0xff, sizeof *s);                            /* every figure -1 until read */
+    s->on_battery = perf_on_battery();
     s->cpu_load = cpu_load(&s->game_cpu);
     s->cpu_temp = cpu_temp();
     ram(&s->ram_used_mb, &s->ram_total_mb, &s->game_ram_mb);
@@ -177,6 +205,8 @@ void perf_stats_sample(PerfStats *s, const char *gpu_name) {
             if (N.util(N.dev, &u) == 0) s->gpu_load = (int)u.gpu;
             if (N.temp && N.temp(N.dev, 0, &t) == 0) s->gpu_temp = (int)t;
             if (N.mem && N.mem(N.dev, &m) == 0) { s->vram_used_mb = (int)(m.used >> 20); s->vram_total_mb = (int)(m.total >> 20); }
+            unsigned mw;
+            if (N.plimit && N.plimit(N.dev, &mw) == 0) s->gpu_power_limit_w = (int)((mw + 500) / 1000);
         }
     } else if (amd_find()) {
         char p[260];
