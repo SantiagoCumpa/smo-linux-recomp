@@ -103,3 +103,23 @@ frames from run to run.
 
 Limits: the route depends on the game behaving the same way each time (it does, as far as measured); the sequence
 does not avoid enemies (a small Goomba hits Mario once on the way to the tower door).
+
+## Benchmark
+
+`tests/benchmark.py` measures the same scene every time, for comparing the runtime before and after a change:
+
+```sh
+python tests/benchmark.py --save ~/Games/<game folder>/userdata/save --label "before"   # the first time: freezes a copy of the save
+python tests/benchmark.py --label "after"                                                # later: the same copy
+```
+
+The save is copied once to `build/bench/save` (`--refresh-save` copies it again), so the benchmark stays the same
+while the game is played; each run resumes it where it was saved (`--stage` starts another stage through
+`tools/dev/save_warp.py`, only one the save has reached). Settings: `defaults/config/graphics.ini` with
+`--resolution` (900p by default), a visible window, the default mods. After the scene plays it waits `--warmup`
+frames (600) with Mario standing still, then measures `--measure` frames (1,800) from the log's 300-frame windows:
+frames a second and 1 % low, the render thread's milliseconds a frame (batch replay, draw preparation, present, wait for
+the GPU), draws a frame, textures made at their use while playing, peak resident memory. `--runs` (2) runs, and the
+spread between them (it should stay within about 5 %); a run on battery is refused. Every run is appended to
+`build/bench/results.jsonl` with the commit and the label. Plug a laptop in: on battery the GPU and CPU are held back.
+
