@@ -115,6 +115,10 @@ def parse(log, warmup, measure):
         res['tex_at_use_play'] = int(t[-1][2]); res['tex_at_use_play_ms'] = float(t[-1][3])
     mem = [int(x) for x in re.findall(r'^nvn_vk_mem: frame \d+: resident (\d+) MB', text, re.M)]
     res['resident_mb'] = max(mem) if mem else -1
+    b = re.search(r'first play frame is frame \d+, ([\d.]+) s after the first present', text)
+    res['boot_s'] = float(b.group(1)) if b else -1.0      # (the title screen and the inputs included: the same every run)
+    h = re.findall(r'holds of the render thread at a draw: (\d+), (\d+) ms', text)
+    res['holds'], res['holds_ms'] = (int(h[-1][0]), int(h[-1][1])) if h else (-1, -1)
     sw = re.findall(r'nvn_vk: swapchain (\d+)x(\d+)', text)
     res['window'] = '%sx%s' % sw[-1] if sw else '?'
     return res, None
@@ -131,6 +135,7 @@ def main():
     ap.add_argument('--warmup', type=int, default=600, help='frames after the scene plays before measuring (default 10 s)')
     ap.add_argument('--measure', type=int, default=1800, help='frames measured (default 30 s)')
     ap.add_argument('--label', default='', help='a note kept with the results ("before", "present thread" ...)')
+    ap.add_argument('--env', action='append', default=[], metavar='NAME=VALUE', help='a runtime switch for the runs (kept with the results)')
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     if a.save:
@@ -149,7 +154,10 @@ def main():
         seq = '1800:Z 200:Z @nerve:StageSceneNrvPlay %d' % (a.warmup + a.measure + 60)
         cmd = [PY, os.path.join(REPO, 'scripts', 'run.py'), name, '--exe', 'smo_bench', '--seconds', '900',
                '--userdata', work, '--env', 'SMO_SHOW=1', '--env', 'SMO_SEQ=' + seq,      # (the userdata folder: it holds save/)
-               '--env', 'SMO_SEQ_EXIT=1', '--env', 'SMO_GRAPHICS_CONFIG=' + cfg]
+               '--env', 'SMO_SEQ_EXIT=1', '--env', 'SMO_GRAPHICS_CONFIG=' + cfg,
+               '--env', 'SMO_VK_PCACHE=0']                # as the game folder's ./smo runs (--env SMO_VK_PCACHE=1 to compare)
+        for kv in a.env:
+            cmd += ['--env', kv]
         subprocess.run(cmd, cwd=REPO, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log = T.build('run', name + '.log')
         res, why = parse(log, a.warmup, a.measure) if os.path.exists(log) else (None, 'no log')
@@ -160,13 +168,13 @@ def main():
         results.append(res)
         print('run %d: %5.1f fps (1%% low %4.1f, p99 %5.1f ms, %d frames over 33 ms) | render thread ms/frame: replay %5.2f '
               '(draw prep %5.2f), present %5.2f, GPU wait %5.2f | %4.0f draws | textures at use in play %d (%.0f ms) | '
-              'resident %d MB | window %s'
+              'resident %d MB | to play %.1f s, holds %d (%d ms) | window %s'
               % (n + 1, res['fps'], res['low1'], res['p99_ms'], res['over33'], res['replay_ms'], res['drawprep_ms'],
                  res['present_ms'], res['gpu_wait_ms'], res['draws'], res.get('tex_at_use_play', -1),
-                 res.get('tex_at_use_play_ms', 0), res['resident_mb'], res['window']), flush=True)
+                 res.get('tex_at_use_play_ms', 0), res['resident_mb'], res['boot_s'], res['holds'], res['holds_ms'], res['window']), flush=True)
         with open(os.path.join(OUT, 'results.jsonl'), 'a', encoding='utf-8') as f:
             f.write(json.dumps(dict(res, run=n + 1, commit=commit, label=a.label, stage=a.stage, resolution=a.resolution,
-                                    warmup=a.warmup, measure=a.measure,
+                                    warmup=a.warmup, measure=a.measure, env=a.env,
                                     time=datetime.datetime.now().isoformat(timespec='seconds'))) + '\n')
     if len(results) > 1:
         def spread(k):

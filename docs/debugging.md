@@ -197,9 +197,11 @@ The end of every log has the counts that tell whether a run was healthy:
   as the Vulkan memory, for the driver's eviction backing.
 - `SMO_VK_MODREL=0` keeps every shader module (by default a stage's module is released once its pipeline library or
   compute pipeline is made, and made again from the stage cache's SPIR-V file if needed: 1.1 GB less).
-- `SMO_VK_PCACHE=0` makes pipelines without a pipeline cache object (nothing read or saved): 640 MB less, as fast for an
-  exe the driver has run before, but the NVIDIA driver keeps its own shader cache per executable, so an exe under a new
-  name compiles everything again.
+- Pipelines are made without a pipeline cache object by default: the NVIDIA driver's own shader disk cache serves them
+  as fast, and the object cost about 650 MB of resident memory (benchmark: 6.3 GB with it, 5.7 GB without, 60 fps
+  either way). That cache is kept per executable, so an exe under a new name would compile everything again:
+  `SMO_VK_PCACHE=1` makes the object (read from and saved to `cache/vk/pipelines_*.bin`), and `scripts/run.py` sets it
+  for its test copies.
 
 ## Crashes and stalls
 

@@ -1509,11 +1509,13 @@ static void prewarm_start(void) {
     }
     /* The pipeline cache object costs its entries in the driver's memory: about 640 MB of a game's working set in the Sand
      * Kingdom, the same whether read from the file or filled while the game hands its programs over, and destroying
-     * it after the boot frees nothing (the driver keeps the memory). It stays: the NVIDIA driver's own shader disk cache
-     * would serve the same pipelines, but it keeps one cache per executable, so an exe started under a new name (every
-     * test copy's first run) would compile everything again (several minutes of every processor). SMO_VK_PCACHE=0 makes
-     * pipelines without the object (nothing read or saved): 640 MB less for an exe whose name the driver has seen. */
-    if (getenv("SMO_VK_PCACHE") && !atoi(getenv("SMO_VK_PCACHE"))) printf("nvn_vk: SMO_VK_PCACHE=0: no pipeline cache object: pipelines are made without one (the driver's own disk cache, kept per executable, serves them); nothing is read or saved\n");
+     * it after the boot frees nothing (the driver keeps the memory). So it is OFF by default: the NVIDIA driver's own shader
+     * disk cache (./smo turns it on, without a size limit) serves the same pipelines, as fast (tests/benchmark.py, Sand
+     * Kingdom at 900p: 60 fps either way, 5.7 instead of 6.3 GB resident; three kingdoms run through: the same holds).
+     * That cache is kept per executable, though, so an exe started under a new name (every test copy's first run)
+     * would compile everything again (several minutes of every processor): scripts/run.py turns the object on for test
+     * copies (SMO_VK_PCACHE=1). */
+    if (!(getenv("SMO_VK_PCACHE") && atoi(getenv("SMO_VK_PCACHE")))) printf("nvn_vk: no pipeline cache object (the default; SMO_VK_PCACHE=1 makes one): pipelines are made without it, the driver's own disk cache (kept per executable) serves them; nothing is read or saved\n");
     else {   /* the driver's pipeline cache, ours on disk: keyed by GPU and driver version (the driver checks its own header too) */
         VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
         void *data = NULL;

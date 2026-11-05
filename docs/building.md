@@ -159,7 +159,7 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   starting the game (`nvn_vk_precompile` in `runtime/gfx/nvn_vk_pipelines.c`: the BNSH inside each `.bfsha`, its
   variations, each program's vertex and fragment stage: the very control and code sections the game copies) and hands
   every program to the workers as `nvnProgramSetShaders` does: the stage records (`cache/vk/stage`, `spv`) and the
-  stage libraries (the pipeline cache) then exist before the game asks; a vertex stage that reads attribute 11 as an
+  stage libraries (the driver's own shader disk cache) then exist before the game asks; a vertex stage that reads attribute 11 as an
   integer (skinned models: key 0x800, the only integer variant met in play) is also made in that variant. With an
   empty cache: about 12,000 stages in about 2 minutes on 14 threads, about 1 GB of cache; with everything there it only
   reads it. Measured over five kingdoms entered for the first time (Sand, Cascade, Wooded, Metro, Snow; the same cache
