@@ -359,3 +359,8 @@ The end of every log has the counts that tell whether a run was healthy:
   `symbol`) and, for `main`, the `execute` function of every state class from its RTTI (column `rtti_name`): the
   game's `main` keeps almost no symbols, so these are most of its names. `tools\target.py` says where the build's
   files are.
+- `nvn_vk_tex_late:` lines (at exit): what was made or read at its use in play frames, by kind (targets made,
+  compressed / uncompressed textures made, textures decoded on the CPU, textures read again because the game changed
+  their memory), with the time, the longest, how many took over 2 ms and the MB read. Measured on an RTX 4060 laptop
+  (charger in, 900p) running through Sand, Cascade and Metro: 719 in 5,205 play frames, 26 ms in all, none over 2 ms;
+  `tex_ahead` makes the rest during the loading screens (about 16,000 textures, 2 GB).

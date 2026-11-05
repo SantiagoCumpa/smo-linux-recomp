@@ -338,6 +338,7 @@ static void occ_end(void) { if (g_occ_open) { vkCmdEndQuery(R.cmd, g_occ_pool, (
 static void pass_end(void) { if (R.in_pass) { occ_end(); vkCmdEndRendering(R.cmd); R.in_pass = 0; pass_shot(); } }
 static int64_t g_tm[12];                          /* ticks: 0 wait for a submission, 1 copy-back, 2 dispatch, 3 batch replay, 4 present, 5 pipelines, 6 modules, 7 copy-back wait at batch start, 8 draw preparation */
 static int64_t tk(void) { plat_counter t; plat_qpc(&t); return t.QuadPart; }
+static int64_t g_tk_hz(void) { static int64_t f; if (!f) { plat_counter c; plat_qpf(&c); f = c.QuadPart; } return f; }
 /* report timestamps, the clock nvn_gl.c's now_ns uses (performance counter in nanoseconds) */
 static uint64_t vk_now_ns(void) {
     static plat_counter f;
@@ -1129,10 +1130,16 @@ static void vt_put(Tex *t, int level, int layer, int w, int h, int d, const void
 /* textures made and read AHEAD of their first draw (tex_ahead, below), and what is still made at a draw. */
 static int64_t g_ta_n, g_ta_bytes, g_ta_tk, g_ta_max_tk, g_late_n, g_late_tk, g_late_scene_n, g_late_scene_tk, g_up_fr_tk, g_up_fr_bytes;
 static int g_up_fr_n, g_ta_inside;
+/* what is made or read at its use, by kind (printed at exit, nvn_vk_tex_late): 0 a target (an image the GPU draws into: made
+ * and cleared), 1 a compressed texture, 2 an uncompressed one, 3 one decoded on the CPU (formats the GPU lacks), 4 a texture
+ * read again because the game changed its memory. In play frames only (near a scene): what the player sees as a hitch. */
+enum { LATE_TARGET, LATE_BC, LATE_PLAIN, LATE_DECODE, LATE_REREAD, LATE_KINDS };
+static int64_t g_late_k_n[LATE_KINDS], g_late_k_tk[LATE_KINDS], g_late_k_bytes[LATE_KINDS], g_late_k_max[LATE_KINDS], g_late_k_big[LATE_KINDS];
 static volatile int32_t g_in_scene;                   /* nvn_vk_pipelines.c (included further down) */
 static VTex *vt_get2(Tex *t, int sync) {
     VTex *vt = t->vk;
     int64_t tu0 = 0, ub0 = R.upload_bytes;
+    int late_kind = LATE_REREAD;
     t->last_use = g_cur_frame;
     if (!vt && t->image_freed) {                   /* tex_reclaim freed it (or let it go before it had an image): it is used after all */
         static int nl;
@@ -1175,6 +1182,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         int can_color = vt->aspect == VK_IMAGE_ASPECT_COLOR_BIT && f.kind != 4 && !vt->decode && fmt_supported(vt->fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT);
         if (can_color) ci.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        late_kind = vt->decode ? LATE_DECODE : f.kind == 4 ? LATE_BC : (can_color || vt->aspect != VK_IMAGE_ASPECT_COLOR_BIT) ? LATE_TARGET : LATE_PLAIN;      /* a target: when nothing is read into it (below) */
         {   /* SMO_VK_RTLOG=1 (debug aid): every new size of image that can be a target, once (game size, format, target, layers, samples) */
             static int on = -1; static struct { int w, h, fmt, target, layers; } seen[256]; static int nseen;
             if (on < 0) on = getenv("SMO_VK_RTLOG") ? 1 : 0;
@@ -1230,7 +1238,13 @@ static VTex *vt_get2(Tex *t, int sync) {
         int64_t d = tk() - tu0;
         g_up_fr_tk += d; g_up_fr_n++; g_up_fr_bytes += R.upload_bytes - ub0;
         g_late_n++; g_late_tk += d;
-        if (g_in_scene) { g_late_scene_n++; g_late_scene_tk += d; }
+        if (late_kind == LATE_TARGET && R.upload_bytes != ub0) late_kind = LATE_PLAIN;      /* target-capable, but the game's texels were read into it */
+        if (g_in_scene) {
+            g_late_scene_n++; g_late_scene_tk += d;
+            g_late_k_n[late_kind]++; g_late_k_tk[late_kind] += d; g_late_k_bytes[late_kind] += R.upload_bytes - ub0;
+            if (d > g_late_k_max[late_kind]) g_late_k_max[late_kind] = d;
+            if (d * 1000 > 2 * g_tk_hz()) g_late_k_big[late_kind]++;      /* over 2 ms: a visible part of a frame */
+        }
     }
     return vt;
 }
@@ -4506,6 +4520,10 @@ static void vkd_shutdown(void) {
         double k = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_tex: textures made ahead of their first use: %lld (%.0f MB, %.0f ms in all, at most %.1f ms after one present); made or read at their use: %lld times, %.0f ms (of them in scene frames: %lld, %.0f ms)\n",
                (long long)g_ta_n, (double)g_ta_bytes / 1048576.0, (double)g_ta_tk * k, (double)g_ta_max_tk * k, (long long)g_late_n, (double)g_late_tk * k, (long long)g_late_scene_n, (double)g_late_scene_tk * k);
+        static const char *const kn[LATE_KINDS] = {"targets made", "compressed made", "uncompressed made", "decoded on the CPU made", "read again (the game changed it)"};
+        for (int i = 0; i < LATE_KINDS; i++) if (g_late_k_n[i])
+            printf("nvn_vk_tex_late: in play frames, %-34s %6lld times, %7.1f ms (longest %.1f ms, %lld over 2 ms), %.1f MB read\n", kn[i], (long long)g_late_k_n[i],
+                   (double)g_late_k_tk[i] * k, (double)g_late_k_max[i] * k, (long long)g_late_k_big[i], (double)g_late_k_bytes[i] / 1048576.0);
     }
     frstat_report();
     if (RS_ON && rs_ui_native()) printf("nvn_vk_scale: SMO_VK_UI_NATIVE=1: the window's textures are kept at the game's size; passes with such a colour target and a SCALED depth target (drawn without depth): %lld\n", (long long)g_rs_mixed);
