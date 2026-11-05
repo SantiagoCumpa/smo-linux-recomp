@@ -185,6 +185,48 @@ static int has_name(const VkExtensionProperties *e, uint32_t n, const char *name
     return 0;
 }
 
+/* ---------------------------------------------------------------- present mode */
+/* graphics.ini vsync (0 clock, 1 on, 2 off, 3 mailbox) -> a present mode the surface offers. The 60 Hz pacing is display.c's,
+ * so by default the swapchain must not wait for the display: mailbox, else immediate. SMO_VK_PRESENT wins over the file. */
+static int g_have_mode[4];
+static const char *const k_mode[4] = {"immediate", "mailbox", "fifo", "fifo_relaxed"};
+static int present_mode_for(int opt, int say) {
+    const char *want = getenv("SMO_VK_PRESENT");
+    int mode = g_have_mode[VK_PRESENT_MODE_MAILBOX_KHR] ? VK_PRESENT_MODE_MAILBOX_KHR : g_have_mode[VK_PRESENT_MODE_IMMEDIATE_KHR] ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    if (!want && opt) {                            /* vsync = on | off | mailbox (the environment switch wins) */
+        static const char *const k_opt[4] = {NULL, "fifo", "immediate", "mailbox"};
+        want = k_opt[opt & 3];
+        if (say) printf("nvn_vk: graphics.ini vsync = %s: present mode %s asked for\n", opt == 1 ? "on" : opt == 2 ? "off" : "mailbox", want);
+    }
+    if (want) {
+        int m = -1;
+        for (int i = 0; i < 4; i++) if (!strcmp(want, k_mode[i])) m = i;
+        if (m >= 0 && g_have_mode[m]) mode = m;
+        else printf("nvn_vk: present mode %s is %s: using %s\n", want, m < 0 ? "not a mode (immediate, mailbox, fifo, fifo_relaxed)" : "not offered by the surface", k_mode[mode]);
+    }
+    if (mode == VK_PRESENT_MODE_FIFO_KHR || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
+        printf("nvn_vk: present mode %s: the display's own refresh now also holds the presents (a second clock next to display.c's)\n", k_mode[mode]);
+    return mode;
+}
+/* The settings menu (smo_settings.c): another vsync while playing. The render thread makes the swapchain again with the
+ * new present mode at its next present (nvn_vk_draw.c vk_present2). */
+static volatile int32_t g_vsync_req = -1;
+/* the settings menu: is the present mode vsync opt maps to offered by the window's surface? (Wayland has no immediate) */
+int nvn_vk_present_offered(int opt) {
+    static const int k_m[4] = {-1, VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR};
+    return opt <= 0 || opt > 3 || g_have_mode[k_m[opt]];
+}
+void nvn_vk_set_vsync(int opt) { plat_xchg(&g_vsync_req, opt); }
+/* The settings menu: the Vulkan devices of this PC that can run the game (Vulkan 1.3), their names, and which one runs it. */
+static char g_gpu_names[8][128];
+static int g_gpu_count, g_gpu_used = -1;
+int nvn_vk_gpus(char names[][128], int max, int *used) {
+    int n = g_gpu_count < max ? g_gpu_count : max;
+    for (int i = 0; i < n; i++) snprintf(names[i], 128, "%s", g_gpu_names[i]);
+    if (used) *used = g_gpu_used;
+    return n;
+}
+
 /* ---------------------------------------------------------------- swapchain */
 static void wait_last_submit(void);
 static void swapchain_destroy(void) {
@@ -217,6 +259,7 @@ static int swapchain_create(void) {
     ci.imageExtent = ext;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (getenv("SMO_WINDOW_SHOT")) ci.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;     /* TEST AID: nvn_vk_draw.c window_shot */
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -372,11 +415,13 @@ int nvn_vk_init(void *window) {
         printf("nvn_vk: device %u: %s (%s, vendor 0x%04x device 0x%04x), Vulkan %u.%u.%u, driver 0x%08x%s\n", (unsigned)i, p.deviceName, k_type[type], p.vendorID, p.deviceID,
                VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion,
                family < 0 ? " - cannot present to the window with a graphics + compute queue" : p.apiVersion < VK_API_VERSION_1_3 ? " - below Vulkan 1.3" : "");
+        if (usable && g_gpu_count < 8) snprintf(g_gpu_names[g_gpu_count++], 128, "%s", p.deviceName);
         if (forced >= 0 ? (int)i == forced && usable : score > best_score) { best = (int)i; best_score = score; best_family = (uint32_t)family; }
     }
     if (best < 0) { printf("nvn_vk: no usable Vulkan 1.3 device%s\n", forced >= 0 ? " (SMO_VK_DEVICE names one that is not usable)" : ""); fflush(stdout); plat_exit(5); }
     V.gpu = gpus[best]; V.family = best_family;
     vkGetPhysicalDeviceProperties(V.gpu, &V.props);
+    for (int i = 0; i < g_gpu_count; i++) if (!strcmp(g_gpu_names[i], V.props.deviceName)) g_gpu_used = i;
 
     static VkExtensionProperties dext[512];
     uint32_t ndext = 512;
@@ -414,26 +459,10 @@ int nvn_vk_init(void *window) {
     /* present mode: the 60 Hz pacing is display.c's, so the swapchain must not wait for the display */
     VkPresentModeKHR modes[16];
     uint32_t nmode = 16;
-    int have[4] = {0, 0, 0, 0};
     r = vkGetPhysicalDeviceSurfacePresentModesKHR(V.gpu, V.surface, &nmode, modes);
     if (r != VK_SUCCESS && r != VK_INCOMPLETE) vk_fatal("vkGetPhysicalDeviceSurfacePresentModesKHR", r);
-    for (uint32_t i = 0; i < nmode; i++) if (modes[i] >= 0 && modes[i] < 4) have[modes[i]] = 1;
-    static const char *const k_mode[4] = {"immediate", "mailbox", "fifo", "fifo_relaxed"};
-    const char *want = getenv("SMO_VK_PRESENT");
-    V.mode = have[VK_PRESENT_MODE_MAILBOX_KHR] ? VK_PRESENT_MODE_MAILBOX_KHR : have[VK_PRESENT_MODE_IMMEDIATE_KHR] ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR;
-    if (!want && gfx_options()->present) {         /* vsync = on | off | mailbox in graphics.ini (the environment switch wins) */
-        static const char *const k_opt[4] = {NULL, "fifo", "immediate", "mailbox"};
-        want = k_opt[gfx_options()->present & 3];
-        printf("nvn_vk: graphics.ini vsync = %s: present mode %s asked for\n", gfx_options()->present == 1 ? "on" : gfx_options()->present == 2 ? "off" : "mailbox", want);
-    }
-    if (want) {
-        int m = -1;
-        for (int i = 0; i < 4; i++) if (!strcmp(want, k_mode[i])) m = i;
-        if (m >= 0 && have[m]) V.mode = m;
-        else printf("nvn_vk: SMO_VK_PRESENT=%s is %s: using %s\n", want, m < 0 ? "not a mode (immediate, mailbox, fifo, fifo_relaxed)" : "not offered by the surface", k_mode[V.mode]);
-    }
-    if (V.mode == VK_PRESENT_MODE_FIFO_KHR || V.mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR)
-        printf("nvn_vk: present mode %s: the display's own refresh now also holds the presents (a second clock next to display.c's)\n", k_mode[V.mode]);
+    for (uint32_t i = 0; i < nmode; i++) if (modes[i] >= 0 && modes[i] < 4) g_have_mode[modes[i]] = 1;
+    V.mode = present_mode_for(gfx_options()->present, 1);
 
     VkCommandPoolCreateInfo pi;
     memset(&pi, 0, sizeof pi);

@@ -4817,6 +4817,11 @@ static void queue_present(Ctx *c) {                     /* (queue, window, textu
             if (!g_present_sync && g_present_out) { plat_event_wait(g_present_ev, PLAT_INFINITE); g_present_out = 0; }   /* this frame shown first */
             amiibo_menu_run(&j);
         }
+        int settings_menu_wanted(void); void settings_menu_run(void *present_job);      /* the settings menu (smo_settings.c), the same way */
+        if (settings_menu_wanted()) {
+            if (!g_present_sync && g_present_out) { plat_event_wait(g_present_ev, PLAT_INFINITE); g_present_out = 0; }
+            settings_menu_run(&j);
+        }
     }
 }
 /* smo_amiibo.c: a request to the render back end (UiMenuJob, smo_ui.h), run on the render thread; 0 = the back end has no menu */

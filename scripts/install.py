@@ -7,7 +7,7 @@
     --keys      your console's prod.keys
     --out_dir   the game folder to make (created; made again on the same folder, it keeps saves, settings, caches)
     --language  the game's language: ja en-US en-GB fr fr-CA de it es es-419 zh-Hans zh-Hant ko nl ru (default:
-                your system's, from LANG; changed later in <out_dir>/smo.env)
+                your system's, from LANG; changed later in the game's settings menu, F1)
     --jobs N    compile jobs (default: all CPUs but two)
 
 Steps, each skipped when its result is already there (a run that stopped resumes):

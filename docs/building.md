@@ -129,13 +129,8 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   run's folder continues from there. Without it, saves go to `build/userdata/save`.
 - `--seq <file>` plays an input sequence (see [`scripted-runs.md`](scripted-runs.md)); `--env NAME=VALUE` sets one of
   the runtime's switches (see [`debugging.md`](debugging.md)).
-- **The game folder's launcher:** `tools/make_game_folder.py` makes a folder whose `./smo` opens a window (GTK4 +
-  libadwaita: `pacman -S python-gobject gtk4 libadwaita`) with the options of `config/graphics.ini` and `smo.env`:
-  resolution up to 4K, full screen or window, window size, vsync, GPU, anisotropic filtering, the weak-GPU profile,
-  shaders not ready, the FPS counter and the frame-time title, what happens when the window loses the focus, the screen saver and the
-  game's language; then **Play**. It rewrites only the lines it changes (comments stay). `./smo --play`, `./smo-run`
-  or `SMO_LAUNCHER=0` in `smo.env` start the game without it; `smo.desktop` is a menu entry for the folder.
-  Without the window: `python3 launcher/smo_launcher.py --show` / `--set resolution=1080p window=windowed`.
+- **The game folder:** `tools/make_game_folder.py` makes a folder whose `./smo` starts the game (`smo.desktop` is a menu
+  entry for it). Every setting is in the game's own settings menu (F1, below), kept in `config/graphics.ini`.
 - Graphics and controller settings live in `build/config/graphics.ini` and `build/config/controllers.ini` (written
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
 - The window: by default the game covers its monitor (`window = borderless_fullscreen`). F11, or a double-click on
@@ -145,13 +140,24 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   game's own; above it the game's screen-sized targets are drawn larger (more detail, more GPU work: 2160p draws 5.8
   times the pixels), below it smaller. `resolution_scale` (0.25 to 2.4) says the same as a factor and is used when
   there is no `resolution` line; `SMO_VK_SCALE` wins over both.
-- FPS counter: `fps_overlay = top_left | top_right | bottom_left | bottom_right` in `graphics.ini` draws frames per
-  second and milliseconds per frame in that corner (green at 55 FPS and above, yellow from 40, red below), small text
-  on a translucent box over the picture, not in captures. F10 shows and hides it while the game runs (in the bottom-left corner when the file
-  says `off`).
-- The screen does not dim or lock while the game's window is shown and active (`screen_saver = off_while_playing`):
-  a pad is not activity the desktop sees. On Wayland it is an idle inhibitor on the window; `screen_saver = allow`
-  leaves it to the desktop. The log says `display: screen saver held off (playing)` / `allowed again`.
+- Settings menu: F1 while you play, or a pad's HOME button. The game waits and a menu in the game's own style shows
+  three tabs: Display (internal resolution, window mode, window size in the window modes, vertical sync, performance
+  overlay and its position), Graphics (the GPU, from the Vulkan devices of the PC; anisotropic filtering; whether a draw
+  waits for a shader that is not ready) and System (what the game does while another window is active, the game's
+  language, and where the saves, captures, settings and logs are). Up / down choose a row, left / right change its
+  value (it then says `(not applied)`), L / R switch tabs, **A applies** every change shown: written to `graphics.ini`
+  and, for the window, vertical sync, overlay and unfocused behaviour, applied at once. Resolution, GPU, filtering,
+  shaders and language take effect at the next start (`(after restart)`); A once more restarts the game in place
+  (progress since the last save is lost). B (or F1, HOME, Escape) closes and drops what was not applied. Settings go to `graphics.ini` (comments kept); the menu's key is `settings_menu` in `controllers.ini`
+  `[hotkeys]`. (`profile = low`, the weak-GPU set, is a key of the file only.)
+- Performance overlay: `performance_overlay = off | fps | detailed` in `graphics.ini` (and the menu): fps = frames per
+  second and milliseconds per frame (green at 55 FPS and above, yellow from 40, red below); detailed = also the internal
+  resolution, CPU load and temperature, GPU load and temperature, video memory and RAM (NVIDIA through the driver's
+  NVML library, AMD through sysfs, the CPU through /proc and hwmon). Small text on a translucent box over the picture in
+  the `overlay_corner` (top_left by default; also top_right, bottom_left, bottom_right, top_center, bottom_center), not in captures. F10 shows and hides it while the game runs. Older files'
+  `fps_overlay = <corner>` still works (fps in that corner).
+- The screen does not dim, lock or sleep while the game runs: a pad is not activity the desktop sees (on Wayland an
+  idle inhibitor on the window). The log says `display: screen saver held off while the game runs`.
   The game keeps running while its window does not have the focus or is minimised (pads and keyboard count only while
   it has the focus); `unfocused = pause` in `graphics.ini` stops it then instead, as the console stops a game behind
   its HOME menu.
@@ -159,8 +165,8 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   keeps running while it is open, and the guide's Choose Mode item does not lead back into the game.
 - Text entry (a name the game asks for) opens a `zenity` or `kdialog` dialog when one is installed; without them the
   game's suggested text is taken.
-- amiibo: press F1, or both stick buttons of a pad, while you play. The game waits and a menu like its pause menu lists
-  the amiibo it knows; up / down (L / R: a page) to choose, A to scan, B (or F1 again) to close. When the game is
+- amiibo: press F2, or both stick buttons of a pad, while you play. The game waits and a menu like its pause menu lists
+  the amiibo it knows; up / down (L / R: a page) to choose, A to scan, B (or F2 again) to close. When the game is
   waiting for an amiibo, → is held for you until it has read it; otherwise hold → yourself (the game's amiibo mode)
   and it reads the one you chose. The key and the buttons are set in `controllers.ini`, section `[hotkeys]`.
 - The Capture button: F12, or a pad's share button, saves the frame as a BMP in the save folder's `album`.

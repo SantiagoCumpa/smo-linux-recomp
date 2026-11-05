@@ -58,6 +58,20 @@ void ui_draw_edges(UiImage *dst, UiXf xf, float x0, float y0, float x1, float y1
  * line; other tags are skipped. Returns the advance. dst NULL = measure only. */
 float ui_text(UiImage *dst, UiXf xf, const UiFont *f, const UiFont *icons, const uint16_t *s, int len, float x, float y, float scale, uint32_t rgba);
 
+/* ---- shared by the host menus */
+const char *ui_lang_folder(void);                          /* LocalizedData folder of the game's language: "USen", "EUes" ... */
+uint8_t *ui_lang_arc(const char *sub, size_t *n);          /* LocalizedData/<language>/<sub>, decompressed; the US English one if missing */
+int ui_layout_tex(const char *layout, const char *name, UiImage *out);   /* a texture of LayoutData/<layout>.szs. 1 = found */
+UiFont *ui_font_in(const uint8_t *fonts, size_t n, const char *name);    /* a font of the FontData archive */
+int ui_has_glyphs(const UiFont *f, const uint16_t *s);    /* every character of s drawn by f */
+int ui_u16(uint16_t *d, const char *utf8, int cap);       /* UTF-8 -> UTF-16 (outside the BMP: '?'); returns the length */
+/* the frame src (sw x sh RGBA8) blurred and a little darkened, as the pause menu shows the game behind it, into out (w x h) */
+void ui_backdrop(const uint8_t *src, int sw, int sh, UiImage *out, int w, int h);
+/* a window of the layout: the corner texture (its top left corner) at the four corners, mirrored, edges stretched, filled */
+void ui_window(UiImage *dst, UiXf xf, float x0, float y0, float x1, float y1, const UiImage *corner, float c, uint32_t rgba);
+/* text with the soft shadow of the pause menu's white captions */
+void ui_shadow_text(UiImage *dst, UiXf xf, const UiFont *f, const UiFont *icons, const uint16_t *s, float x, float y, float scale, uint32_t rgba);
+
 /* ---- showing a menu: what smo_amiibo.c asks the render back end (RBackend.menu, nvn_vk_draw.c) on the render thread */
 enum { UI_MENU_READ, UI_MENU_SHOW, UI_MENU_END };
 typedef struct {

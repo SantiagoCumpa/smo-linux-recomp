@@ -7,10 +7,7 @@ install folder), outside the build tree:
 The folder (default: smo/ at the repository root; ignored by git, it holds your game's files):
 
     smo/
-      smo                 run it (or double-click it, or smo.desktop) to play: the launcher window with the options,
-                          then the game (./smo --play: the game at once)
-      smo-run             the game itself, without the launcher
-      launcher/           the launcher (GTK4 + libadwaita, tools/launcher/smo_launcher.py)
+      smo                 run it (or double-click it, or smo.desktop) to play; F1 in the game opens the settings menu
       smo.desktop         a menu entry: copy it to ~/.local/share/applications to have the game in the app menu
       bin/                smo_native and libsmo_game.so; the game runs with this as its folder
       game/elf/           main.elf and sdk.elf (and the other modules); game/exefs/main.npdm
@@ -22,7 +19,7 @@ The folder (default: smo/ at the repository root; ignored by git, it holds your 
       logs/               smo.log of the last run, smo.1.log .. smo.4.log of the runs before it
       tmp/, run/          the game's temporary files
       smo-folder.json     what built this folder: commit, date, the game version
-      smo.env             settings the scripts read (SMO_LANGUAGE, SMO_LAUNCHER=0: no launcher window)
+      smo.env             environment for the game, read by ./smo when it exists (e.g. export SMO_LANGUAGE=es)
 
 The runtime finds everything relative to bin/ (romfs, userdata and config through its exe folder, the Vulkan cache
 as ../cache/vk from the working folder), so the folder can be moved anywhere. Making it again updates bin/ and game/
@@ -45,7 +42,8 @@ import target as T  # noqa: E402
 LANGUAGES = ('ja', 'en-US', 'en-GB', 'fr', 'fr-CA', 'de', 'it', 'es', 'es-419', 'zh-Hans', 'zh-Hant', 'ko', 'nl', 'ru')   # the game's (nnmisc.c)
 
 RUN_SCRIPT = r'''#!/usr/bin/env bash
-# Super Mario Odyssey (smo-recomp): run the game from this folder, without the launcher. Arguments are passed to the game.
+# Super Mario Odyssey (smo-recomp): run the game from this folder. Arguments are passed to the game. Its settings are in the
+# game's own menu (F1, or a pad's HOME button), kept in config/graphics.ini.
 # SMO_PRIME=0 runs on the default GPU instead of the discrete one (NVIDIA PRIME offload).
 set -e
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
@@ -56,7 +54,7 @@ export XDG_CACHE_HOME="$here/cache"
 export __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_PATH="$here/cache/nvidia" __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
 export MESA_SHADER_CACHE_DIR="$here/cache/mesa"
 export TMPDIR="$here/tmp"
-[ -f "$here/smo.env" ] && . "$here/smo.env"      # settings of this folder (SMO_LANGUAGE=...), written by the setup
+[ -f "$here/smo.env" ] && . "$here/smo.env"      # environment of this folder, if any (the settings menu keeps SMO_LANGUAGE in it)
 if [ "${SMO_PRIME:-1}" != 0 ]; then
     export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}" __VK_LAYER_NV_optimus="${__VK_LAYER_NV_optimus:-NVIDIA_only}"
     export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
@@ -65,31 +63,10 @@ cd "$here/bin"
 exec ./smo_native ../game/elf/main.elf 0 "$@" >"$here/logs/smo.log" 2>&1
 '''
 
-LAUNCHER = r'''#!/usr/bin/env bash
-# Super Mario Odyssey (smo-recomp): the launcher window (options, then Play), or the game at once:
-#   ./smo --play       the game without the window (also when smo.env has SMO_LAUNCHER=0)
-#   ./smo --launcher   the window even with SMO_LAUNCHER=0
-here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-[ -f "$here/smo.env" ] && . "$here/smo.env"
-mode=window
-case "${1:-}" in
-    --play) mode=play; shift ;;
-    --launcher) mode=window; shift ;;
-    *) [ "${SMO_LAUNCHER:-1}" = 0 ] && mode=play ;;
-esac
-if [ "$mode" = window ]; then
-    if python3 -c 'import gi; gi.require_version("Gtk", "4.0"); gi.require_version("Adw", "1"); from gi.repository import Adw' 2>/dev/null; then
-        exec python3 "$here/launcher/smo_launcher.py" --folder "$here"
-    fi
-    echo "smo: the launcher needs python-gobject, gtk4 and libadwaita (pacman -S python-gobject gtk4 libadwaita); starting the game" >&2
-fi
-exec "$here/smo-run" "$@"
-'''
-
 DESKTOP = '''[Desktop Entry]
 Type=Application
 Name=Super Mario Odyssey
-Comment=smo-recomp: the launcher, then the game
+Comment=smo-recomp
 Exec="{folder}/smo"
 Path={folder}
 Icon=applications-games
@@ -99,11 +76,11 @@ Categories=Game;
 
 README = '''Super Mario Odyssey, recompiled (smo-recomp)
 
-Play: run ./smo in this folder (from a terminal or your file manager). It opens the launcher: resolution (up to 4K),
-full screen or window, GPU and the other options, then Play. ./smo --play starts the game at once; so does ./smo-run.
+Play: run ./smo in this folder (from a terminal or your file manager). In the game, F1 (or a pad's HOME button) opens
+the settings menu: resolution (up to 4K), full screen or window, vertical sync, performance overlay, GPU, language...
 smo.desktop is a menu entry for this folder: copy it to ~/.local/share/applications.
 
-  config/graphics.ini, config/controllers.ini   settings (F1 in the game opens the help)
+  config/graphics.ini, config/controllers.ini   settings (the settings menu writes graphics.ini)
   userdata/save/                                your saves: back this folder up
   logs/smo.log                                  the log of the last run (attach it to a bug report)
   cache/                                        shader caches; deleting it only makes the next start slower
@@ -216,20 +193,34 @@ def main():
     for sub in ('logs', 'tmp', 'run', os.path.join('cache', 'vk'), os.path.join('cache', 'nvidia'), os.path.join('cache', 'mesa')):
         os.makedirs(os.path.join(out, sub), exist_ok=True)
 
-    for name, text in (('smo', LAUNCHER), ('smo-run', RUN_SCRIPT)):
-        path = os.path.join(out, name)
-        with open(path + '.new', 'w', encoding='utf-8') as f:
-            f.write(text)
-        os.chmod(path + '.new', 0o755)
-        os.replace(path + '.new', path)
     launcher = os.path.join(out, 'smo')
-    copy_tree(os.path.join(REPO, 'tools', 'launcher', 'smo_launcher.py'), os.path.join(out, 'launcher', 'smo_launcher.py'))
+    with open(launcher + '.new', 'w', encoding='utf-8') as f:
+        f.write(RUN_SCRIPT)
+    os.chmod(launcher + '.new', 0o755)
+    os.replace(launcher + '.new', launcher)
+    # folders made with the GTK launcher (before the settings menu replaced it): the launcher, ./smo-run and SMO_LAUNCHER go
+    shutil.rmtree(os.path.join(out, 'launcher'), ignore_errors=True)
+    if os.path.exists(os.path.join(out, 'smo-run')):
+        os.remove(os.path.join(out, 'smo-run'))
+    env_file = os.path.join(out, 'smo.env')
+    if os.path.exists(env_file):
+        lines = [l for l in open(env_file, encoding='utf-8') if 'SMO_LAUNCHER=' not in l and (not a.language or 'SMO_LANGUAGE=' not in l)
+                 and not (l.startswith('#') and 'smo-run' in l)]
+        if not lines or not lines[0].startswith('#'):
+            lines.insert(0, '# environment of this game folder, read by ./smo (the settings menu, F1, keeps SMO_LANGUAGE here)\n')
+        with open(env_file, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
     with open(os.path.join(out, 'smo.desktop'), 'w', encoding='utf-8') as f:
         f.write(DESKTOP.format(folder=out))
-    env_file = os.path.join(out, 'smo.env')
-    if a.language:
-        with open(env_file, 'w', encoding='utf-8') as f:
-            f.write('# settings of this game folder, read by ./smo\nexport SMO_LANGUAGE=%s\n' % a.language)
+    if a.language:                                       # where the settings menu keeps it
+        ini = os.path.join(out, 'config', 'graphics.ini')
+        lines = open(ini, encoding='utf-8').readlines() if os.path.exists(ini) else []
+        lines = [l for l in lines if not l.split('=', 1)[0].strip().lower() == 'language']
+        if lines and not lines[-1].endswith('\n'):
+            lines[-1] += '\n'
+        lines.append('language = %s\n' % a.language)
+        with open(ini, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
     with open(os.path.join(out, 'README.txt'), 'w', encoding='utf-8') as f:
         f.write(README)
     with open(os.path.join(out, 'smo-folder.json'), 'w', encoding='utf-8') as f:

@@ -37,6 +37,7 @@ typedef struct {
     int kb_player;                      /* -2 auto, -1 none, 0..7 */
     int kb_vk[24];
     int hk_vk;                          /* [hotkeys] amiibo_menu: virtual key, 0 = none */
+    int hk_settings;                    /* [hotkeys] settings_menu: virtual key, 0 = none */
     unsigned hk_combo;                  /* [hotkeys] amiibo_menu_pad: Pro button bits, 0 = none */
 } Cfg;
 typedef struct {
@@ -167,10 +168,12 @@ static const char *const g_default_ini =
 "RSTICK_LEFT = none\r\nRSTICK_UP = none\r\nRSTICK_RIGHT = none\r\nRSTICK_DOWN = none\r\n"
 "\r\n"
 "[hotkeys]\r\n"
-"; The amiibo menu (in the style of the game's pause menu; the game waits while it is open): a key of the keyboard (as above;\r\n"
-"; pressed again it closes the menu) and the Pro Controller buttons any pad holds together for it, joined with +; none = no key /\r\n"
-"; no combination. Without this section: F1 and STICK_L+STICK_R (both sticks pressed in).\r\n"
-"amiibo_menu = F1\r\n"
+"; The settings menu (F1 by default; a pad's HOME button opens it too) and the amiibo menu (in the style of the game's pause\r\n"
+"; menu): a key of the keyboard (as above; pressed again it closes the menu) and, for the amiibo menu, the Pro Controller\r\n"
+"; buttons any pad holds together for it, joined with +; none = no key / no combination. The game waits while a menu is open.\r\n"
+"; Without this section: F1, F2 and STICK_L+STICK_R (both sticks pressed in).\r\n"
+"settings_menu = F1\r\n"
+"amiibo_menu = F2\r\n"
 "amiibo_menu_pad = STICK_L+STICK_R\r\n"
 "\r\n"
 "; Per device (GUID from --pad-test). Every key is optional; what is missing falls back to [general] and the built-in default:\r\n"
@@ -198,7 +201,8 @@ static void cfg_defaults(Cfg *c) {
     c->def.layout = 2; c->def.dz = 0.10f; c->def.outer = 0.98f; c->def.trig = 0.33f; c->def.rstr = 1.0f; c->def.rumble = 1;
     c->kb_player = -2;
     memcpy(c->kb_vk, g_kb_default, sizeof c->kb_vk);
-    c->hk_vk = VK_F1;
+    c->hk_vk = VK_F2;
+    c->hk_settings = VK_F1;
     c->hk_combo = 1u << 4 | 1u << 5;                      /* STICK_L + STICK_R */
 }
 static unsigned parse_combo(char *v) {                    /* "STICK_L+STICK_R" -> Pro button bits; none / unknown names -> 0 */
@@ -303,6 +307,7 @@ static void cfg_parse(Cfg *c, char *text) {
             else for (int i = 0; i < 24; i++) if (!strcasecmp(key, g_kbn[i])) c->kb_vk[i] = parse_vk(val);
         } else if (sect == 5) {
             if (!strcasecmp(key, "amiibo_menu")) c->hk_vk = parse_vk(val);
+            else if (!strcasecmp(key, "settings_menu")) c->hk_settings = parse_vk(val);
             else if (!strcasecmp(key, "amiibo_menu_pad")) c->hk_combo = strcasecmp(val, "none") ? parse_combo(val) : 0;
         }
     }
@@ -624,6 +629,9 @@ static void dev_state(const Dev *d, NnPadState *o) {      /* lock held */
     /* SDL's misc1 is the Switch Pro Controller's capture button, the Xbox Series pad's share button, the
      * microphone button of a DualSense: the console's Capture button (nnhid.c takes a picture), not a button the game sees */
     o->capture = d->gp && SDL_GetGamepadButton(d->gp, SDL_GAMEPAD_BUTTON_MISC1);
+    /* SDL's guide is the HOME button (Joy-Con, Pro Controller), Xbox / PlayStation logo: the console's HOME button, which
+     * opens the system's menu; here the settings menu (nnhid.c). Not a button the game sees. */
+    o->home = d->gp && SDL_GetGamepadButton(d->gp, SDL_GAMEPAD_BUTTON_GUIDE);
 }
 static Dev *dev_of(int player) { for (int i = 0; i < MAXDEV; i++) if (g_dev[i].used && !g_dev[i].ignored && g_dev[i].slot == player) return &g_dev[i]; return NULL; }
 
@@ -696,7 +704,11 @@ int nnpad_kb_vk(int idx) {
 }
 int nnpad_hotkey_vk(int which) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
-    return which == 0 ? g_cfg.hk_vk : 0;
+    /* which 0: the amiibo menu; 1: the settings menu. A file written before the settings menu existed binds the amiibo
+     * menu to F1, now the settings menu's key: the amiibo menu then takes F2. */
+    if (which == 1) return g_cfg.hk_settings;
+    if (which == 0) return g_cfg.hk_vk && g_cfg.hk_vk == g_cfg.hk_settings ? VK_F2 : g_cfg.hk_vk;
+    return 0;
 }
 unsigned nnpad_hotkey_combo(void) {
     if (!g_inited) { lock(); if (!g_cfg.path[0]) { cfg_load(1); } unlock(); }
@@ -972,7 +984,7 @@ int nnpad_selftest(const NnHidHooks *h) {
         int amiibo_menu_take_request(void);
         int took[4];
         amiibo_menu_take_request();
-        check(nnpad_hotkey_vk(0) == VK_F1 && nnpad_hotkey_combo() == (1u << 4 | 1u << 5), "[hotkeys] defaults: the amiibo menu on F1 and on STICK_L+STICK_R");
+        check(nnpad_hotkey_vk(0) == VK_F2 && nnpad_hotkey_vk(1) == VK_F1 && nnpad_hotkey_combo() == (1u << 4 | 1u << 5), "[hotkeys] defaults: the settings menu on F1, the amiibo menu on F2 and on STICK_L+STICK_R");
         vj_clear(js[0], SDL_GAMEPAD_BUTTON_COUNT, 6);
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_LEFT_STICK, true); settle(); h->state(0, &btn, st, &attr); took[0] = amiibo_menu_take_request();
         SDL_SetJoystickVirtualButton(js[0], SDL_GAMEPAD_BUTTON_RIGHT_STICK, true); settle(); h->state(0, &btn, st, &attr); took[1] = amiibo_menu_take_request();

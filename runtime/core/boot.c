@@ -2,6 +2,8 @@
  * constructors, nnMain) on the lifted binary and records which functions of
  * other modules it asks for, in order. Unimplemented imports return 0. */
 #include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <math.h>
 #include "plat.h"
@@ -228,7 +230,21 @@ static uint32_t guest_main(void * arg) {
     return 0;
 }
 
+/* The settings menu's "Restart now" (smo_settings.c): the program started again in place, with the same command line,
+ * working folder and environment (the caller sets what changed in it, e.g. SMO_LANGUAGE), as totk-pc-recomp's menu does.
+ * exec replaces the process: the window, the device and the threads go with it. Progress since the last save is lost
+ * (the menu says so). Returns only if exec failed. */
+static char **g_argv;
+void smo_restart(void) {
+    printf("restart: starting the game again (settings menu)\n");
+    fflush(stdout); fflush(stderr);
+    execv("/proc/self/exe", g_argv);
+    printf("restart: exec failed (%s): close the game and start it again\n", strerror(errno));
+    fflush(stdout);
+}
+
 int main(int argc, char **argv) {
+    g_argv = argv;
     g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* the target's main.elf from the exe's folder (image.h) */
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc > 1 && !strcmp(argv[1], "--shaderc-selftest")) { int smo_shaderc_selftest(void); return smo_shaderc_selftest(); }   /* vk_shaderc_shim.c */

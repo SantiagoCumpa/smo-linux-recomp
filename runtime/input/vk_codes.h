@@ -17,6 +17,7 @@
 #define VK_DOWN 0x28
 #define VK_NUMPAD0 0x60
 #define VK_F1 0x70
+#define VK_F2 0x71
 #define VK_F11 0x7A
 #define VK_F12 0x7B
 #define VK_LSHIFT 0xA0

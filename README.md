@@ -63,7 +63,8 @@ on Linux.
 | Audio | the game's own audio renderer runs (lifted from its system library) and played through the Windows audio device (6 → 2 channel downmix, 48 kHz; on Linux an SDL3 audio stream, PipeWire or PulseAudio): 0 dropped samples, 0 underruns in the Cap Kingdom run |
 | Video | H.264 through Windows Media Foundation: the tutorial videos played with their picture (on Linux: FFmpeg) |
 | Help | the pause menu's Action Guide opens inside the game window, scaled to it, from the manual in your dump (Microsoft Edge WebView2), and the game waits while it is open, as on the console; checked with scripted input in a 2560 × 1440 window: open, the Controls page with its pictures, back, Bonus, Choose Mode (the game's Options, then the page again), close. On Linux it opens in the desktop's web browser, and the game does not wait |
-| amiibo | F1, or both stick buttons on a pad, opens a menu drawn like the game's pause menu from its own layout textures, fonts and texts: 102 amiibo, in the game's language. The one chosen is held to a virtual NFC reader; checked in Cascade Kingdom: the game reads Peach and runs her help. Mario, Bowser and Luigi checked as well¹ |
+| Settings menu | F1, or a pad's HOME button, opens a menu in the game's own style: internal resolution up to 4K, window mode and size, vertical sync, performance overlay (FPS, or detailed: resolution, CPU, GPU, memory, temperatures), GPU, anisotropic filtering, unfocused behaviour, language, and where the files are. What the running game can take applies at once; the rest after "Restart now" |
+| amiibo | F2, or both stick buttons on a pad, opens a menu drawn like the game's pause menu from its own layout textures, fonts and texts: 102 amiibo, in the game's language. The one chosen is held to a virtual NFC reader; checked in Cascade Kingdom: the game reads Peach and runs her help. Mario, Bowser and Luigi checked as well¹ |
 | System calls | every system call the game made in the tested scenes is implemented (331 of 331 in the Cap Kingdom run); `SMO_IMPORT_SELFTEST=1` checks the ones written from the game's import list rather than met in play: 0 failures |
 | Controllers | keyboard, XInput (Windows only), and any pad through SDL3 (hot-plug, 8 players, remapping file, rumble, motion): 51 of 51 automated checks with virtual devices; played with an Xbox One controller; other physical pads not tried |
 | Window and capture | a borderless window by default; F11 or a double-click switches to borderless fullscreen and back. The game keeps running at 60 frames a second while its window is not the active one or is minimised (`unfocused = pause` in `graphics.ini` stops it, as the console does). F12 or a pad's share button saves the frame to the save folder's `album` |
@@ -106,7 +107,7 @@ sudo pacman -S clang lld llvm pkgconf sdl3 vulkan-headers vulkan-icd-loader shad
 ```
 
 `smo-recomp` makes the Python environment, decrypts your NSP files (with the repository's `tools/bin/hactool`) into `build/install/dump`, lifts and
-compiles the game (the first time takes a while) and makes the game folder: `smo` (the launcher), `bin/`, `game/`,
+compiles the game (the first time takes a while) and makes the game folder: `smo` (starts the game; F1 in it opens the settings menu), `bin/`, `game/`,
 `romfs/`, `config/`, `userdata/` (saves), `cache/`, `logs/`. Each step is skipped when its result is there, so a run that
 stopped resumes, and running it again on the same folder updates the program and keeps saves, settings and caches.
 No firmware is needed. The folder can be moved anywhere; on btrfs or XFS its copies are reflinks (no extra space).

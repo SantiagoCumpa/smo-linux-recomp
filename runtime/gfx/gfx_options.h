@@ -1,4 +1,4 @@
-/* Graphics options: config\graphics.ini. See gfx_options.c. */
+/* Graphics options: config/graphics.ini. See gfx_options.c. */
 #ifndef GFX_OPTIONS_H
 #define GFX_OPTIONS_H
 typedef struct {
@@ -13,12 +13,18 @@ typedef struct {
                               * sets it too and wins; env SMO_VK_SCALE wins over both) */
     int handheld;            /* 1: the game is told it runs handheld = it makes its own 1280x720 render targets instead of 1920x1080 */
     int aniso;               /* 0 = the game's own value; 2, 4, 8, 16 = at least that on samplers that filter between mip levels */
-    int fps_overlay;         /* fps_overlay: 0 off, 1 top_left, 2 top_right, 3 bottom_left, 4 bottom_right (F10 shows / hides it while playing) */
+    int perf_overlay;        /* performance_overlay: 0 off, 1 fps (frames per second and ms per frame), 2 detailed (+ internal resolution, CPU,
+                              * GPU, memory, temperatures); F10 shows / hides it while playing (older files: fps_overlay = <corner> = fps) */
+    int overlay_corner;      /* overlay_corner: 1 top_left (default), 2 top_right, 3 bottom_left, 4 bottom_right, 5 top_center, 6 bottom_center */
+    char language[16];       /* language: "" = the system's; else a code of the game's (en-US, es ...): nnmisc.c; env SMO_LANGUAGE wins */
     int overlay;             /* 1: frame time in the title bar and a "frame-time:" log line every second */
     int shader_skip;         /* shader_wait: 0 hold (a draw waits for its shader or pipeline: the frame is late), 1 skip (near a scene the draw is left out until they are ready; nvn_vk_pipelines.c skip_on; env SMO_VK_NOHOLD wins) */
     int profile;            /* 0 custom (the keys as written), 1 low: scale, aniso and present are set by the profile (gfx_options.c) */
-    int keep_awake_playing;  /* screen_saver: 1 off_while_playing (default: no dimming while the window is shown and active), 0 allow */
     int pause_unfocused;     /* unfocused: 0 run (the game goes on while the window is not active), 1 pause (nnmisc.c oe_watch stops it) */
 } GfxOptions;
 const GfxOptions *gfx_options(void);      /* any thread; read once (the file is written with defaults when it does not exist) */
+GfxOptions *gfx_options_edit(void);       /* the settings menu (smo_settings.c): the same struct, to change what applies at once */
+/* Writes key = value into graphics.ini: the line of that key is replaced (comments and every other line kept), or added at
+ * the end. 1 = written. The struct is not changed: the caller sets what applies at once. */
+int gfx_options_save(const char *key, const char *value);
 #endif

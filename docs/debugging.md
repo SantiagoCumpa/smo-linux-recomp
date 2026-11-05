@@ -45,6 +45,9 @@ The end of every log has the counts that tell whether a run was healthy:
 - `SMO_CAPTURE_AT=<frame>[,<frame>...]` presses the Capture button at those frames (the picture goes to the save
   folder's `album`, as when you press F12); `SMO_CAPTURE_GS=<n>` presses it at n frames that drew with a geometry stage
   (the lightning), at least 60 frames apart.
+- `SMO_SETTINGS_SHOT_DIR=<folder>` saves each new picture of the settings menu (F1) as a PNG; `%` in a test sequence
+  presses its key. `SMO_WINDOW_SHOT=<frame>[,<frame>...]` (with `SMO_SHOT_DIR`) saves the window's picture of those frames
+  as presented, the performance overlay included (`window_<frame>.png`).
 - `SMO_AMIIBO_SHOT_DIR=<folder>` saves the first three different pictures of each opening of the amiibo menu as
   `amiibo_menu_<opening>_<n>.png` (the menu's frames are not game frames, so `SMO_SHOT` does not see them).
 - `SMO_GUIDE_SHOT=<file.png>` belonged to the Windows build's Help in the game window (WebView2); on Linux the Help

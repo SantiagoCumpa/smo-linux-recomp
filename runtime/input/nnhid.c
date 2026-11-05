@@ -49,7 +49,7 @@ static int scripted(int vk) {
  * "<second>[+<duration>]:<keys>", duration 0.15 s by default, keys held together. Key characters are the
  * keyboard keys of the mapping above (Z X C V Q E A S I J K L), '!' = Enter (Plus), '-' = Backspace (Minus),
  * lower-case u d l r = the arrow keys (left stick) and the digits 8 2 4 6 = right stick up, down, left, right (SMO),
- * '*' = the amiibo menu's key (SMO, smo_amiibo.c). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
+ * '*' = the amiibo menu's key (SMO, smo_amiibo.c), '%' = the settings menu's key (smo_settings.c). Example: "38:Z 41:Z 60+0.6:r 62:Z 70:!".
  * Each step is announced on stdout when it starts, so it can be matched against the frame log. */
 #define SCRIPT_MAX 256
 static struct { double at, len; char keys[12]; int said; } g_script[SCRIPT_MAX];
@@ -65,6 +65,7 @@ static int script_vk(char k) {
     case 'l': return VK_LEFT;
     case 'r': return VK_RIGHT;
     case '*': return 0x101;                                   /* VK_AMIIBO_MENU (below) */
+    case '%': return 0x102;                                   /* VK_SETTINGS_MENU (below) */
     default: return k;
     }
 }
@@ -744,6 +745,8 @@ static const struct { uint16_t x; int pos, label; } g_xmap[] = {
  * waiting states of its amiibo mode and of the amiibo NPC's prompt), right is held on player 1 until the game has read the
  * amiibo and half a second more, at most 4 s: as a player holds right while tapping the figure. */
 #define VK_AMIIBO_MENU 0x101                                  /* '*' of the test sequences: not a key of the keyboard */
+#define VK_SETTINGS_MENU 0x102                                /* '%' of the test sequences */
+void settings_menu_request(void);                             /* smo_settings.c */
 long long nvn_front_frame_next(void);                         /* nvn_gl.c */
 void amiibo_menu_request(void);                               /* smo_amiibo.c */
 long nfp_amiibo_reads(void);                                  /* nnapplet.c */
@@ -790,6 +793,7 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
     if (id > 7 || !style_is_fullkey) return;                  /* every controller here is a full-key (Pro) controller */
     if (id == 0) seq_tick();                                  /* the input sequence advances one step per poll of player 1 */
     if (id == 0) { static int was; int on = scripted(VK_AMIIBO_MENU) || script_key(VK_AMIIBO_MENU) || seq_key(VK_AMIIBO_MENU); if (on && !was) amiibo_menu_request(); was = on; }
+    if (id == 0) { static int was; int on = scripted(VK_SETTINGS_MENU) || script_key(VK_SETTINGS_MENU) || seq_key(VK_SETTINGS_MENU); if (on && !was) settings_menu_request(); was = on; }
     if (!player_connected(id)) return;
     uint64_t buttons = 0;
     int lx = 0, ly = 0, rx = 0, ry = 0, wired = 1;
@@ -812,6 +816,11 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
                 void smo_capture_request(void);
                 int on = ps.capture && devices_live();
                 if (id < 8) { if (on && !was[id]) smo_capture_request(); was[id] = on; }
+            }
+            {   /* the pad's HOME button: the settings menu, once per press */
+                static int was[8];
+                int on = ps.home && devices_live();
+                if (id < 8) { if (on && !was[id]) settings_menu_request(); was[id] = on; }
             }
             if (devices_live()) {
                 buttons |= ps.buttons;
@@ -857,6 +866,18 @@ static void fill_pad(uint64_t out, uint32_t id, int style_is_fullkey) {
  * (hid_menu_pad_buttons, smo_guide.c): without the keyboard player's keys, which the Help page reads itself. */
 static uint64_t menu_buttons(int keyboard);
 uint64_t hid_menu_buttons(void) { return menu_buttons(1); }
+/* the settings menu, while it holds the game: a pad's HOME button newly pressed (it closes the menu), once per press */
+int hid_menu_home(void) {
+    static int was[8];
+    int hit = 0;
+    for (int id = 0; id < 8; id++) {
+        NnPadState ps;
+        int on = sdl_on() && nnpad_get(id, &ps) && ps.home && devices_live();
+        if (on && !was[id]) hit = 1;
+        was[id] = on;
+    }
+    return hit;
+}
 uint64_t hid_menu_pad_buttons(void) { return menu_buttons(0); }
 static uint64_t menu_buttons(int keyboard) {
     uint64_t all = 0;

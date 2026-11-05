@@ -40,11 +40,6 @@ static const char *const k_default_ini =
 ";   pause: it stops until the window is active again, as the console stops the game while the HOME menu is open.\n"
 "unfocused = run\n"
 "\n"
-"; screen_saver = off_while_playing | allow\n"
-";   off_while_playing: the screen does not dim, lock or sleep while the game's window is shown and active (a pad is\n"
-";   not activity the desktop sees). allow: the desktop's own rules, except during the game's ending.\n"
-"screen_saver = off_while_playing\n"
-"\n"
 "; vsync = clock | on | off | mailbox      (Vulkan)\n"
 ";   clock:   frames are shown at once (mailbox when the GPU offers it, else immediate) and the game is paced by the\n"
 ";            program's own 60 Hz clock. Lowest latency; can tear only when mailbox is missing.\n"
@@ -91,14 +86,23 @@ static const char *const k_default_ini =
 ";   profile is active.\n"
 "profile = custom\n"
 "\n"
-"; fps_overlay = off | top_left | top_right | bottom_left | bottom_right\n"
-";   A small frame counter on a translucent box in that corner: frames per second and milliseconds per frame (green at 55\n"
-";   and above, yellow from 40, red below). F10 shows and hides it while the game runs.\n"
-"fps_overlay = off\n"
+"; performance_overlay = off | fps | detailed\n"
+";   A small box over the picture: fps = frames per second and milliseconds per frame (green at 55 and above, yellow\n"
+";   from 40, red below); detailed = also the internal resolution, CPU and GPU load and temperature, video memory and\n"
+";   RAM. F10 shows and hides it while the game runs; F1 opens the settings menu, where it is set too.\n"
+"performance_overlay = off\n"
+"\n"
+"; overlay_corner = top_left | top_right | bottom_left | bottom_right | top_center | bottom_center\n"
+"overlay_corner = top_left\n"
+"\n"
+"; language = system | ja | en-US | en-GB | fr | fr-CA | de | it | es | es-419 | zh-Hans | zh-Hant | ko | nl | ru\n"
+";   The game's language (read when the game starts). system: the desktop's (LANG). SMO_LANGUAGE in the environment\n"
+";   or in the game folder's smo.env wins; the settings menu (F1) changes both.\n"
+"language = system\n"
 "\n"
 "; frame_time_overlay = off | on\n"
 ";   on: the average frame time of the last second in the window title ('.. fps - 16.67 ms per frame') and as a\n"
-";   'frame-time:' line in the log. For a counter in the picture itself: fps_overlay.\n"
+";   'frame-time:' line in the log. For a counter in the picture itself: performance_overlay.\n"
 "frame_time_overlay = off\n";
 
 #define GFX_LOW_SCALE 0.5f
@@ -133,8 +137,9 @@ static void opt_load(void) {
     GfxOptions *o = &g_opt;
     int written = 0, unknown = 0;
     memset(o, 0, sizeof *o);
-    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 1; o->keep_awake_playing = 1;
+    o->width = 1280; o->height = 720; o->scale = 1.0f; o->window_mode = 1; o->overlay_corner = 1;
     float res_scale = 0;          /* from 'resolution': wins over resolution_scale wherever the two stand */
+    int perf_set = 0, old_fps = -1;   /* fps_overlay of older files: a corner = the fps overlay there, unless performance_overlay says */
     opt_path(o->path);
     FILE *f = fopen(o->path, "rb");
     if (!f) {
@@ -166,14 +171,26 @@ static void opt_load(void) {
             for (size_t i = 0; i < sizeof k_res / sizeof k_res[0]; i++) if (!strcasecmp(val, k_res[i].name)) { res_scale = k_res[i].scale; found = 1; }
             if (!found) unknown++;
         }
-        else if (!strcasecmp(key, "screen_saver")) o->keep_awake_playing = strcasecmp(val, "allow") != 0;
+        else if (!strcasecmp(key, "screen_saver")) { }    /* older files: the screen now always stays on while the game runs */
+        else if (!strcasecmp(key, "performance_overlay")) {
+            o->perf_overlay = !strcasecmp(val, "fps") ? 1 : !strcasecmp(val, "detailed") ? 2 : 0;
+            if (strcasecmp(val, "off") && !o->perf_overlay) unknown++;
+            perf_set = 1;
+        }
+        else if (!strcasecmp(key, "overlay_corner")) {
+            static const char *const k_pos[7] = {"", "top_left", "top_right", "bottom_left", "bottom_right", "top_center", "bottom_center"};
+            int found = 0;
+            for (int i = 1; i < 7; i++) if (!strcasecmp(val, k_pos[i])) found = i;
+            if (found) o->overlay_corner = found; else unknown++;
+        }
+        else if (!strcasecmp(key, "language")) { if (strcasecmp(val, "system")) snprintf(o->language, sizeof o->language, "%s", val); }
         else if (!strcasecmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
         else if (!strcasecmp(key, "fps_overlay")) {
             static const char *const k_pos[5] = {"off", "top_left", "top_right", "bottom_left", "bottom_right"};
             int found = -1;
             for (int i = 0; i < 5; i++) if (!strcasecmp(val, k_pos[i])) found = i;
             if (!strcasecmp(val, "on")) found = 3;
-            if (found < 0) unknown++; else o->fps_overlay = found;
+            if (found < 0) unknown++; else old_fps = found;
         }
         else if (!strcasecmp(key, "frame_time_overlay")) o->overlay = !strcasecmp(val, "on") || !strcmp(val, "1");
         else if (!strcasecmp(key, "profile")) o->profile = !strcasecmp(val, "low");
@@ -182,6 +199,7 @@ static void opt_load(void) {
         else unknown++;
     }
     if (f) fclose(f);
+    if (!perf_set && old_fps > 0) { o->perf_overlay = 1; o->overlay_corner = old_fps; }
     if (res_scale > 0) o->scale = res_scale;
     if (o->profile == 1) {       /* the low-end profile wins over the three keys it sets, wherever they stand in the file */
         o->scale = GFX_LOW_SCALE; o->aniso = 0; o->present = 0;
@@ -189,10 +207,10 @@ static void opt_load(void) {
     printf("graphics profile: %s\n", o->profile == 1 ? "low (weak or integrated GPU): resolution_scale=" GFX_LOW_SCALE_TEXT ", anisotropic_filtering=game, vsync=clock; these three keys of the file are not used"
                                                      : "custom (every key of graphics.ini as written; 'profile = low' is the set for a weak or integrated GPU)");
     static const char *const k_win[4] = {"windowed", "borderless_fullscreen", "fullscreen", "borderless_window"}, *const k_vs[4] = {"clock", "on", "off", "mailbox"};
-    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s fps_overlay=%d screen_saver=%s%s\n", o->path,
+    printf("graphics options: %s (%s): renderer=%s window=%s %dx%d unfocused=%s vsync=%s gpu=%s console_mode=%s resolution_scale=%.2f anisotropic_filtering=%d frame_time_overlay=%s performance_overlay=%s overlay_corner=%d language=%s%s\n", o->path,
            written ? "written with the defaults" : f ? "read" : "NOT readable, defaults used", o->renderer ? "opengl" : "vulkan", k_win[o->window_mode], o->width, o->height,
-           o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off", o->fps_overlay,
-           o->keep_awake_playing ? "off_while_playing" : "allow", unknown ? " (lines with an unknown key were ignored)" : "");
+           o->pause_unfocused ? "pause" : "run", k_vs[o->present], o->gpu[0] ? o->gpu : "auto", o->handheld ? "handheld" : "docked", o->scale, o->aniso, o->overlay ? "on" : "off",
+           o->perf_overlay == 2 ? "detailed" : o->perf_overlay ? "fps" : "off", o->overlay_corner, o->language[0] ? o->language : "system", unknown ? " (lines with an unknown key were ignored)" : "");
     if (o->scale != 1.0f && o->renderer) printf("graphics options: resolution_scale=%.2f is ignored by the OpenGL renderer (Vulkan only)\n", o->scale);
     if (o->scale != 1.0f && (o->scale < 0.25f || o->scale > 2.4f)) printf("graphics options: resolution_scale=%.2f is outside 0.25 .. 2.4: the nearest of the two is used\n", o->scale);
     if (o->renderer) printf("graphics options: renderer=opengl is not available on Linux: Vulkan is used\n");
@@ -201,4 +219,44 @@ static void opt_load(void) {
 const GfxOptions *gfx_options(void) {
     pthread_once(&g_once, opt_load);
     return &g_opt;
+}
+GfxOptions *gfx_options_edit(void) {
+    pthread_once(&g_once, opt_load);
+    return &g_opt;
+}
+int gfx_options_save(const char *key, const char *value) {
+    static plat_lock_t lock = PLAT_LOCK_INIT;
+    const char *path = gfx_options()->path;
+    char tmp[PATH_MAX + 8], line[1024], k[128];
+    int done = 0, ok = 0;
+    plat_lock(&lock);
+    FILE *in = fopen(path, "rb");
+    snprintf(tmp, sizeof tmp, "%s.new", path);
+    FILE *out = fopen(tmp, "wb");
+    if (out) {
+        while (in && fgets(line, sizeof line, in)) {
+            const char *p = line, *eq = strchr(line, '=');
+            while (*p == ' ' || *p == '\t') p++;
+            int keyline = eq && *p != ';' && *p != '#' && *p != '[';
+            if (keyline) {
+                size_t n = (size_t)(eq - p);
+                if (n >= sizeof k) n = sizeof k - 1;
+                memcpy(k, p, n); k[n] = 0; trim(k);
+            }
+            if (keyline && !strcasecmp(k, key)) {
+                if (!done) fprintf(out, "%s = %s\n", key, value);     /* a key written twice keeps one line */
+                done = 1;
+            } else fputs(line, out);
+        }
+        if (!done) {
+            long end = ftell(out);
+            fprintf(out, "%s%s = %s\n", end > 0 ? "\n" : "", key, value);
+        }
+        ok = fclose(out) == 0 && rename(tmp, path) == 0;
+    }
+    if (in) fclose(in);
+    plat_unlock(&lock);
+    printf("graphics options: %s = %s %s %s\n", key, value, ok ? "written to" : "could NOT be written to", path);
+    fflush(stdout);
+    return ok;
 }

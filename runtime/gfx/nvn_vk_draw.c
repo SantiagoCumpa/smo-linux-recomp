@@ -3646,29 +3646,50 @@ static void overlay_draw(uint32_t index) {
         vkCmdBlitImage(R.cmd, g_ovl.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
     }
 }
-/* the FRAME COUNTER (graphics.ini fps_overlay, F10: display.c): frames per second and milliseconds per frame in a corner of
- * the window, drawn after the blit of the game's picture (never into the game's textures, so captures do not have it).
- * A pipeline of our own draws coloured rectangles into the swapchain image (dynamic rendering, alpha blending): a
- * translucent box, then the text, a 5x7 font whose lit runs of pixels are rectangles of `k` window pixels (2 at 1080p,
- * 4 at 2160p), each over a soft shadow. The text changes twice a second. Counted: presents of game frames
- * (g_vk_frames), not the loading screen's repeats. */
-int display_fps_overlay(void);                 /* display.c: 0 hidden, 1..4 the corner */
+/* the PERFORMANCE OVERLAY (graphics.ini performance_overlay, the settings menu, F10: display.c): in a corner of the window,
+ * drawn after the blit of the game's picture (never into the game's textures, so captures do not have it). fps: frames per
+ * second and milliseconds per frame; detailed: also the internal resolution, CPU and GPU load and temperature, video
+ * memory and RAM (perf_stats.c). A pipeline of our own draws coloured rectangles into the swapchain image (dynamic
+ * rendering, alpha blending): a translucent box, then the text, a 5x7 font whose lit runs of pixels are rectangles of `k`
+ * window pixels (2 at 1080p, 4 at 2160p), each over a soft shadow. The text changes twice a second. Counted: presents of
+ * game frames (g_vk_frames), not the loading screen's repeats. */
+int display_fps_overlay(void);                 /* display.c: 0 hidden, 1..6 the position (corners, top / bottom centre) */
+int display_perf_overlay(void);                /* display.c: 0 hidden, 1 fps, 2 detailed */
+#include "perf_stats.h"
+#define OVL_LINES 6
 static struct {
     VkPipeline pipe; VkPipelineLayout layout; VkFormat fmt; int failed;
     VkImage key[16]; VkImageView view[16];     /* a view of each swapchain image, made when first drawn into */
-    int64_t t0, f0; char text[24]; float fps;
+    int64_t t0, f0; char text[OVL_LINES][32]; int lines; float fps;
 } g_fps;
 static const uint8_t *fps_glyph(char ch) {
+    /* rows top to bottom, 5 bits each (bit 4 = left column) */
     static const uint8_t digits[10][7] = {
         {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F},
         {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
         {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E},
         {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}};
-    static const uint8_t F[7] = {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, P[7] = {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
-        S[7] = {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, m[7] = {0x00,0x00,0x1A,0x15,0x15,0x11,0x11},
-        s[7] = {0x00,0x00,0x0E,0x10,0x0E,0x01,0x1E}, dot[7] = {0,0,0,0,0,0x0C,0x0C}, blank[7] = {0};
+    static const uint8_t upper[26][7] = {
+        {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}, {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E},   /* A B C */
+        {0x1C,0x12,0x11,0x11,0x11,0x12,0x1C}, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}, {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10},   /* D E F */
+        {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F}, {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}, {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E},   /* G H I */
+        {0x07,0x02,0x02,0x02,0x02,0x12,0x0C}, {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, {0x10,0x10,0x10,0x10,0x10,0x10,0x1F},   /* J K L */
+        {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, {0x11,0x11,0x19,0x15,0x13,0x11,0x11}, {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E},   /* M N O */
+        {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}, {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}, {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},   /* P Q R */
+        {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}, {0x11,0x11,0x11,0x11,0x11,0x11,0x0E},   /* S T U */
+        {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}, {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}, {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11},   /* V W X */
+        {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}, {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}};                                        /* Y Z */
+    static const uint8_t m[7] = {0x00,0x00,0x1A,0x15,0x15,0x11,0x11}, s[7] = {0x00,0x00,0x0E,0x10,0x0E,0x01,0x1E},
+        x[7] = {0x00,0x00,0x11,0x0A,0x04,0x0A,0x11}, dot[7] = {0,0,0,0,0,0x0C,0x0C}, pct[7] = {0x18,0x19,0x02,0x04,0x08,0x13,0x03},
+        slash[7] = {0x01,0x01,0x02,0x04,0x08,0x10,0x10}, colon[7] = {0,0x0C,0x0C,0,0x0C,0x0C,0}, dash[7] = {0,0,0,0x1F,0,0,0},
+        deg[7] = {0x0C,0x12,0x12,0x0C,0,0,0}, blank[7] = {0};
     if (ch >= '0' && ch <= '9') return digits[ch - '0'];
-    return ch == 'F' ? F : ch == 'P' ? P : ch == 'S' ? S : ch == 'm' ? m : ch == 's' ? s : ch == '.' ? dot : blank;
+    if (ch >= 'A' && ch <= 'Z') return upper[ch - 'A'];
+    switch (ch) {
+    case 'm': return m; case 's': return s; case 'x': return x; case '.': return dot; case '%': return pct; case '/': return slash;
+    case ':': return colon; case '-': return dash; case '*': return deg;      /* '*' = the degree sign */
+    default: return blank;
+    }
 }
 static int fps_pipeline(void) {                   /* once, and again if the swapchain's format changes; 0 if it cannot be made */
     if (g_fps.pipe && g_fps.fmt == V.format.format) return 1;
@@ -3743,28 +3764,56 @@ static void fps_rect(int x, int y, int w, int h, const float rgba[4]) {       /*
     vkCmdPushConstants(R.cmd, g_fps.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
     vkCmdDraw(R.cmd, 6, 1, 0, 0);
 }
+static void ovl_value(char *out, size_t cap, const char *label, int v, const char *unit) {
+    if (v < 0) snprintf(out, cap, "%s --", label); else snprintf(out, cap, "%s %d%s", label, v, unit);
+}
+static void ovl_update(int level, double secs, int64_t frames) {
+    g_fps.lines = 1;
+    if (frames > 0) snprintf(g_fps.text[0], sizeof g_fps.text[0], "%d FPS %.1f ms", (int)(g_fps.fps + 0.5f), secs * 1000.0 / (double)frames);
+    else snprintf(g_fps.text[0], sizeof g_fps.text[0], "0 FPS");
+    if (level < 2) return;
+    PerfStats ps;
+    perf_stats_sample(&ps, V.props.deviceName);
+    float sc = rs_scale();
+    char a[24], b[24];
+    snprintf(g_fps.text[1], sizeof g_fps.text[1], "RES %dx%d", (int)(1600.0f * sc + 0.5f), (int)(900.0f * sc + 0.5f));
+    ovl_value(a, sizeof a, "CPU", ps.cpu_load, "%");
+    if (ps.cpu_temp >= 0) snprintf(g_fps.text[2], sizeof g_fps.text[2], "%s %d*C", a, ps.cpu_temp); else snprintf(g_fps.text[2], sizeof g_fps.text[2], "%s", a);
+    ovl_value(b, sizeof b, "GPU", ps.gpu_load, "%");
+    if (ps.gpu_temp >= 0) snprintf(g_fps.text[3], sizeof g_fps.text[3], "%s %d*C", b, ps.gpu_temp); else snprintf(g_fps.text[3], sizeof g_fps.text[3], "%s", b);
+    if (ps.vram_used_mb >= 0 && ps.vram_total_mb > 0) snprintf(g_fps.text[4], sizeof g_fps.text[4], "VRAM %.1f/%.1f GB", ps.vram_used_mb / 1024.0, ps.vram_total_mb / 1024.0);
+    else snprintf(g_fps.text[4], sizeof g_fps.text[4], "VRAM --");
+    if (ps.ram_used_mb >= 0 && ps.ram_total_mb > 0) snprintf(g_fps.text[5], sizeof g_fps.text[5], "RAM %.1f/%.1f GB", ps.ram_used_mb / 1024.0, ps.ram_total_mb / 1024.0);
+    else snprintf(g_fps.text[5], sizeof g_fps.text[5], "RAM --");
+    g_fps.lines = 6;
+}
 static void fps_overlay_draw(uint32_t index) {
-    int pos = display_fps_overlay();
+    int pos = display_fps_overlay(), level = display_perf_overlay();
     int64_t now = tk();
     static int64_t hz;
+    static int last_level;
     if (!hz) { plat_counter f; plat_qpf(&f); hz = f.QuadPart; }
-    if (!g_fps.t0) { g_fps.t0 = now; g_fps.f0 = g_vk_frames; snprintf(g_fps.text, sizeof g_fps.text, "-- FPS"); }
-    if (now - g_fps.t0 >= hz / 2) {                      /* twice a second */
+    if (!g_fps.t0) { g_fps.t0 = now; g_fps.f0 = g_vk_frames; snprintf(g_fps.text[0], sizeof g_fps.text[0], "-- FPS"); g_fps.lines = 1; }
+    if (now - g_fps.t0 >= hz / 2 || level != last_level) {   /* twice a second, and at once when the level changes */
         int64_t frames = g_vk_frames - g_fps.f0;
         double secs = (double)(now - g_fps.t0) / (double)hz;
-        g_fps.fps = (float)(frames / secs);
-        if (frames > 0) snprintf(g_fps.text, sizeof g_fps.text, "%d FPS %.1f ms", (int)(g_fps.fps + 0.5f), secs * 1000.0 / (double)frames);
-        else snprintf(g_fps.text, sizeof g_fps.text, "0 FPS");
-        g_fps.t0 = now; g_fps.f0 = g_vk_frames;
+        if (secs > 0.05) {
+            g_fps.fps = (float)(frames / secs);
+            ovl_update(level, secs, frames);
+            g_fps.t0 = now; g_fps.f0 = g_vk_frames;
+        } else if (level < 2) g_fps.lines = 1;
+        last_level = level;
     }
-    if (!pos || !fps_pipeline()) return;
+    if (!pos || !level || !fps_pipeline()) return;
     VkImageView view = fps_view(index);
     if (!view) return;
     int W = (int)V.extent.width, H = (int)V.extent.height, k = H / 540 > 1 ? H / 540 : 1;      /* 2 at 1080p, 4 at 2160p */
-    int n = (int)strlen(g_fps.text), pad = 2 * k, bw = (n * 6 - 1) * k + 2 * pad, bh = 7 * k + 2 * pad, m = H / 80, x0, y0;
+    int lines = level >= 2 ? g_fps.lines : 1, n = 0, line_h = 10 * k;
+    for (int l = 0; l < lines; l++) { int len = (int)strlen(g_fps.text[l]); if (len > n) n = len; }
+    int pad = 2 * k, bw = (n * 6 - 1) * k + 2 * pad, bh = (lines - 1) * line_h + 7 * k + 2 * pad, m = H / 80, x0, y0;
     if (bw + 2 * m > W || bh + 2 * m > H) return;
-    x0 = pos == 2 || pos == 4 ? W - m - bw : m;
-    y0 = pos == 3 || pos == 4 ? H - m - bh : m;
+    x0 = pos == 5 || pos == 6 ? (W - bw) / 2 : pos == 2 || pos == 4 ? W - m - bw : m;      /* 5, 6: top / bottom centre */
+    y0 = pos == 3 || pos == 4 || pos == 6 ? H - m - bh : m;
     static const float box[4] = {0.0f, 0.0f, 0.0f, 0.40f}, shadow[4] = {0.0f, 0.0f, 0.0f, 0.55f}, white[4] = {0.94f, 0.94f, 0.94f, 1.0f};
     float num[4] = {0.35f, 0.86f, 0.43f, 1.0f};           /* green at 55 and above, yellow from 40, red below */
     if (g_fps.fps < 40.0f && g_fps.fps > 0.0f) { num[0] = 0.94f; num[1] = 0.31f; num[2] = 0.27f; }
@@ -3783,24 +3832,68 @@ static void fps_overlay_draw(uint32_t index) {
     vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fps.pipe);
     fps_rect(x0, y0, bw, bh, box);
     for (int layer = 0; layer < 2; layer++) {             /* the shadow (one text pixel down and right), then the text */
-        int number = 1, off = layer ? 0 : (k + 1) / 2;
-        for (int i = 0; i < n; i++) {
-            if (g_fps.text[i] == ' ') number = 0;           /* the frame rate in its colour, the rest white */
-            const uint8_t *g = fps_glyph(g_fps.text[i]);
-            const float *col = layer == 0 ? shadow : number ? num : white;
-            int gx = x0 + pad + i * 6 * k;
-            for (int r = 0; r < 7; r++)
-                for (int b = 0; b < 5; b++) {
-                    if (!(g[r] >> (4 - b) & 1)) continue;
-                    int e = b;
-                    while (e + 1 < 5 && (g[r] >> (4 - (e + 1)) & 1)) e++;      /* a run of lit pixels: one rectangle */
-                    fps_rect(gx + b * k + off, y0 + pad + r * k + off, (e - b + 1) * k, k, col);
-                    b = e;
-                }
+        int off = layer ? 0 : (k + 1) / 2;
+        for (int l = 0; l < lines; l++) {
+            const char *t = g_fps.text[l];
+            int len = (int)strlen(t), number = l == 0;    /* the frame rate in its colour, the rest white */
+            for (int i = 0; i < len; i++) {
+                if (t[i] == ' ') number = 0;
+                const uint8_t *g = fps_glyph(t[i]);
+                const float *col = layer == 0 ? shadow : number ? num : white;
+                int gx = x0 + pad + i * 6 * k, gy = y0 + pad + l * line_h;
+                for (int r = 0; r < 7; r++)
+                    for (int bb = 0; bb < 5; bb++) {
+                        if (!(g[r] >> (4 - bb) & 1)) continue;
+                        int e = bb;
+                        while (e + 1 < 5 && (g[r] >> (4 - (e + 1)) & 1)) e++;      /* a run of lit pixels: one rectangle */
+                        fps_rect(gx + bb * k + off, gy + r * k + off, (e - bb + 1) * k, k, col);
+                        bb = e;
+                    }
+            }
         }
     }
     vkCmdEndRendering(R.cmd);
     image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+}
+/* TEST AID, SMO_WINDOW_SHOT=<frame>[,<frame>...] (with SMO_SHOT_DIR): the window's picture of that frame as it is
+ * presented, the performance overlay included (SMO_SHOT pictures are the game's window texture, without it), saved as
+ * window_<frame>.png. The swapchain is made with TRANSFER_SRC while the variable is set (nvn_vk.c). */
+static struct { VkBuffer buf; VMem mem; int w, h; long long frame; } g_wshot;
+static int window_shot_record(uint32_t index) {
+    static int parsed; static long long want[16]; static int nwant;
+    if (!parsed) { parsed = 1; const char *e = getenv("SMO_WINDOW_SHOT"); while (e && *e && nwant < 16) { want[nwant++] = atoll(e); e = strchr(e, ','); if (e) e++; } }
+    long long f = nvn_front_frame_next();
+    int hit = 0;
+    for (int i = 0; i < nwant; i++) if (want[i] == f) hit = 1;
+    if (!hit || g_wshot.buf) return 0;
+    g_wshot.w = (int)V.extent.width; g_wshot.h = (int)V.extent.height; g_wshot.frame = f;
+    g_wshot.buf = vbuf_new((uint64_t)g_wshot.w * g_wshot.h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_wshot.mem);
+    image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy c;
+    memset(&c, 0, sizeof c);
+    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; c.imageSubresource.layerCount = 1;
+    c.imageExtent.width = (uint32_t)g_wshot.w; c.imageExtent.height = (uint32_t)g_wshot.h; c.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_wshot.buf, 1, &c);
+    image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    return 1;
+}
+int tex_write_png(const char *path, const uint8_t *rgba, int w, int h);
+static void window_shot_save(void) {
+    cmd_wait_all();
+    size_t n = (size_t)g_wshot.w * g_wshot.h;
+    uint8_t *px = malloc(n * 4);
+    if (px) {
+        const uint8_t *s = g_wshot.mem.map;
+        int bgr = V.format.format == VK_FORMAT_B8G8R8A8_UNORM || V.format.format == VK_FORMAT_B8G8R8A8_SRGB;
+        for (size_t i = 0; i < n; i++) { px[i * 4] = s[i * 4 + (bgr ? 2 : 0)]; px[i * 4 + 1] = s[i * 4 + 1]; px[i * 4 + 2] = s[i * 4 + (bgr ? 0 : 2)]; px[i * 4 + 3] = 255; }
+        char path[400];
+        const char *dir = getenv("SMO_SHOT_DIR");
+        snprintf(path, sizeof path, "%s%swindow_%lld.png", dir ? dir : "", dir ? "/" : "", g_wshot.frame);
+        if (tex_write_png(path, px, g_wshot.w, g_wshot.h) == 0) printf("nvn_vk: the window's picture of frame %lld saved: %s\n", g_wshot.frame, path);
+        free(px);
+    }
+    vkDestroyBuffer(V.device, g_wshot.buf, NULL); vmem_free(g_wshot.mem);
+    g_wshot.buf = NULL;
 }
 /* the console's Capture button (F12 in the game window; a pad's share / capture button: display.c and
  * nnpad_sdl.c call smo_capture_request). The frame being presented is read back like a SMO_SHOT picture, made 8-bit
@@ -4091,6 +4184,10 @@ swap: ;
      * path blits with FRAMEBUFFER_SRGB off). */
     VkFormat want = vt && (vt->fmt == VK_FORMAT_R8G8B8A8_SRGB || vt->fmt == VK_FORMAT_B8G8R8A8_SRGB) ? VK_FORMAT_B8G8R8A8_SRGB : VK_FORMAT_B8G8R8A8_UNORM;
     if (want != V.format.format) { cmd_wait_all(); swapchain_destroy(); V.format.format = want; printf("nvn_vk: swapchain format %d (the window texture's colour class)\n", (int)want); }
+    {   /* another vsync from the settings menu: the swapchain is made again with the present mode it maps to */
+        int32_t vs = plat_xchg(&g_vsync_req, -1);
+        if (vs >= 0) { int m = present_mode_for(vs, 1); if (m != (int)V.mode) { cmd_wait_all(); swapchain_destroy(); V.mode = m; } printf("nvn_vk: present mode %s (settings menu)\n", k_mode[V.mode]); }
+    }
     uint32_t index = 0;
     VkResult r = VK_SUCCESS;
     /* one pair of semaphores per present, 8 in turn: a semaphore handed to vkAcquireNextImageKHR must not still be waited
@@ -4145,8 +4242,10 @@ swap: ;
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         overlay_draw(index);
         if (!g_menu.on) fps_overlay_draw(index);
+        int shot = window_shot_record(index);
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         cmd_submit(acq, rend);
+        if (shot) window_shot_save();
         VkPresentInfoKHR pr = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pr.waitSemaphoreCount = 1; pr.pWaitSemaphores = &rend; pr.swapchainCount = 1; pr.pSwapchains = &V.swapchain; pr.pImageIndices = &index;
         g_wd_where = 4;

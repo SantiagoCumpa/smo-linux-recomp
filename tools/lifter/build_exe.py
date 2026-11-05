@@ -43,11 +43,11 @@ HOST_SOURCES = {
     'os': ['os_threads.c', 'nnsdk.c', 'nntime.c', 'nnmisc.c', 'smo_nn.c'],
     'fs': ['nnfs.c', 'nnfsdir.c'],
     'gfx': ['nvn_stub.c', 'nvn_gl.c', 'nvn_vk.c', 'nvn_misc.c', 'nvn_handles.c', 'nvn_layout.c', 'mx_translate.c',
-            'tex_decode.c', 'display.c', 'gfx_options.c', 'vk_shaderc_shim.c', 'gl_absent.c'],
+            'tex_decode.c', 'display.c', 'gfx_options.c', 'vk_shaderc_shim.c', 'gl_absent.c', 'perf_stats.c'],
     'audio': ['nnaudio.c', 'smo_audio.c'],
     'input': ['nnhid.c', 'nnpad_sdl.c'],
     'services': ['nnservices.c', 'nnapplet.c', 'nnalbum.c', 'nnnet.c', 'nnpl.c', 'nnfontll.c', 'nnmovie.c', 'nnmovie_ff.c'],
-    'game': ['smo_nerve.c', 'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c'],
+    'game': ['smo_nerve.c', 'smo_fast.c', 'smo_selftest.c', 'smo_ui.c', 'smo_amiibo.c', 'smo_guide.c', 'smo_settings.c'],
 }
 INCLUDED = [T.runtime('gfx', n) for n in ('nvn_vk_draw.c', 'nvn_vk_pipelines.c', 'nvn_vk_watchdog.c')]
 GEN_SOURCES = ['sdkdata.c', 'sdklift_gen.c']

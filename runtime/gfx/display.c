@@ -102,17 +102,51 @@ static void window_fullscreen(int on) {
     fflush(stdout);
 }
 
-/* The frame counter over the picture (nvn_vk_draw.c fps_overlay_draw): its corner, 0 = hidden. graphics.ini fps_overlay
- * gives the start; F10 hides it, or shows it in that corner (bottom left when the file says off). */
-static volatile int32_t g_fps_pos = -1;
-int display_fps_overlay(void) {
-    if (g_fps_pos < 0) plat_xchg(&g_fps_pos, gfx_options()->fps_overlay);
-    return g_fps_pos;
+/* The performance overlay over the picture (nvn_vk_draw.c fps_overlay_draw): its level (0 hidden, 1 fps, 2 detailed) and
+ * position (1..6: the four corners, top / bottom centre). graphics.ini performance_overlay / overlay_corner give the start; the settings menu changes them; F10
+ * hides it, or shows it again at the last level shown (fps when it was never shown). */
+static volatile int32_t g_perf_level = -1, g_perf_corner = -1, g_perf_last = 1;
+int display_perf_overlay(void) {
+    if (g_perf_level < 0) { plat_xchg(&g_perf_level, gfx_options()->perf_overlay); if (gfx_options()->perf_overlay) plat_xchg(&g_perf_last, gfx_options()->perf_overlay); }
+    return g_perf_level;
+}
+int display_fps_overlay(void) {                       /* the corner of the overlay, 0 = hidden */
+    if (g_perf_corner < 0) plat_xchg(&g_perf_corner, gfx_options()->overlay_corner ? gfx_options()->overlay_corner : 1);
+    return display_perf_overlay() ? g_perf_corner : 0;
+}
+void display_set_perf_overlay(int level, int corner) {
+    plat_xchg(&g_perf_level, level);
+    if (level) plat_xchg(&g_perf_last, level);
+    if (corner >= 1 && corner <= 6) plat_xchg(&g_perf_corner, corner);
 }
 static void fps_overlay_toggle(void) {
-    int on = display_fps_overlay() != 0, pos = gfx_options()->fps_overlay ? gfx_options()->fps_overlay : 3;
-    plat_xchg(&g_fps_pos, on ? 0 : pos);
-    printf("display: frame counter %s (F10)\n", on ? "hidden" : "shown");
+    int on = display_perf_overlay() != 0;
+    plat_xchg(&g_perf_level, on ? 0 : g_perf_last);
+    printf("display: performance overlay %s (F10)\n", on ? "hidden" : g_perf_last == 2 ? "shown (detailed)" : "shown (fps)");
+    fflush(stdout);
+}
+
+/* The window mode the settings menu asks for (smo_settings.c, the game's main thread): applied by the event loop.
+ * mode as gfx_options window_mode: 0 windowed, 1 borderless fullscreen, 2 fullscreen on top, 3 borderless window. */
+static volatile int32_t g_req_window, g_req_mode, g_req_w, g_req_h;
+void display_set_window(int mode, int w, int h) {
+    plat_xchg(&g_req_mode, mode); plat_xchg(&g_req_w, w); plat_xchg(&g_req_h, h);
+    plat_xchg(&g_req_window, 1);
+}
+static void window_apply(void) {
+    int mode = g_req_mode, w = g_req_w, h = g_req_h, full = mode == 1 || mode == 2;
+    if (!g_win) return;
+    SDL_SetWindowAlwaysOnTop(g_win, mode == 2);
+    if (full) { window_fullscreen(1); }
+    else {
+        window_fullscreen(0);
+        SDL_SetWindowBordered(g_win, mode == 0);
+        if (w >= 320 && h >= 180) SDL_SetWindowSize(g_win, w, h);
+        SDL_SetWindowPosition(g_win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+    }
+    printf("display: window mode %s%s (settings menu)\n", mode == 2 ? "fullscreen (on top)" : mode == 1 ? "borderless fullscreen" : mode == 3 ? "borderless window" : "windowed",
+           full ? "" : "");
+    if (!full) printf("display: window size %dx%d asked for\n", w, h);
     fflush(stdout);
 }
 
@@ -208,9 +242,11 @@ static void window_event(const SDL_Event *e) {
         if (e->key.scancode == SDL_SCANCODE_F11) { window_fullscreen(!g_win_full); break; }
         if (e->key.scancode == SDL_SCANCODE_F10) { fps_overlay_toggle(); break; }
         if (e->key.scancode == SDL_SCANCODE_F12) { void smo_capture_request(void); smo_capture_request(); break; }   /* F12 = the console's Capture button */
-        {   /* the amiibo menu's key (controllers.ini [hotkeys], F1 by default) */
-            int nnpad_hotkey_vk(int which); void amiibo_menu_request(void);
-            int vk = nnpad_hotkey_vk(0);
+        {   /* the menus' keys (controllers.ini [hotkeys]): the settings menu (F1 by default) and the amiibo menu (F2) */
+            int nnpad_hotkey_vk(int which); void amiibo_menu_request(void); void settings_menu_request(void);
+            int vk = nnpad_hotkey_vk(1);
+            if (vk && vk_to_scancode(vk) == (int)e->key.scancode) { settings_menu_request(); break; }
+            vk = nnpad_hotkey_vk(0);
             if (vk && vk_to_scancode(vk) == (int)e->key.scancode) amiibo_menu_request();
         }
         break;
@@ -224,20 +260,18 @@ static void display_pump(uint32_t wait_ms) {
         while (SDL_PollEvent(&e)) window_event(&e);
     }
     if (plat_xchg(&g_req_full_toggle, 0)) window_fullscreen(!g_win_full);
+    if (plat_xchg(&g_req_window, 0)) window_apply();
     if (plat_xchg(&g_req_title, 0)) { char t[192]; plat_lock(&g_title_lock); snprintf(t, sizeof t, "%s", g_title_req); plat_unlock(&g_title_lock); SDL_SetWindowTitle(g_win, t); }
     {   int32_t m = plat_xchg(&g_req_minimise, 0);
         if (m == 1) SDL_MinimizeWindow(g_win); else if (m == 2) SDL_RestoreWindow(g_win); }
-    {   /* The screen saver is held off while a source asks (the game's ending) and, with screen_saver =
-         * off_while_playing, while the window is shown, active and not minimised: a pad is not activity the desktop
-         * sees. On Wayland SDL holds an idle inhibitor on the window's surface (D-Bus ScreenSaver as the fallback). */
+    {   /* The screen saver (dimming, locking, sleep) is held off the whole time the game runs: a pad is not activity the
+         * desktop sees. On Wayland SDL holds an idle inhibitor on the window's surface (D-Bus ScreenSaver as the fallback).
+         * Done here rather than once, in case something lets it go (g_keep_awake: the sources that asked, kept for the log). */
         static int awake;
-        int32_t ff = g_focus_flags;
-        int playing = gfx_options()->keep_awake_playing && (ff & 1) && (ff & 4) && !(ff & 2);
-        int want = g_keep_awake != 0 || playing;
-        if (want != awake) {
-            if (want) SDL_DisableScreenSaver(); else SDL_EnableScreenSaver();
-            awake = want;
-            printf("display: screen saver %s\n", want ? (playing ? "held off (playing)" : "held off (the game asks)") : "allowed again");
+        if (!awake) {
+            SDL_DisableScreenSaver();
+            awake = 1;
+            printf("display: screen saver held off while the game runs\n");
             fflush(stdout);
         } }
 }

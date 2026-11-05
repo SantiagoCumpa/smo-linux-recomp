@@ -35,7 +35,6 @@
 
 void nfp_place_amiibo(const uint8_t *id);                 /* nnapplet.c */
 long nfp_amiibo_reads(void);
-const char *oe_language(void);                           /* nnmisc.c: the game's language, "en-US" ... */
 int nerve_watch_set(const char *a, const char *b);       /* smo_nerve.c */
 long long nerve_watch_last(void);
 long long nvn_front_frame_next(void);                    /* nvn_gl.c */
@@ -74,44 +73,12 @@ static volatile int32_t g_request;
 #define LIST_Y (-19.0f)
 #define ITEM_X 4.0f
 
-/* ---------------------------------------------------------------- the game's files */
-static const char *lang_folder(void) {
-    static const struct { const char *code, *dir; } map[] = {
-        {"ja", "JPja"}, {"en-US", "USen"}, {"en-GB", "EUen"}, {"fr", "EUfr"}, {"fr-CA", "USfr"}, {"de", "EUde"}, {"it", "EUit"},
-        {"es", "EUes"}, {"es-419", "USes"}, {"zh-Hans", "CNzh"}, {"zh-Hant", "TWzh"}, {"nl", "EUnl"}, {"ru", "EUru"}};
-    const char *code = oe_language();
-    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) if (code && !strcmp(code, map[i].code)) return map[i].dir;
-    return "USen";
-}
-static uint8_t *lang_arc(const char *sub, size_t *n) {     /* LocalizedData/<lang>/<sub>, the US English one if missing */
-    char p[160];
-    snprintf(p, sizeof p, "LocalizedData/%s/%s", lang_folder(), sub);
-    uint8_t *b = ui_arc(p, n);
-    if (!b) { snprintf(p, sizeof p, "LocalizedData/USen/%s", sub); b = ui_arc(p, n); }
-    return b;
-}
-static int layout_tex(const char *layout, const char *name, UiImage *out) {
-    char p[96];
-    size_t n = 0, ln = 0, bn = 0;
-    snprintf(p, sizeof p, "LayoutData/%s.szs", layout);
-    uint8_t *arc = ui_arc(p, &n);
-    const uint8_t *ly = arc ? ui_sarc(arc, n, "layout.lyarc", &ln) : NULL, *bntx = ly ? ui_sarc(ly, ln, "timg/__Combined.bntx", &bn) : NULL;
-    int ok = bntx && ui_bntx(bntx, bn, name, out);
-    if (!ok) printf("amiibo menu: texture %s of %s not found\n", name, p);
-    free(arc);
-    return ok;
-}
-static UiFont *font_of(const uint8_t *fonts, size_t n, const char *name) {
-    size_t m = 0;
-    const uint8_t *b = ui_sarc(fonts, n, name, &m);
-    UiFont *f = b ? ui_font(b, m) : NULL;
-    if (!f) printf("amiibo menu: font %s not usable\n", name);
-    return f;
-}
-static int has_glyphs(const UiFont *f, const uint16_t *s) {    /* every character of s drawn by f (measured one by one) */
-    for (; *s; s++) { uint16_t one[2] = {*s, 0}; if (*s != ' ' && ui_text(NULL, ui_xf_move(0, 0), f, NULL, one, 1, 0, 0, 1, 0) <= 0) return 0; }
-    return 1;
-}
+/* ---------------------------------------------------------------- the game's files (smo_ui.c) */
+#define lang_folder ui_lang_folder
+#define lang_arc ui_lang_arc
+#define layout_tex ui_layout_tex
+#define font_of ui_font_in
+#define has_glyphs ui_has_glyphs
 static void u16cpy(uint16_t *d, const uint16_t *s, int cap) { int i = 0; for (; s && s[i] && i < cap - 1; i++) d[i] = s[i]; d[i] = 0; }
 static void u16cat(uint16_t *d, const uint16_t *s, int cap) { int i = 0; while (d[i]) i++; u16cpy(d + i, s, cap - i); }
 static void u16cat_a(uint16_t *d, const char *s, int cap) { int i = 0; while (d[i]) i++; for (; *s && i < cap - 1; s++) d[i++] = (uint8_t)*s; d[i] = 0; }
@@ -183,79 +150,10 @@ static int menu_load(void) {
     return M.ok;
 }
 
-/* ---------------------------------------------------------------- the picture */
-/* The game's frame, blurred as the pause menu shows it: box-averaged down 4 times, three passes of a 7-tap box blur each way
- * (about a Gaussian of 14 pixels at 1600 x 900), stretched back with bilinear filtering. */
-#define BG_DOWN 4
-static void menu_background(const uint8_t *src, int w, int h) {
-    int sw = (w + BG_DOWN - 1) / BG_DOWN, sh = (h + BG_DOWN - 1) / BG_DOWN;
-    float *s = calloc((size_t)sw * sh * 3, sizeof *s), *t = calloc((size_t)sw * sh * 3, sizeof *t);
-    ui_image_free(&M.bg);
-    M.bg.w = w; M.bg.h = h; M.bg.ch = 4; M.bg.px = malloc((size_t)w * h * 4);
-    if (!s || !t || !M.bg.px) { free(s); free(t); return; }
-    for (int y = 0; y < sh; y++) for (int x = 0; x < sw; x++) {
-        float acc[3] = {0, 0, 0}; int k = 0;
-        for (int dy = 0; dy < BG_DOWN && y * BG_DOWN + dy < h; dy++) for (int dx = 0; dx < BG_DOWN && x * BG_DOWN + dx < w; dx++, k++) {
-            const uint8_t *p = src + ((size_t)(y * BG_DOWN + dy) * w + x * BG_DOWN + dx) * 4;
-            acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2];
-        }
-        for (int c = 0; c < 3; c++) s[((size_t)y * sw + x) * 3 + c] = k ? acc[c] / (float)k : 0;
-    }
-    for (int pass = 0; pass < 6; pass++) {
-        int horiz = !(pass & 1);
-        for (int y = 0; y < sh; y++) for (int x = 0; x < sw; x++) for (int c = 0; c < 3; c++) {
-            float acc = 0;
-            for (int d = -3; d <= 3; d++) {
-                int xx = horiz ? x + d : x, yy = horiz ? y : y + d;
-                if (xx < 0) xx = 0; if (yy < 0) yy = 0; if (xx >= sw) xx = sw - 1; if (yy >= sh) yy = sh - 1;
-                acc += s[((size_t)yy * sw + xx) * 3 + c];
-            }
-            t[((size_t)y * sw + x) * 3 + c] = acc / 7.0f;
-        }
-        float *u = s; s = t; t = u;
-    }
-    for (int y = 0; y < h; y++) {
-        float fy = ((float)y + 0.5f) / (float)BG_DOWN - 0.5f;
-        int y0 = (int)floorf(fy); float ay = fy - (float)y0;
-        int y1 = y0 + 1; if (y0 < 0) y0 = 0; if (y1 < 0) y1 = 0; if (y0 >= sh) y0 = sh - 1; if (y1 >= sh) y1 = sh - 1;
-        for (int x = 0; x < w; x++) {
-            float fx = ((float)x + 0.5f) / (float)BG_DOWN - 0.5f;
-            int x0 = (int)floorf(fx); float ax = fx - (float)x0;
-            int x1 = x0 + 1; if (x0 < 0) x0 = 0; if (x1 < 0) x1 = 0; if (x0 >= sw) x0 = sw - 1; if (x1 >= sw) x1 = sw - 1;
-            uint8_t *q = M.bg.px + ((size_t)y * w + x) * 4;
-            for (int c = 0; c < 3; c++) {
-                float v = (s[((size_t)y0 * sw + x0) * 3 + c] * (1 - ax) + s[((size_t)y0 * sw + x1) * 3 + c] * ax) * (1 - ay) +
-                          (s[((size_t)y1 * sw + x0) * 3 + c] * (1 - ax) + s[((size_t)y1 * sw + x1) * 3 + c] * ax) * ay;
-                q[c] = (uint8_t)(v * 0.92f + 0.5f);            /* a little darker, as the pause menu's own picture */
-            }
-            q[3] = 255;
-        }
-    }
-    free(s); free(t);
-}
-
-/* A window of the layout: the corner texture (its top left corner) at the four corners, mirrored, the edges stretched from
- * its last row / column, the inside filled. */
-static void window(UiImage *dst, UiXf xf, float x0, float y0, float x1, float y1, const UiImage *corner, float c, uint32_t rgba) {
-    float tw = (float)corner->w, th = (float)corner->h;
-    enum { L = UI_EDGE_LEFT, R = UI_EDGE_RIGHT, B = UI_EDGE_BOTTOM, T = UI_EDGE_TOP };
-    ui_draw_edges(dst, xf, x0, y1 - c, x0 + c, y1, corner, 0, 0, tw, th, rgba, L | T);                 /* top left */
-    ui_draw_edges(dst, xf, x1 - c, y1 - c, x1, y1, corner, tw, 0, 0, th, rgba, R | T);                 /* top right: mirrored */
-    ui_draw_edges(dst, xf, x0, y0, x0 + c, y0 + c, corner, 0, th, tw, 0, rgba, L | B);                 /* bottom left: flipped */
-    ui_draw_edges(dst, xf, x1 - c, y0, x1, y0 + c, corner, tw, th, 0, 0, rgba, R | B);                 /* bottom right */
-    ui_draw_edges(dst, xf, x0 + c, y1 - c, x1 - c, y1, corner, tw - 0.5f, 0, tw - 0.5f, th, rgba, T);   /* top edge */
-    ui_draw_edges(dst, xf, x0 + c, y0, x1 - c, y0 + c, corner, tw - 0.5f, th, tw - 0.5f, 0, rgba, B);   /* bottom edge */
-    ui_draw_edges(dst, xf, x0, y0 + c, x0 + c, y1 - c, corner, 0, th - 0.5f, tw, th - 0.5f, rgba, L);   /* left edge */
-    ui_draw_edges(dst, xf, x1 - c, y0 + c, x1, y1 - c, corner, tw, th - 0.5f, 0, th - 0.5f, rgba, R);   /* right edge */
-    ui_draw_edges(dst, xf, x0 + c, y0 + c, x1 - c, y1 - c, NULL, 0, 0, 0, 0, rgba, 0);                  /* inside */
-}
-
-/* text with the soft shadow of the pause menu's white captions */
-static void shadow_text(UiImage *dst, UiXf xf, const UiFont *f, const UiFont *icons, const uint16_t *s, float x, float y, float scale, uint32_t rgba) {
-    static const float off[5][2] = {{1.5f, -2.0f}, {0.8f, -1.5f}, {2.2f, -2.5f}, {1.5f, -1.2f}, {1.5f, -2.8f}};
-    for (int k = 0; k < 5; k++) ui_text(dst, xf, f, icons, s, -1, x + off[k][0], y + off[k][1], scale, 0x0000001e);
-    ui_text(dst, xf, f, icons, s, -1, x, y, scale, rgba);
-}
+/* ---------------------------------------------------------------- the picture (blur, windows, captions: smo_ui.c) */
+static void menu_background(const uint8_t *src, int w, int h) { ui_backdrop(src, w, h, &M.bg, w, h); }
+#define window ui_window
+#define shadow_text ui_shadow_text
 
 static void menu_draw(void) {
     UiImage *d = &M.frame;

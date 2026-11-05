@@ -192,7 +192,8 @@ static uint32_t oe_watch(void * pause) {
         int ours = !testing && (flags & 1);
         if (ours) g_oe_was_foreground = 1;
         int minimised = (flags & 2) != 0;
-        int runnable = !pause || !g_oe_was_foreground || ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
+        int pausing = pause || gfx_options()->pause_unfocused;      /* the settings menu may switch it while playing */
+        int runnable = !pausing || !g_oe_was_foreground || ours || g_oe_exit_requested || (minimised ? g_oe_focus_mode == 1 : g_oe_focus_mode != 3);
         if (!runnable && !g_guest_frozen) {
             if (g_oe_resume_notify) oe_push(OE_MSG_RESUME);
             frozen_at = plat_ms(); polls_at = g_oe_poll_count;
@@ -214,9 +215,10 @@ static void oe_track_focus(void) {
     static volatile int32_t watcher;
     uint64_t now = plat_ms();
     if (enabled < 0) { const char *e = getenv("SMO_FOCUS_NOTIFY"); enabled = !(e && e[0] == '0'); }
-    if (enabled && plat_cas(&watcher, 1, 0) == 0) {     /* the watcher: only to pause the game, or for the test */
+    if (enabled && plat_cas(&watcher, 1, 0) == 0) {     /* the watcher: pauses the game while unfocused = pause (the settings menu
+                                                         * may switch it on later, so it always runs; 20 ms polls), and the test */
         int pause = gfx_options()->pause_unfocused;
-        if (pause || getenv("SMO_FOCUS_TEST")) plat_thread_detach(plat_thread_start(oe_watch, (void *)(intptr_t)pause, 0));
+        plat_thread_detach(plat_thread_start(oe_watch, (void *)(intptr_t)pause, 0));
     }
     if (!enabled || (now - last < 30 && !g_oe_focus_recheck)) return;
     last = now;
@@ -319,6 +321,7 @@ static uint64_t desired_language(void) {
     char name[128] = "", pick[16] = "en-US";
     const char *env = getenv("SMO_LANGUAGE");
     if (env && env[0]) snprintf(name, sizeof name, "%s", env);
+    else if (gfx_options()->language[0]) snprintf(name, sizeof name, "%s", gfx_options()->language);    /* graphics.ini language */
     else {
         /* the language of messages: LANGUAGE (its first entry), LC_ALL, LC_MESSAGES, LANG; "es_PE.UTF-8" -> "es-PE" */
         const char *vars[] = {"LANGUAGE", "LC_ALL", "LC_MESSAGES", "LANG"};
