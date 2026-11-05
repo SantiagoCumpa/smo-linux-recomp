@@ -95,6 +95,11 @@ static const char *const k_default_ini =
 "; overlay_corner = top_left | top_right | bottom_left | bottom_right | top_center | bottom_center\n"
 "overlay_corner = top_left\n"
 "\n"
+"; aspect = keep | stretch\n"
+";   keep: the game's 16:9 picture keeps its shape in a window or on a monitor of another shape (an ultrawide one, a\n"
+";   16:10 one): black bars fill the rest. stretch: the picture fills the whole window, stretched.\n"
+"aspect = keep\n"
+"\n"
 "; language = system | ja | en-US | en-GB | fr | fr-CA | de | it | es | es-419 | zh-Hans | zh-Hant | ko | nl | ru\n"
 ";   The game's language (read when the game starts). system: the desktop's (LANG). SMO_LANGUAGE in the environment\n"
 ";   or in the game folder's smo.env wins; the settings menu (F1) changes both.\n"
@@ -172,6 +177,7 @@ static void opt_load(void) {
             if (!found) unknown++;
         }
         else if (!strcasecmp(key, "screen_saver")) { }    /* older files: the screen now always stays on while the game runs */
+        else if (!strcasecmp(key, "aspect")) o->stretch = !strcasecmp(val, "stretch");
         else if (!strcasecmp(key, "performance_overlay")) {
             o->perf_overlay = !strcasecmp(val, "fps") ? 1 : !strcasecmp(val, "detailed") ? 2 : 0;
             if (strcasecmp(val, "off") && !o->perf_overlay) unknown++;

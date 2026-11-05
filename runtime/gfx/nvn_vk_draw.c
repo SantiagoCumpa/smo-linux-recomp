@@ -3598,13 +3598,39 @@ static int g_isem;
 static struct { VkImage img; VMem mem; int made, on; float frac; int thick; void *bar_arg; } g_ovl = {.on = -1};
 /* the amiibo menu's picture (vk_menu): an image of its own, blitted over the whole swapchain image */
 static struct { VkImage img; VMem mem; VkBuffer buf; VMem bmem; VkFormat fmt; int w, h, on; } g_menu;
+/* Where a picture of sw x sh goes in the window: the largest rectangle of its shape, centred (black bars around it on a
+ * window of another shape: an ultrawide or 16:10 monitor, a resized window); the whole window with aspect = stretch.
+ * out: x0, y0, x1, y1. Returns 1 when it leaves part of the window uncovered (the bars must be cleared). */
+static int fit_rect(int sw, int sh, int32_t out[4]) {
+    int64_t ew = (int64_t)V.extent.width, eh = (int64_t)V.extent.height;
+    out[0] = 0; out[1] = 0; out[2] = (int32_t)ew; out[3] = (int32_t)eh;
+    if (gfx_options()->stretch || sw <= 0 || sh <= 0 || ew <= 0 || eh <= 0) return 0;
+    if (ew * sh > eh * sw) {                       /* wider than the picture: bars left and right */
+        int64_t w = (eh * sw + sh / 2) / sh;
+        if (ew - w < 2) return 0;
+        out[0] = (int32_t)((ew - w) / 2); out[2] = out[0] + (int32_t)w;
+    } else {                                       /* taller: bars above and below */
+        int64_t h = (ew * sh + sw / 2) / sw;
+        if (eh - h < 2) return 0;
+        out[1] = (int32_t)((eh - h) / 2); out[3] = out[1] + (int32_t)h;
+    }
+    return 1;
+}
+static void clear_bars(uint32_t index) {           /* the swapchain image black, before a picture is blitted into its rectangle */
+    VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f;
+    VkImageSubresourceRange sr; memset(&sr, 0, sizeof sr); sr.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; sr.levelCount = 1; sr.layerCount = 1;
+    vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr);
+    image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+}
 static void overlay_draw(uint32_t index) {
     if (g_menu.on && g_menu.img) {
         VkImageBlit b;
         memset(&b, 0, sizeof b);
         b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
         b.srcOffsets[1].x = g_menu.w; b.srcOffsets[1].y = g_menu.h; b.srcOffsets[1].z = 1;
-        b.dstOffsets[1].x = (int32_t)V.extent.width; b.dstOffsets[1].y = (int32_t)V.extent.height; b.dstOffsets[1].z = 1;
+        int32_t r[4];
+        if (fit_rect(g_menu.w, g_menu.h, r)) clear_bars(index);      /* (the game's picture under it has the same rectangle) */
+        b.dstOffsets[0].x = r[0]; b.dstOffsets[0].y = r[1]; b.dstOffsets[1].x = r[2]; b.dstOffsets[1].y = r[3]; b.dstOffsets[1].z = 1;
         vkCmdBlitImage(R.cmd, g_menu.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         return;
     }
@@ -4237,7 +4263,9 @@ swap: ;
             memset(&b, 0, sizeof b);
             b.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; b.srcSubresource.layerCount = 1; b.dstSubresource = b.srcSubresource;
             b.srcOffsets[0].x = s4[0]; b.srcOffsets[0].y = s4[1]; b.srcOffsets[1].x = s4[0] + s4[2]; b.srcOffsets[1].y = s4[1] + s4[3]; b.srcOffsets[1].z = 1;
-            b.dstOffsets[1].x = (int32_t)V.extent.width; b.dstOffsets[1].y = (int32_t)V.extent.height; b.dstOffsets[1].z = 1;
+            int32_t r[4];
+            if (fit_rect(s4[2], s4[3], r)) clear_bars(index);      /* the picture keeps its shape: black bars around it (aspect = keep) */
+            b.dstOffsets[0].x = r[0]; b.dstOffsets[0].y = r[1]; b.dstOffsets[1].x = r[2]; b.dstOffsets[1].y = r[3]; b.dstOffsets[1].z = 1;
             vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         overlay_draw(index);

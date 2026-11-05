@@ -13,6 +13,7 @@ typedef struct {
                               * sets it too and wins; env SMO_VK_SCALE wins over both) */
     int handheld;            /* 1: the game is told it runs handheld = it makes its own 1280x720 render targets instead of 1920x1080 */
     int aniso;               /* 0 = the game's own value; 2, 4, 8, 16 = at least that on samplers that filter between mip levels */
+    int stretch;             /* aspect: 0 keep (black bars around the 16:9 picture), 1 stretch it over the whole window */
     int perf_overlay;        /* performance_overlay: 0 off, 1 fps (frames per second and ms per frame), 2 detailed (+ internal resolution, CPU,
                               * GPU, memory, temperatures); F10 shows / hides it while playing (older files: fps_overlay = <corner> = fps) */
     int overlay_corner;      /* overlay_corner: 1 top_left (default), 2 top_right, 3 bottom_left, 4 bottom_right, 5 top_center, 6 bottom_center */

@@ -161,7 +161,11 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
 - The window: by default the game covers its monitor (`window = borderless_fullscreen`). F11, or a double-click on
   it, switches between that and a window; `window = borderless_window` (no frame, the size in `graphics.ini`; a tiling
   compositor such as niri tiles it), `windowed` (with a title bar) and `fullscreen` (always on top) start that way. The
-  mouse pointer is hidden while the window covers its monitor and shown in a window.
+  mouse pointer is hidden while the window covers its monitor and shown in a window. The game's 16:9 picture keeps its shape on a
+  monitor or window of another shape (ultrawide, 16:10, a resized window): black bars fill the rest, and the settings
+  and amiibo menus take the same rectangle; `aspect = stretch` in `graphics.ini` stretches it over the whole window
+  instead. (A true ultrawide picture, more of the world at the sides, would need the game's camera, scene buffers and HUD
+  changed: not done.)
 - Internal resolution: `resolution = 720p | 900p | 1080p | 1440p | 2160p` in `graphics.ini`. 900p (1600x900) is the
   game's own; above it the game's screen-sized targets are drawn larger (more detail, more GPU work: 2160p draws 5.8
   times the pixels), below it smaller. `resolution_scale` (0.25 to 2.4) says the same as a factor and is used when
