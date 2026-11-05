@@ -165,9 +165,18 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   reads it. Measured over five kingdoms entered for the first time (Sand, Cascade, Wooded, Metro, Snow; the same cache
   of a run to the title screen before): render-thread holds at a draw 151 / 860 ms without, 70 / 78 ms with (almost all
   while loading), stages translated near a scene 519 against 10, loading screens held 6.7 s against 4.4 s. `cache/vk/precompiled.txt`
-  says what it was made for (GPU, driver, translator version, native or scaled internal resolution: a fragment stage
-  is translated differently); at start the log says whether it fits (`nvn_vk: the material shaders ...`), and the
-  exit report counts the stages translated in the run and near a scene (`nvn_vk_stages:`).
+  has a line per GPU (and resolution mode) it was made for: the driver (and its own version text, e.g. `615.78.08`,
+  `Mesa 26.2.6`), the translator version, native or scaled internal resolution (a fragment stage is translated
+  differently). `./smo --compile-shaders` goes through every GPU of the PC (`SMO_PRECOMPILE_ALL=1`: the program starts
+  again for the next one with `SMO_VK_DEVICE`), so the settings menu can switch GPU without a cold start;
+  `./smo --compile-shaders nvidia intel` (or `amd`, `all`) names the GPUs instead (`SMO_PRECOMPILE_GPUS`), and
+  `./smo-recomp ... --shader-gpus nvidia,intel` passes that to its step 6; the
+  translation (`cache/vk/stage`, `spv`) is shared, each driver keeps its compiled code in its own cache
+  (`cache/nvidia`, `cache/mesa`). When the game starts and the GPU's driver has changed since its line was written (the
+  driver's cache is then thrown away), it compiles them again before the game: `[NVIDIA]: Driver updated <old> ->
+  <new>` in the log and a small box with a bar at the bottom of the window. Otherwise the log says whether it fits (`nvn_vk: the
+  material shaders ...`), and the exit report counts the stages translated in the run and near a scene
+  (`nvn_vk_stages:`).
 - Without `--exe` (the name is then `smo_test`), or with any other name, the run is a test: `scripts/run.py` copies
   `smo_native` to that name, keeps the window hidden (`SMO_SHOW=1` shows it) and silent, and stops the game after
   `--seconds` (default 30). Everything the game prints goes to `build/run/<run name>.log`, and a summary (boot stages

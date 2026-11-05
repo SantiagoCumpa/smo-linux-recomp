@@ -66,6 +66,7 @@ void display_before_present(void);
     X(PFN_vkVoidFunction, vkGetInstanceProcAddr, (VkInstance, const char *)) \
     X(VkResult, vkEnumeratePhysicalDevices, (VkInstance, uint32_t *, VkPhysicalDevice *)) \
     X(void, vkGetPhysicalDeviceProperties, (VkPhysicalDevice, VkPhysicalDeviceProperties *)) \
+    X(void, vkGetPhysicalDeviceProperties2, (VkPhysicalDevice, VkPhysicalDeviceProperties2 *)) \
     X(void, vkGetPhysicalDeviceQueueFamilyProperties, (VkPhysicalDevice, uint32_t *, VkQueueFamilyProperties *)) \
     X(VkResult, vkEnumerateDeviceExtensionProperties, (VkPhysicalDevice, const char *, uint32_t *, VkExtensionProperties *)) \
     X(void, vkDestroySurfaceKHR, (VkInstance, VkSurfaceKHR, const VkAllocationCallbacks *)) \
@@ -222,6 +223,25 @@ void nvn_vk_set_vsync(int opt) { plat_xchg(&g_vsync_req, opt); }
 /* The settings menu: the Vulkan devices of this PC that can run the game (Vulkan 1.3), their names, and which one runs it. */
 static char g_gpu_names[8][128];
 static int g_gpu_count, g_gpu_used = -1;
+static int g_gpu_dev[8], g_gpu_ndev;
+static uint32_t g_gpu_vendor[8];                       /* their vendor ids (the precompile's GPU filter) */
+/* SMO_PRECOMPILE_GPUS = all | a list of nvidia, intel, amd (./smo --compile-shaders <gpus>): does GPU number i match */
+static int pc_gpu_wanted(int i) {
+    const char *f = getenv("SMO_PRECOMPILE_GPUS");
+    if (!f || !f[0] || strstr(f, "all")) return 1;
+    uint32_t v = g_gpu_vendor[i];
+    return (v == 0x10de && strstr(f, "nvidia")) || (v == 0x8086 && strstr(f, "intel")) || (v == 0x1002 && strstr(f, "amd"));
+}                     /* the physical device numbers of the usable GPUs (not CPU renderers): ./smo --compile-shaders goes through them */
+static char g_driver_info[96];                         /* the driver's own version text (VkPhysicalDeviceDriverProperties.driverInfo: "570.86.16", "Mesa 25.1.4") */
+const char *nvn_vk_driver_info(void) { return g_driver_info; }
+static VkPhysicalDevice gpus_of(int i) {               /* physical device number i (the enumeration's order) */
+    VkPhysicalDevice g[16]; uint32_t n = 16;
+    if (vkEnumeratePhysicalDevices(V.instance, &n, g) != VK_SUCCESS && n == 0) return VK_NULL_HANDLE;
+    return i >= 0 && (uint32_t)i < n ? g[i] : VK_NULL_HANDLE;
+}
+const char *nvn_vk_vendor_label(void) {                /* NVIDIA, Intel, AMD, else the device's name */
+    return V.props.vendorID == 0x10de ? "NVIDIA" : V.props.vendorID == 0x8086 ? "Intel" : V.props.vendorID == 0x1002 ? "AMD" : V.props.deviceName;
+}
 int nvn_vk_gpus(char names[][128], int max, int *used) {
     int n = g_gpu_count < max ? g_gpu_count : max;
     for (int i = 0; i < n; i++) snprintf(names[i], 128, "%s", g_gpu_names[i]);
@@ -233,11 +253,13 @@ int nvn_vk_gpus(char names[][128], int max, int *used) {
 static void wait_last_submit(void);
 static void present_flush(void);                      /* nvn_vk_draw.c: the presentation thread has nothing pending */
 static void present_stop(void);
+static void fps_views_drop(void);                      /* nvn_vk_draw.c: the overlay's views of the swapchain images */
 static void swapchain_destroy(void) {
     if (!V.swapchain) return;
     present_flush();
     wait_last_submit();                                  /* also resets the fence for the next submit */
     vkDeviceWaitIdle(V.device);
+    fps_views_drop();                                     /* a new swapchain may reuse an image handle: a view kept by handle would draw into the old one */
     vkDestroySwapchainKHR(V.device, V.swapchain, NULL);
     V.swapchain = NULL; V.image_count = 0;
 }
@@ -421,11 +443,21 @@ int nvn_vk_init(void *window) {
                VK_API_VERSION_MAJOR(p.apiVersion), VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion), p.driverVersion,
                family < 0 ? " - cannot present to the window with a graphics + compute queue" : p.apiVersion < VK_API_VERSION_1_3 ? " - below Vulkan 1.3" : "");
         if (usable && g_gpu_count < 8) snprintf(g_gpu_names[g_gpu_count++], 128, "%s", p.deviceName);
+        if (usable && type != VK_PHYSICAL_DEVICE_TYPE_CPU && g_gpu_ndev < 8) { g_gpu_vendor[g_gpu_ndev] = p.vendorID; g_gpu_dev[g_gpu_ndev++] = (int)i; }
         if (forced >= 0 ? (int)i == forced && usable : score > best_score) { best = (int)i; best_score = score; best_family = (uint32_t)family; }
     }
     if (best < 0) { printf("nvn_vk: no usable Vulkan 1.3 device%s\n", forced >= 0 ? " (SMO_VK_DEVICE names one that is not usable)" : ""); fflush(stdout); plat_exit(5); }
     V.gpu = gpus[best]; V.family = best_family;
     vkGetPhysicalDeviceProperties(V.gpu, &V.props);
+    {   VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &dp;
+        vkGetPhysicalDeviceProperties2(V.gpu, &p2);
+        snprintf(g_driver_info, sizeof g_driver_info, "%s", dp.driverInfo[0] ? dp.driverInfo : "?");
+        for (char *q = g_driver_info; *q; q++) if (*q == '\n' || *q == '\r') *q = ' ';
+        if (!dp.driverInfo[0]) snprintf(g_driver_info, sizeof g_driver_info, "0x%08x", V.props.driverVersion);
+        printf("nvn_vk: driver %s %s (%s)\n", dp.driverName[0] ? dp.driverName : "?", g_driver_info, nvn_vk_vendor_label());
+    }
     for (int i = 0; i < g_gpu_count; i++) if (!strcmp(g_gpu_names[i], V.props.deviceName)) g_gpu_used = i;
 
     static VkExtensionProperties dext[512];
@@ -506,12 +538,39 @@ int nvn_vk_init(void *window) {
     fflush(stdout);
     V.alive = 1;
     vkd_init();
+    void nvn_vk_precompile(void); void nvn_vk_shutdown(void);
     if (getenv("SMO_PRECOMPILE") && atoi(getenv("SMO_PRECOMPILE"))) {      /* ./smo --compile-shaders: the shaders, then out (the game does not start) */
-        void nvn_vk_precompile(void); void nvn_vk_shutdown(void);
-        nvn_vk_precompile();
-        nvn_vk_shutdown();                         /* writes the pipeline cache (the stage libraries) */
+        int me = -1, all = getenv("SMO_PRECOMPILE_ALL") && atoi(getenv("SMO_PRECOMPILE_ALL")), nwant = 0, my_n = 0;
+        void smo_restart(void);
+        for (int i = 0; i < g_gpu_ndev; i++) if (V.gpu == gpus_of(g_gpu_dev[i])) me = i;
+        for (int i = 0; i < g_gpu_ndev; i++) if (pc_gpu_wanted(i)) { nwant++; if (i <= me) my_n = nwant; }
+        if (all && me >= 0 && !pc_gpu_wanted(me)) {      /* the GPU it started on is not one asked for: the first one that is */
+            for (int i = 0; i < g_gpu_ndev; i++) if (pc_gpu_wanted(i)) { char n[16]; snprintf(n, sizeof n, "%d", g_gpu_dev[i]); setenv("SMO_VK_DEVICE", n, 1); nvn_vk_shutdown(); smo_restart(); }
+            printf("precompile: no GPU of this PC is one of \"%s\": nothing compiled\n", getenv("SMO_PRECOMPILE_GPUS"));
+            nvn_vk_shutdown();
+            fflush(stdout);
+            _exit(3);
+        }
+        printf("precompile: GPU %d of %d: %s (%s driver %s)\n", all ? my_n : 1, all ? nwant : 1, V.props.deviceName, nvn_vk_vendor_label(), g_driver_info);
         fflush(stdout);
+        nvn_vk_precompile();
+        nvn_vk_shutdown();                         /* the driver writes its shader disk cache */
+        fflush(stdout);
+        /* SMO_PRECOMPILE_ALL=1 (./smo --compile-shaders): every GPU of the PC in turn: the program starts again for the next
+         * one (one Vulkan device a process), with SMO_VK_DEVICE naming it */
+        for (int i = me + 1; all && me >= 0 && i < g_gpu_ndev; i++) if (pc_gpu_wanted(i)) {
+            char n[16];
+            snprintf(n, sizeof n, "%d", g_gpu_dev[i]);
+            setenv("SMO_VK_DEVICE", n, 1);
+            smo_restart();
+        }
         _exit(0);
+    }
+    {   /* the GPU's driver changed since its shaders were compiled (../cache/vk/precompiled.txt): compiled again now, with a
+         * message and a bar in the window, before the game starts (a desktop entry has no terminal to say it in) */
+        char old[128];
+        int nvn_vk_driver_updated(char *old, size_t n); void nvn_vk_precompile_shown(const char *old);
+        if (nvn_vk_driver_updated(old, sizeof old)) nvn_vk_precompile_shown(old);
     }
     return 1;
 }

@@ -10,6 +10,8 @@
                 your system's, from LANG; changed later in the game's settings menu, F1)
     --jobs N    compile jobs (default: all CPUs but two)
     --no-shaders  skip step 6 (compiling the shaders ahead; <out_dir>/smo --compile-shaders does it later)
+    --shader-gpus all | nvidia,intel,amd: the GPUs step 6 compiles for (default: every GPU of the PC; the game compiles
+                for a GPU left out when it first runs on it)
 
 Steps, each skipped when its result is already there (a run that stopped resumes):
     1. check     tools and libraries (scripts/setup.py's deps step)
@@ -17,8 +19,8 @@ Steps, each skipped when its result is already there (a run that stopped resumes
     3. decrypt   the NSP files -> build/install/dump (tools/extract/nsp.py; about 5.5 GB, a minute)
     4. build     lift and compile the game from it (scripts/setup.py; the first time takes long)
     5. folder    the game folder (tools/make_game_folder.py): ./smo starts the game
-    6. shaders   the material shaders of every kingdom, compiled ahead (<out_dir>/smo --compile-shaders; a few
-                 minutes the first time, seconds when they are there)
+    6. shaders   the material shaders of every kingdom, compiled ahead for every GPU of the PC, or those --shader-gpus
+                 names (<out_dir>/smo --compile-shaders; a few minutes a GPU the first time, seconds when they are there)
 
 No firmware is needed: the game's text uses its own fonts, and the system fonts stand in for the console's shared
 fonts. Everything but the game folder stays inside the repository's build/ folder.
@@ -65,11 +67,16 @@ def fail(task, what, tail):
 
 
 def progress_line(task, line):
-    """A tool's '@progress <phase> <done> <total>' line: the bar."""
+    """A tool's '@progress <phase> <done> <total>' line: the bar; '@gpu <i> <n> <name>': which GPU (shaders, one per GPU)."""
+    if line.startswith('@gpu '):
+        p = line.split(' ', 3)
+        task.gpu = 'GPU %s of %s (%s): ' % (p[1], p[2], p[3].split(' (')[0] if len(p) > 3 else '?')
+        task.update(0.0, task.gpu + 'starting')
+        return True
     parts = line.split()
     if len(parts) == 4 and parts[0] == '@progress':
         done, total = int(parts[2]), max(1, int(parts[3]))
-        task.update(done / total, '%s %d/%d' % (PHASES.get(parts[1], parts[1]), done, total))
+        task.update(done / total, '%s%s %d/%d' % (getattr(task, 'gpu', ''), PHASES.get(parts[1], parts[1]), done, total))
         return True
     return False
 
@@ -94,6 +101,8 @@ def main():
     ap.add_argument('--language', choices=LANGUAGES, help="the game's language (default: the system's)")
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 2) - 2))
     ap.add_argument('--no-shaders', action='store_true', help='skip compiling the shaders ahead (step 6)')
+    ap.add_argument('--shader-gpus', default='all', metavar='all|nvidia,intel,amd',
+                    help='the GPUs to compile the shaders for (default: every GPU of the PC)')
     a = ap.parse_args()
     in_dir, keys, out = (os.path.abspath(os.path.expanduser(p)) for p in (a.in_dir, a.keys, a.out_dir))
     if not os.path.isdir(in_dir):
@@ -212,7 +221,14 @@ def main():
             t.finish(note='(skipped: run %s --compile-shaders later)' % os.path.join(out, 'smo'))
         else:
             t.update(detail='starting (the first time: a few minutes)')
-            code, tail = run_logged([os.path.join(out, 'smo'), '--compile-shaders'], log, lambda l: progress_line(t, l))
+            gpus = [g.strip().lower() for g in a.shader_gpus.split(',') if g.strip()] or ['all']
+            bad = [g for g in gpus if g not in ('all', 'nvidia', 'intel', 'amd')]
+            if bad:
+                fail(t, 'Compiling shaders', ['--shader-gpus: unknown GPU kind %s (all, nvidia, intel, amd)' % ', '.join(bad)])
+            code, tail = run_logged([os.path.join(out, 'smo'), '--compile-shaders'] + gpus, log, lambda l: progress_line(t, l))
+            if code == 3:
+                t.finish(note='(no %s GPU on this PC: nothing compiled)' % a.shader_gpus)
+                code = 0
             if code:
                 fail(t, 'Compiling shaders', tail)
     log.close()

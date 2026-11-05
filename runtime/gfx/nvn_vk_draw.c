@@ -3783,6 +3783,89 @@ static struct {
     VkImage key[16]; VkImageView view[16];     /* a view of each swapchain image, made when first drawn into */
     int64_t t0, f0; char text[OVL_LINES][32]; int lines, warn_line; float fps;      /* warn_line: a line in yellow (on battery), -1 none */
 } g_fps;
+/* ---- a message over a black window (no game picture yet): the shaders compiled again after a driver update, before the
+ * game starts (nvn_vk_precompile_shown). Lines of the overlay's 5x7 font, twice its size, centred; the bar of the held
+ * loading screen (g_ovl) under them. */
+static struct { char text[4][96]; int n; float frac; } g_msg;
+static const uint8_t *fps_glyph(char ch);
+static int fps_pipeline(void);
+static VkImageView fps_view(uint32_t index);
+static void fps_rect(int x, int y, int w, int h, const float rgba[4]);
+static void vk_present2(void *arg, int progress);
+static void msg_draw(uint32_t index) {              /* a small box at the bottom: the lines, then a thin bar (g_msg.frac) */
+    if (!g_msg.n || !fps_pipeline()) return;
+    VkImageView view = fps_view(index);
+    if (!view) return;
+    int W = (int)V.extent.width, H = (int)V.extent.height, k = H / 360 > 1 ? H / 360 : 1, longest = 1;      /* half as large again as the performance overlay */
+    for (int l = 0; l < g_msg.n; l++) { int len = (int)strlen(g_msg.text[l]); if (len > longest) longest = len; }
+    while (k > 1 && longest * 6 * k > W * 9 / 10) k--;
+    int pad = 2 * k, line_h = 9 * k, bar_h = 2 * k, bw = (longest * 6 - 1) * k + 2 * pad, bh = g_msg.n * line_h + bar_h + 2 * pad;      /* tight: 2 dots of margin, 2 between lines */
+    int x0 = (W - bw) / 2, y0 = H - H / 30 - bh;
+    image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    ca.imageView = view; ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL; ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    ri.renderArea.extent = V.extent; ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(R.cmd, &ri);
+    VkViewport vpt = {0.0f, 0.0f, (float)W, (float)H, 0.0f, 1.0f};
+    VkRect2D sc = {{0, 0}, V.extent};
+    vkCmdSetViewport(R.cmd, 0, 1, &vpt);
+    vkCmdSetScissor(R.cmd, 0, 1, &sc);
+    vkCmdBindPipeline(R.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_fps.pipe);
+    static const float box[4] = {0.12f, 0.12f, 0.12f, 0.85f}, white[4] = {0.94f, 0.94f, 0.94f, 1.0f}, yellow[4] = {0.94f, 0.78f, 0.24f, 1.0f}, track[4] = {0.30f, 0.30f, 0.30f, 1.0f};
+    fps_rect(x0, y0, bw, bh, box);
+    for (int l = 0; l < g_msg.n; l++) {
+        const char *t = g_msg.text[l];
+        int len = (int)strlen(t), x = x0 + (bw - (len * 6 - 1) * k) / 2, y = y0 + pad + l * line_h;      /* each line centred */
+        for (int i = 0; i < len; i++) {
+            const uint8_t *g = fps_glyph(t[i]);
+            for (int r = 0; r < 7; r++)
+                for (int bb = 0; bb < 5; bb++) {
+                    if (!(g[r] >> (4 - bb) & 1)) continue;
+                    int e = bb;
+                    while (e + 1 < 5 && (g[r] >> (4 - (e + 1)) & 1)) e++;
+                    fps_rect(x + i * 6 * k + bb * k, y + r * k, (e - bb + 1) * k, k, l == 0 ? yellow : white);
+                    bb = e;
+                }
+        }
+    }
+    int by = y0 + pad + g_msg.n * line_h, bx = x0 + pad, bwid = bw - 2 * pad;
+    float f = g_msg.frac < 0 ? 0 : g_msg.frac > 1 ? 1 : g_msg.frac;
+    fps_rect(bx, by, bwid, bar_h, track);
+    if (f > 0) fps_rect(bx, by, (int)((float)bwid * f), bar_h, white);
+    vkCmdEndRendering(R.cmd);
+    image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+}
+static void msg_upper(char *s) { for (; *s; s++) if (*s >= 'a' && *s <= 'z') *s = (char)(*s - 32); }
+static int64_t g_msg_last;
+static void msg_progress(int done, int total) {        /* nvn_vk_precompile's progress: the window again, at most ten times a second */
+    if (tk() - g_msg_last < g_tk_hz() / 10 && done < total) return;
+    g_msg_last = tk();
+    if (total > 1) snprintf(g_msg.text[2], sizeof g_msg.text[2], "COMPILING SHADERS  %d%%", (int)((int64_t)done * 100 / total));
+    static PresentJob none;
+    g_msg.frac = total > 1 ? (float)done / (float)total : 0.0f;
+    vk_present2(&none, 1);
+}
+const char *nvn_vk_driver_info(void); const char *nvn_vk_vendor_label(void);
+void nvn_vk_precompile(void);
+/* nvn_vk.c, before the game starts: the GPU's driver changed since the shaders were compiled for it */
+void nvn_vk_precompile_shown(const char *old) {
+    printf("[%s]: Driver updated %s -> %s. The shaders must be compiled again. This will take a few minutes...\n", nvn_vk_vendor_label(), old, nvn_vk_driver_info());
+    fflush(stdout);
+    snprintf(g_msg.text[0], sizeof g_msg.text[0], "%s DRIVER UPDATED", nvn_vk_vendor_label());
+    snprintf(g_msg.text[1], sizeof g_msg.text[1], "%s TO %s", old, nvn_vk_driver_info());
+    snprintf(g_msg.text[2], sizeof g_msg.text[2], "COMPILING SHADERS");
+    for (int i = 0; i < 3; i++) msg_upper(g_msg.text[i]);
+    g_msg.n = 3; g_msg.frac = 0;
+    g_msg_last = 0;
+    msg_progress(0, 1);
+    g_pc_progress = msg_progress;
+    nvn_vk_precompile();
+    g_pc_progress = NULL;
+    g_msg.n = 0;
+    printf("[%s]: shaders compiled for driver %s: starting the game\n", nvn_vk_vendor_label(), nvn_vk_driver_info());
+    fflush(stdout);
+}
 static const uint8_t *fps_glyph(char ch) {
     /* rows top to bottom, 5 bits each (bit 4 = left column) */
     static const uint8_t digits[10][7] = {
@@ -3864,6 +3947,12 @@ static int fps_pipeline(void) {                   /* once, and again if the swap
     if (r != VK_SUCCESS) { g_fps.pipe = NULL; g_fps.failed = 1; printf("nvn_vk: the frame counter's pipeline could not be made (%s): no counter\n", vk_result_name(r)); return 0; }
     g_fps.fmt = V.format.format;
     return 1;
+}
+/* every view of the swapchain's images, when the swapchain is destroyed (nvn_vk.c swapchain_destroy). A view used to be
+ * kept while its image handle stayed the same, but a new swapchain can hand out an image with the handle of an old one:
+ * the overlay was then drawn into a destroyed image, missing on one frame in three (seen after the window changed size). */
+static void fps_views_drop(void) {
+    for (int i = 0; i < 16; i++) { if (g_fps.view[i]) vkDestroyImageView(V.device, g_fps.view[i], NULL); g_fps.view[i] = NULL; g_fps.key[i] = NULL; }
 }
 static VkImageView fps_view(uint32_t index) {      /* swapchain images change when the swapchain is made again: views follow */
     if (index >= 16) return NULL;
@@ -3991,7 +4080,7 @@ static int window_shot_record(uint32_t index) {
     if (!parsed) { parsed = 1; const char *e = getenv("SMO_WINDOW_SHOT"); while (e && *e && nwant < 16) { want[nwant++] = atoll(e); e = strchr(e, ','); if (e) e++; } }
     long long f = nvn_front_frame_next();
     int hit = 0;
-    for (int i = 0; i < nwant; i++) if (want[i] == f) hit = 1;
+    for (int i = 0; i < nwant; i++) if (want[i] == f) { hit = 1; want[i] = -1; }      /* once a frame number (presents before the first frame all say frame 1) */
     if (!hit || g_wshot.buf) return 0;
     g_wshot.w = (int)V.extent.width; g_wshot.h = (int)V.extent.height; g_wshot.frame = f;
     g_wshot.buf = vbuf_new((uint64_t)g_wshot.w * g_wshot.h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, &g_wshot.mem);
@@ -4374,7 +4463,8 @@ swap: ;
             vkCmdBlitImage(R.cmd, vt->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
         } else { VkClearColorValue z; memset(&z, 0, sizeof z); z.float32[3] = 1.0f; vkCmdClearColorImage(R.cmd, V.images[index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &sr); }
         overlay_draw(index);
-        if (!g_menu.on) fps_overlay_draw(index);
+        if (!g_menu.on && !g_msg.n) fps_overlay_draw(index);
+        if (g_msg.n) msg_draw(index);
         int shot = window_shot_record(index);
         image_barrier(V.images[index], VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
         { int64_t s0 = tk(); cmd_submit(acq, rend); g_pt[2] += tk() - s0; }

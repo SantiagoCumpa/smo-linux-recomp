@@ -67,20 +67,30 @@ cd "$here/bin"
 if [ "${1:-}" = "--compile-shaders" ]; then
     # the material shaders of every kingdom, translated and compiled ahead (the game loads them while you play: without
     # this, the first visit of a place can stutter). No window; the game does not start. Log: logs/compile-shaders.log
+    # ./smo --compile-shaders [all | nvidia intel amd ...]: the GPUs to compile for (default: every GPU of the PC)
     shift
-    [ "${SMO_PROGRESS:-}" = 1 ] || echo "Compiling shaders (the first time: a few minutes)"
-    SMO_PRECOMPILE=1 ./smo_native ../game/elf/main.elf 0 "$@" 2>&1 | tee "$here/logs/compile-shaders.log" | while IFS= read -r line; do
+    gpus="all"
+    while [ $# -gt 0 ] && [[ "$1" =~ ^(all|nvidia|intel|amd)$ ]]; do if [ "$gpus" = all ]; then gpus="$1"; else gpus="$gpus,$1"; fi; shift; done
+    export SMO_PRECOMPILE_GPUS="$gpus"
+    # every GPU of the PC in turn (SMO_PRECOMPILE_ALL: the program starts again for the next one), so that switching GPU
+    # in the settings menu finds its shaders ready too
+    if [ "$gpus" = all ]; then what="every GPU of this PC"; else what="the GPUs: $gpus"; fi
+    [ "${SMO_PROGRESS:-}" = 1 ] || echo "Compiling shaders for $what (the first time: a few minutes each)"
+    SMO_PRECOMPILE=1 SMO_PRECOMPILE_ALL=1 ./smo_native ../game/elf/main.elf 0 "$@" 2>&1 | tee "$here/logs/compile-shaders.log" | while IFS= read -r line; do
         if [ "${SMO_PROGRESS:-}" = 1 ]; then          # the installer (scripts/install.py) draws its own progress line
+            [[ "$line" =~ ^precompile:\ GPU\ ([0-9]+)\ of\ ([0-9]+) ]] && echo "@gpu ${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${line#*: GPU * of *: }"
             [[ "$line" =~ ^precompile:\ [0-9]+%\ \(([0-9]+)\ of\ ([0-9]+) ]] && echo "@progress shaders ${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
             [[ "$line" == "precompile: done"* ]] && echo "${line#precompile: }"
             continue
         fi
         case "$line" in
-            "precompile: "*%*) printf '\r  %s   ' "${line#precompile: }" ;;
-            "precompile: done"*) printf '\r  %s\n' "${line#precompile: }" ;;
+            "precompile: GPU "*) printf '  %s\n' "${line#precompile: }" ;;
+            "precompile: "*%*) printf '\r    %s   ' "${line#precompile: }" ;;
+            "precompile: done"*) printf '\r    %s\n' "${line#precompile: }" ;;
         esac
     done
     status=${PIPESTATUS[0]}
+    if grep -q "^precompile: no GPU" "$here/logs/compile-shaders.log"; then grep "^precompile: no GPU" "$here/logs/compile-shaders.log" | sed 's/^precompile: /  /'; exit 3; fi
     grep -q "^precompile: done" "$here/logs/compile-shaders.log" || { echo "Compiling shaders failed: see $here/logs/compile-shaders.log"; exit 1; }
     exit "$status"
 fi
@@ -115,9 +125,10 @@ Play: run ./smo in this folder (from a terminal or your file manager). In the ga
 the settings menu: resolution (up to 4K), full screen or window, vertical sync, performance overlay, GPU, language...
 smo.desktop is a menu entry for this folder: copy it to ~/.local/share/applications.
 
-Shaders: ./smo --compile-shaders prepares the shaders of every kingdom ahead (a few minutes the first time), so that a
-new place does not stutter the first time you see it. Run it again after a graphics driver update, or after switching
-the internal resolution between native and a scaled one (logs/smo.log says when it would help).
+Shaders: ./smo --compile-shaders prepares the shaders of every kingdom ahead, for every GPU of the PC (a few minutes
+the first time; ./smo --compile-shaders nvidia, or intel, amd: only those), so that a new place does not stutter the first time you see it. After a graphics driver update the
+game does it again by itself when it starts (a small box with a bar in the window). Run it again after switching the
+internal resolution between native and a scaled one (logs/smo.log says when it would help).
 
   config/graphics.ini, config/controllers.ini   settings (the settings menu writes graphics.ini)
   userdata/save/                                your saves: back this folder up

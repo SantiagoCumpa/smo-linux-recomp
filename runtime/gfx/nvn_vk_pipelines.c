@@ -1744,18 +1744,66 @@ static int pc_stage(SSrc *o, const uint8_t *n, size_t len, uint64_t rec, int s) 
 /* ../cache/vk/precompiled.txt: what the last precompile was made for. A stage record is another one when the translator
  * changes (MX_VK_VERSION) or when the internal resolution goes from native to scaled or back (fragment stages: "rs1"); the
  * stage libraries are another one for another GPU or driver (the pipeline cache's own name). */
-static void pc_marker(char *out, size_t n) {
-    snprintf(out, n, "gpu %04x:%04x driver %08x translator %u scaled %d\n", (unsigned)V.props.vendorID, (unsigned)V.props.deviceID,
-             (unsigned)V.props.driverVersion, MX_VK_VERSION, RS_ON ? 1 : 0);
+const char *nvn_vk_driver_info(void); const char *nvn_vk_vendor_label(void);      /* nvn_vk.c */
+/* ../cache/vk/precompiled.txt: one line per GPU (and resolution mode) the shaders were compiled for:
+ *     gpu <vendor>:<device> driver <hex> translator <MX_VK_VERSION> scaled <0|1> version <the driver's own version text>
+ * The key is the GPU and the mode; the driver says when its compiled code is out of date (another driver version: the
+ * driver's own shader cache throws it away), the translator when the translation is. */
+typedef struct { char key[48]; unsigned driver, translator; int scaled; char version[96]; } PcLine;
+static int pc_parse(const char *line, PcLine *o) {
+    char gpu[24], ver[96] = "";
+    memset(o, 0, sizeof *o);
+    int n = sscanf(line, "gpu %23s driver %x translator %u scaled %d version %95[^\n]", gpu, &o->driver, &o->translator, &o->scaled, ver);
+    if (n < 4) return 0;
+    snprintf(o->key, sizeof o->key, "%s %d", gpu, o->scaled);
+    if (n == 5) snprintf(o->version, sizeof o->version, "%s", ver); else snprintf(o->version, sizeof o->version, "0x%08x", o->driver);
+    return 1;
 }
-static void pc_check(void) {                       /* at start: the log says when ./smo --compile-shaders would help */
-    char want[160], have[160] = "";
-    pc_marker(want, sizeof want);
+static void pc_now(PcLine *o) {
+    memset(o, 0, sizeof *o);
+    snprintf(o->key, sizeof o->key, "%04x:%04x %d", (unsigned)V.props.vendorID, (unsigned)V.props.deviceID, RS_ON ? 1 : 0);
+    o->driver = V.props.driverVersion; o->translator = MX_VK_VERSION; o->scaled = RS_ON ? 1 : 0;
+    snprintf(o->version, sizeof o->version, "%s", nvn_vk_driver_info());
+}
+static void pc_marker_write(void) {                /* this GPU's line, the others kept */
+    char lines[16][256]; int n = 0;
+    char line[256];
+    PcLine now, l;
+    pc_now(&now);
     FILE *f = fopen(vkc_file("precompiled.txt"), "r");
-    if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); }
-    if (!strcmp(want, have)) printf("nvn_vk: the material shaders were precompiled for this GPU, driver and resolution mode (../cache/vk/precompiled.txt)\n");
-    else printf("nvn_vk: the material shaders are NOT precompiled for this GPU, driver and resolution mode (%s): new places may stutter the first time; run ./smo --compile-shaders\n", have[0] ? "made for another one" : "never made");
+    while (f && fgets(line, sizeof line, f) && n < 15) if (pc_parse(line, &l) && strcmp(l.key, now.key)) snprintf(lines[n++], sizeof lines[0], "%s", line);
+    if (f) fclose(f);
+    char gpu[24]; snprintf(gpu, sizeof gpu, "%04x:%04x", (unsigned)V.props.vendorID, (unsigned)V.props.deviceID);
+    snprintf(lines[n++], sizeof lines[0], "gpu %s driver %08x translator %u scaled %d version %s\n", gpu, now.driver, now.translator, now.scaled, now.version);
+    if ((f = fopen(vkc_file("precompiled.txt"), "w"))) { for (int i = 0; i < n; i++) fputs(lines[i], f); fclose(f); }
 }
+/* at start: 0 compiled for this GPU, driver and mode; 1 never for this GPU and mode; 2 its driver changed (*old: the version
+ * it was compiled with); 3 compiled by another translator */
+static int pc_state(char *old, size_t n) {
+    char line[256];
+    PcLine now, l;
+    int st = 1;
+    pc_now(&now);
+    FILE *f = fopen(vkc_file("precompiled.txt"), "r");
+    while (f && fgets(line, sizeof line, f)) {
+        if (!pc_parse(line, &l) || strcmp(l.key, now.key)) continue;
+        if (l.translator != now.translator) st = 3;
+        else if (l.driver != now.driver) { st = 2; if (old) snprintf(old, n, "%s", l.version); }
+        else st = 0;
+    }
+    if (f) fclose(f);
+    return st;
+}
+static void pc_check(void) {                       /* at start: what the log says about the precompile for this GPU */
+    char old[96] = "";
+    int st = pc_state(old, sizeof old);
+    if (st == 0) printf("nvn_vk: the material shaders were precompiled for this GPU, driver and resolution mode (../cache/vk/precompiled.txt)\n");
+    else if (st == 2) printf("nvn_vk: [%s]: driver updated %s -> %s: the shaders are compiled again before the game starts\n", nvn_vk_vendor_label(), old, nvn_vk_driver_info());
+    else printf("nvn_vk: the material shaders are NOT precompiled for this GPU, driver and resolution mode (%s): new places may stutter the first time; run ./smo --compile-shaders\n",
+                st == 3 ? "made by another version of the translator" : "never made for it");
+}
+int nvn_vk_driver_updated(char *old, size_t n) { return pc_state(old, n) == 2; }      /* nvn_vk.c: compile again before the game starts */
+static void (*g_pc_progress)(int done, int total);     /* nvn_vk_precompile_shown: the bar in the window */
 void nvn_vk_precompile(void) {
     plat_counter fq; plat_qpf(&fq);
     int64_t t0 = tk();
@@ -1800,7 +1848,7 @@ void nvn_vk_precompile(void) {
                 plat_unlock(&g_sh_lock);
                 queued++;
                 int pct = (int)((int64_t)(queued + dup) * 100 / (total ? total : 1));
-                if (pct != last_pct) { last_pct = pct; printf("precompile: %d%% (%d of %d programs)\n", pct, queued + dup, total); fflush(stdout); }
+                if (pct != last_pct) { last_pct = pct; printf("precompile: %d%% (%d of %d programs)\n", pct, queued + dup, total); fflush(stdout); if (g_pc_progress) g_pc_progress(queued + dup, total); }
             }
             free(arc);
         }
@@ -1810,11 +1858,7 @@ void nvn_vk_precompile(void) {
     while (g_jq_queued > g_jq_done || g_bq_queued > g_bq_done) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
     plat_unlock(&g_sh_lock);
     free(seen);
-    {   char m[160];
-        FILE *f = fopen(vkc_file("precompiled.txt"), "w");
-        pc_marker(m, sizeof m);
-        if (f) { fputs(m, f); fclose(f); }
-    }
+    pc_marker_write();
     printf("precompile: done in %.0f s: %d programs (%d the same as another), %lld stages translated now, %lld already in the cache; %d programs of another kind left out\n",
            (double)(tk() - t0) / (double)fq.QuadPart, queued + dup, dup, (long long)(g_pc_translated - tr0), (long long)(g_pc_fromrec - rec0), bad);
     fflush(stdout);
