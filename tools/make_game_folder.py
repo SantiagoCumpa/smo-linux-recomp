@@ -58,6 +58,7 @@ export XDG_CACHE_HOME="$here/cache"
 export __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_PATH="$here/cache/nvidia" __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
 export MESA_SHADER_CACHE_DIR="$here/cache/mesa"
 export TMPDIR="$here/tmp"
+export SMO_LOG_TAGS="${SMO_LOG_TAGS:-1}"          # [INFO] / [WARN] / [ERROR] in front of every line of the log (runtime/core/log.c)
 [ -f "$here/smo.env" ] && . "$here/smo.env"      # environment of this folder, if any (the settings menu keeps SMO_LANGUAGE in it)
 if [ "${SMO_PRIME:-1}" != 0 ]; then
     export __NV_PRIME_RENDER_OFFLOAD="${__NV_PRIME_RENDER_OFFLOAD:-1}" __VK_LAYER_NV_optimus="${__VK_LAYER_NV_optimus:-NVIDIA_only}"
@@ -77,6 +78,7 @@ if [ "${1:-}" = "--compile-shaders" ]; then
     if [ "$gpus" = all ]; then what="every GPU of this PC"; else what="the GPUs: $gpus"; fi
     [ "${SMO_PROGRESS:-}" = 1 ] || echo "Compiling shaders for $what (the first time: a few minutes each)"
     SMO_PRECOMPILE=1 SMO_PRECOMPILE_ALL=1 ./smo_native ../game/elf/main.elf 0 "$@" 2>&1 | tee "$here/logs/compile-shaders.log" | while IFS= read -r line; do
+        line="${line#\[INFO\] }"; line="${line#\[WARN\] }"; line="${line#\[ERROR\] }"      # (the log's level tags)
         if [ "${SMO_PROGRESS:-}" = 1 ]; then          # the installer (scripts/install.py) draws its own progress line
             [[ "$line" =~ ^precompile:\ GPU\ ([0-9]+)\ of\ ([0-9]+) ]] && echo "@gpu ${BASH_REMATCH[1]} ${BASH_REMATCH[2]} ${line#*: GPU * of *: }"
             [[ "$line" =~ ^precompile:\ [0-9]+%\ \(([0-9]+)\ of\ ([0-9]+) ]] && echo "@progress shaders ${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
@@ -90,8 +92,9 @@ if [ "${1:-}" = "--compile-shaders" ]; then
         esac
     done
     status=${PIPESTATUS[0]}
-    if grep -q "^precompile: no GPU" "$here/logs/compile-shaders.log"; then grep "^precompile: no GPU" "$here/logs/compile-shaders.log" | sed 's/^precompile: /  /'; exit 3; fi
-    grep -q "^precompile: done" "$here/logs/compile-shaders.log" || { echo "Compiling shaders failed: see $here/logs/compile-shaders.log"; exit 1; }
+    tags='^(\[[A-Z]+\] )?'
+    if grep -Eq "${tags}precompile: no GPU" "$here/logs/compile-shaders.log"; then grep -E "${tags}precompile: no GPU" "$here/logs/compile-shaders.log" | sed -E "s/${tags}precompile: /  /"; exit 3; fi
+    grep -Eq "${tags}precompile: done" "$here/logs/compile-shaders.log" || { echo "Compiling shaders failed: see $here/logs/compile-shaders.log"; exit 1; }
     exit "$status"
 fi
 for i in 3 2 1; do [ -f "$here/logs/smo.$i.log" ] && mv -f "$here/logs/smo.$i.log" "$here/logs/smo.$((i + 1)).log"; done

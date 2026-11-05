@@ -375,4 +375,11 @@ The end of every log has the counts that tell whether a run was healthy:
   frame. `SMO_VK_PRESENT_THREAD=0` presents on the render thread as before (also when the family has one queue).
   `nvn_vk_present:` lines (every 300 frames) give the present's parts: loading barrier, acquire, submit, queue present,
   occlusion results.
+- Log levels: the game folder's `./smo` runs with `SMO_LOG_TAGS=1`, and every line of the terminal and of
+  `logs/smo.log` begins with `[INFO]`, `[WARN]` or `[ERROR]` (`runtime/core/log.c`: stdout and stderr are streams of its
+  own, so no call site changes). The level comes from the line's words: an abort, an assertion, a crash report, a FAIL
+  or FAILED line is an error; NOT, WARNING, cannot, could not, refused, not found, failed, SKIPPED, on battery, driver
+  updated, not implemented a warning, except in a clause of counters that says none ("0 refused", "failed Vulkan
+  calls 0"); a line on stderr is at least a warning. Builds run from the repository (scripts/run.py, the tests, the
+  benchmark) keep untagged lines, which their scripts read as they are.
 

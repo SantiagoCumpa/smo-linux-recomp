@@ -244,6 +244,7 @@ void smo_restart(void) {
 }
 
 int main(int argc, char **argv) {
+    { void smo_log_init(void); smo_log_init(); }       /* log.c: [INFO] / [WARN] / [ERROR] on every line (SMO_LOG_TAGS=1, ./smo) */
     g_argv = argv;
     g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* the target's main.elf from the exe's folder (image.h) */
     setvbuf(stdout, NULL, _IONBF, 0);

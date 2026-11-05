@@ -38,7 +38,7 @@ def pkg_config(*args):
 # The host runtime's build units by subsystem folder (runtime/<folder>/<file>). Not listed: nvn_vk_draw.c,
 # nvn_vk_pipelines.c and nvn_vk_watchdog.c (included by nvn_vk.c) and game_shim.c (part of the game library).
 HOST_SOURCES = {
-    'core': ['plat.c', 'hostrt.c', 'boot.c', 'gamedll.c', 'sdklift_rt.c', 'hitch.c', 'mods.c'],
+    'core': ['plat.c', 'hostrt.c', 'boot.c', 'gamedll.c', 'sdklift_rt.c', 'hitch.c', 'mods.c', 'log.c'],
     'libc': ['clib.c', 'nnlibc2.c', 'libcxx.c', 'nncxxlib.c', 'nncxxrt.c', 'nniostream.c', 'nnunwind.c'],
     'os': ['os_threads.c', 'nnsdk.c', 'nntime.c', 'nnmisc.c', 'smo_nn.c'],
     'fs': ['nnfs.c', 'nnfsdir.c'],
