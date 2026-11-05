@@ -101,13 +101,14 @@ def parse(log, warmup, measure):
     fr = windows(r'^nvn_perf: frames (\d+)\.\.(\d+) frame time ms: avg ([\d.]+) min [\d.]+ median ([\d.]+) p99 ([\d.]+) max ([\d.]+) \| fps avg ([\d.]+), 1% low ([\d.]+)')
     vk = windows(r'^nvn_vk_perf: frames (\d+)\.\.(\d+) ms/frame: batch replay ([\d.]+) \(of it: dispatch [\d.]+, draw preparation ([\d.]+).*?wait for the GPU ([\d.]+).*?present ([\d.]+)')
     dr = windows(r'^nvn_vk: frames (\d+)\.\.(\d+): ([\d.]+) fps, (\d+) draws per frame')
+    gp = windows(r'^nvn_vk_gpu: frames (\d+)\.\.(\d+): GPU time ([\d.]+) ms per frame')      # SMO_VK_GPUTIME=1
     if not fr or not vk:
         return None, 'no 300-frame window inside the measured frames %d..%d (the run ended early?)' % (lo, hi)
     mean = lambda ws, g: statistics.mean(float(w.group(g)) for w in ws)
     res.update(play_frame=play, windows=len(fr),
                fps=mean(fr, 7), low1=min(float(w.group(8)) for w in fr), p99_ms=max(float(w.group(5)) for w in fr),
                replay_ms=mean(vk, 3), drawprep_ms=mean(vk, 4), gpu_wait_ms=mean(vk, 5), present_ms=mean(vk, 6),
-               draws=mean(dr, 4) if dr else 0.0)
+               draws=mean(dr, 4) if dr else 0.0, gpu_ms=mean(gp, 3) if gp else -1.0)
     over = re.findall(r'(\d+) frames over 33\.4 ms', text)
     res['over33'] = int(over[-1]) if over else -1
     t = re.findall(r'made or read at their use: (\d+) times, ([\d.]+) ms \(of them in scene frames: (\d+), ([\d.]+) ms\)', text)
@@ -168,10 +169,11 @@ def main():
         results.append(res)
         print('run %d: %5.1f fps (1%% low %4.1f, p99 %5.1f ms, %d frames over 33 ms) | render thread ms/frame: replay %5.2f '
               '(draw prep %5.2f), present %5.2f, GPU wait %5.2f | %4.0f draws | textures at use in play %d (%.0f ms) | '
-              'resident %d MB | to play %.1f s, holds %d (%d ms) | window %s'
+              'resident %d MB | to play %.1f s, holds %d (%d ms) | window %s%s'
               % (n + 1, res['fps'], res['low1'], res['p99_ms'], res['over33'], res['replay_ms'], res['drawprep_ms'],
                  res['present_ms'], res['gpu_wait_ms'], res['draws'], res.get('tex_at_use_play', -1),
-                 res.get('tex_at_use_play_ms', 0), res['resident_mb'], res['boot_s'], res['holds'], res['holds_ms'], res['window']), flush=True)
+                 res.get('tex_at_use_play_ms', 0), res['resident_mb'], res['boot_s'], res['holds'], res['holds_ms'], res['window'],
+                 ' | GPU %.2f ms/frame' % res['gpu_ms'] if res['gpu_ms'] >= 0 else ''), flush=True)
         with open(os.path.join(OUT, 'results.jsonl'), 'a', encoding='utf-8') as f:
             f.write(json.dumps(dict(res, run=n + 1, commit=commit, label=a.label, stage=a.stage, resolution=a.resolution,
                                     warmup=a.warmup, measure=a.measure, env=a.env,

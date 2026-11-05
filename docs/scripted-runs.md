@@ -121,5 +121,8 @@ frames (600) with Mario standing still, then measures `--measure` frames (1,800)
 frames a second and 1 % low, the render thread's milliseconds a frame (batch replay, draw preparation, present, wait for
 the GPU), draws a frame, textures made at their use while playing, peak resident memory. `--runs` (2) runs, and the
 spread between them (it should stay within about 5 %); a run on battery is refused. Every run is appended to
-`build/bench/results.jsonl` with the commit and the label. Plug a laptop in: on battery the GPU and CPU are held back.
+`build/bench/results.jsonl` with the commit and the label. Plug a laptop in: on battery the GPU and CPU are held back. `--env
+NAME=VALUE` passes a runtime switch: `--env SMO_VK_GPUTIME=1` adds the GPU's milliseconds a frame. Measured on an RTX 4060
+laptop GPU with the charger in (Sand Kingdom, 1,116 draws): GPU 4.13 ms a frame at 900p, 5.58 at 1440p, 6.95 at 2160p,
+60 fps at all three (the GPU's work grows far less than the pixels: most of it does not depend on the resolution).
 
