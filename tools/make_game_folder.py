@@ -8,6 +8,7 @@ The folder (default: smo/ at the repository root; ignored by git, it holds your 
 
     smo/
       smo                 run it (or double-click it, or smo.desktop) to play; F1 in the game opens the settings menu
+                          (./smo --compile-shaders: the material shaders ahead, see below)
       smo.desktop         a menu entry: copy it to ~/.local/share/applications to have the game in the app menu
       bin/                smo_native and libsmo_game.so; the game runs with this as its folder
       game/elf/           main.elf and sdk.elf (and the other modules); game/exefs/main.npdm
@@ -24,6 +25,8 @@ The folder (default: smo/ at the repository root; ignored by git, it holds your 
 The runtime finds everything relative to bin/ (romfs, userdata and config through its exe folder, the Vulkan cache
 as ../cache/vk from the working folder), so the folder can be moved anywhere. Making it again updates bin/ and game/
 and keeps romfs/, config/, userdata/ and cache/ (--refresh-romfs, --refresh-cache to take them again from build/).
+./smo --compile-shaders translates and compiles the material shaders of every kingdom into cache/ (a few minutes the first
+time; scripts/install.py runs it): the game loads them while you play, and a shader made then is a stutter.
 Copies use reflinks where the file system has them (btrfs, XFS): no extra space and no time for the 5 GB of romfs.
 --link-romfs makes romfs/ a symbolic link to build/romfs instead (the folder then depends on the dump staying where it is).
 """
@@ -48,8 +51,6 @@ RUN_SCRIPT = r'''#!/usr/bin/env bash
 set -e
 here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 mkdir -p "$here/logs" "$here/tmp" "$here/cache/nvidia" "$here/cache/mesa" "$here/cache/vk" "$here/run"
-for i in 3 2 1; do [ -f "$here/logs/smo.$i.log" ] && mv -f "$here/logs/smo.$i.log" "$here/logs/smo.$((i + 1)).log"; done
-[ -f "$here/logs/smo.log" ] && mv -f "$here/logs/smo.log" "$here/logs/smo.1.log"
 export XDG_CACHE_HOME="$here/cache"
 export __GL_SHADER_DISK_CACHE=1 __GL_SHADER_DISK_CACHE_PATH="$here/cache/nvidia" __GL_SHADER_DISK_CACHE_SKIP_CLEANUP=1
 export MESA_SHADER_CACHE_DIR="$here/cache/mesa"
@@ -60,6 +61,28 @@ if [ "${SMO_PRIME:-1}" != 0 ]; then
     export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
 fi
 cd "$here/bin"
+if [ "${1:-}" = "--compile-shaders" ]; then
+    # the material shaders of every kingdom, translated and compiled ahead (the game loads them while you play: without
+    # this, the first visit of a place can stutter). No window; the game does not start. Log: logs/compile-shaders.log
+    shift
+    [ "${SMO_PROGRESS:-}" = 1 ] || echo "Compiling shaders (the first time: a few minutes)"
+    SMO_PRECOMPILE=1 ./smo_native ../game/elf/main.elf 0 "$@" 2>&1 | tee "$here/logs/compile-shaders.log" | while IFS= read -r line; do
+        if [ "${SMO_PROGRESS:-}" = 1 ]; then          # the installer (scripts/install.py) draws its own progress line
+            [[ "$line" =~ ^precompile:\ [0-9]+%\ \(([0-9]+)\ of\ ([0-9]+) ]] && echo "@progress shaders ${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+            [[ "$line" == "precompile: done"* ]] && echo "${line#precompile: }"
+            continue
+        fi
+        case "$line" in
+            "precompile: "*%*) printf '\r  %s   ' "${line#precompile: }" ;;
+            "precompile: done"*) printf '\r  %s\n' "${line#precompile: }" ;;
+        esac
+    done
+    status=${PIPESTATUS[0]}
+    grep -q "^precompile: done" "$here/logs/compile-shaders.log" || { echo "Compiling shaders failed: see $here/logs/compile-shaders.log"; exit 1; }
+    exit "$status"
+fi
+for i in 3 2 1; do [ -f "$here/logs/smo.$i.log" ] && mv -f "$here/logs/smo.$i.log" "$here/logs/smo.$((i + 1)).log"; done
+[ -f "$here/logs/smo.log" ] && mv -f "$here/logs/smo.log" "$here/logs/smo.1.log"
 exec ./smo_native ../game/elf/main.elf 0 "$@" >"$here/logs/smo.log" 2>&1
 '''
 
@@ -80,10 +103,15 @@ Play: run ./smo in this folder (from a terminal or your file manager). In the ga
 the settings menu: resolution (up to 4K), full screen or window, vertical sync, performance overlay, GPU, language...
 smo.desktop is a menu entry for this folder: copy it to ~/.local/share/applications.
 
+Shaders: ./smo --compile-shaders prepares the shaders of every kingdom ahead (a few minutes the first time), so that a
+new place does not stutter the first time you see it. Run it again after a graphics driver update, or after switching
+the internal resolution between native and a scaled one (logs/smo.log says when it would help).
+
   config/graphics.ini, config/controllers.ini   settings (the settings menu writes graphics.ini)
   userdata/save/                                your saves: back this folder up
   logs/smo.log                                  the log of the last run (attach it to a bug report)
   cache/                                        shader caches; deleting it only makes the next start slower
+                                                (then run ./smo --compile-shaders again)
 
 This folder holds files from your own copy of the game: do not share it.
 Made by tools/make_game_folder.py of the smo-recomp repository; run it again to update the game (saves, settings and

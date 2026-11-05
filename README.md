@@ -67,7 +67,7 @@ on Linux.
 | amiibo | F2, or both stick buttons on a pad, opens a menu drawn like the game's pause menu from its own layout textures, fonts and texts: 102 amiibo, in the game's language. The one chosen is held to a virtual NFC reader; checked in Cascade Kingdom: the game reads Peach and runs her help. Mario, Bowser and Luigi checked as well¹ |
 | System calls | every system call the game made in the tested scenes is implemented (331 of 331 in the Cap Kingdom run); `SMO_IMPORT_SELFTEST=1` checks the ones written from the game's import list rather than met in play: 0 failures |
 | Controllers | keyboard, XInput (Windows only), and any pad through SDL3 (hot-plug, 8 players, remapping file, rumble, motion): 51 of 51 automated checks with virtual devices; played with an Xbox One controller; other physical pads not tried |
-| Window and capture | a borderless window by default; F11 or a double-click switches to borderless fullscreen and back. The game keeps running at 60 frames a second while its window is not the active one or is minimised (`unfocused = pause` in `graphics.ini` stops it, as the console does). F12 or a pad's share button saves the frame to the save folder's `album` |
+| Window and capture | a borderless window by default; F11 or a double-click switches to borderless fullscreen and back (the mouse pointer is hidden in full screen). The game keeps running at 60 frames a second while its window is not the active one or is minimised (`unfocused = pause` in `graphics.ini` stops it, as the console does). F12 or a pad's share button saves the frame to the save folder's `album` |
 | Save data | journalled like the console's (two-phase commit); the game's autosave and Resume work |
 | Speed | 60 fps, paced to a 60 Hz clock: at Cascade Kingdom's first checkpoint 59.8-60.0 fps in each of 20 windows of 300 frames (1% lows 49.4-56.0); the Cap Kingdom run averages 59.4 fps once play begins, lowest 49.5 while the tower stage loads. Development PC only |
 | Online | not available: the network services answer as a console without a network |
@@ -107,7 +107,8 @@ sudo pacman -S clang lld llvm pkgconf sdl3 vulkan-headers vulkan-icd-loader shad
 ```
 
 `smo-recomp` makes the Python environment, decrypts your NSP files (with the repository's `tools/bin/hactool`) into `build/install/dump`, lifts and
-compiles the game (the first time takes a while) and makes the game folder: `smo` (starts the game; F1 in it opens the settings menu), `bin/`, `game/`,
+compiles the game (the first time takes a while; each step shows a live progress line, the details go to
+`build/install/install.log`) and makes the game folder, then compiles its shaders ahead (`smo --compile-shaders`). The folder: `smo` (starts the game; F1 in it opens the settings menu), `bin/`, `game/`,
 `romfs/`, `config/`, `userdata/` (saves), `cache/`, `logs/`. Each step is skipped when its result is there, so a run that
 stopped resumes, and running it again on the same folder updates the program and keeps saves, settings and caches.
 No firmware is needed. The folder can be moved anywhere; on btrfs or XFS its copies are reflinks (no extra space).
@@ -133,8 +134,8 @@ docs/             building, architecture, debugging, scripted runs
 
 ## Plans
 
-- Speed on slower CPUs and GPUs, and shorter stalls the first time a kingdom is visited (its textures and shaders are
-  made then).
+- Speed on slower CPUs and GPUs, and shorter stalls the first time a kingdom is visited (its textures are made then;
+  its shaders can be compiled ahead: `./smo --compile-shaders`, which the install runs).
 - Scripted runs further through the game: the rest of Cap Kingdom, then kingdom by kingdom.
 - Checks on real hardware for the few shader instructions translated from documentation only (`SHFL`, `AL2P`, indexed
   `IPA`).

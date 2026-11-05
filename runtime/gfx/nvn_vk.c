@@ -24,6 +24,7 @@
  * surface comes from SDL (SDL_Vulkan_CreateSurface: Wayland or X11). On a hybrid laptop the discrete GPU is preferred
  * (scripts/run.py also sets the PRIME offload variables). */
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
@@ -490,6 +491,13 @@ int nvn_vk_init(void *window) {
     fflush(stdout);
     V.alive = 1;
     vkd_init();
+    if (getenv("SMO_PRECOMPILE") && atoi(getenv("SMO_PRECOMPILE"))) {      /* ./smo --compile-shaders: the shaders, then out (the game does not start) */
+        void nvn_vk_precompile(void); void nvn_vk_shutdown(void);
+        nvn_vk_precompile();
+        nvn_vk_shutdown();                         /* writes the pipeline cache (the stage libraries) */
+        fflush(stdout);
+        _exit(0);
+    }
     return 1;
 }
 

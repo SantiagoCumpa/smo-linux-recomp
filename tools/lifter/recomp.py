@@ -21,6 +21,7 @@ import os
 import struct
 import sys
 import collections
+PROGRESS = os.environ.get('SMO_PROGRESS') == '1'   # scripts/install.py: '@progress <phase> <done> <total>' lines
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(_REPO, 'tools'))
@@ -1253,7 +1254,9 @@ def cmd_full2(outdir, jobs):
             pending.sort()
             parts = [pending[i:i + 400] for i in range(0, len(pending), 400)]
             new = set()
-            for n, b, wanted in pool.imap_unordered(_worker_scan, parts):
+            for k, (n, b, wanted) in enumerate(pool.imap_unordered(_worker_scan, parts)):
+                if PROGRESS:
+                    print('@progress discover %d %d' % (k + 1, len(parts)), flush=True)
                 total += n
                 bad += b
                 new.update(w for w in wanted if w not in known and BASE <= w < BASE + TEXT_SIZE)
@@ -1268,7 +1271,9 @@ def cmd_full2(outdir, jobs):
         jobs_list = [(outdir, 'c_%04x.c' % b, entries) for b, entries in buckets.items()]
         changed = 0
         files = []
-        for name, was_changed in pool.imap_unordered(_worker_write, jobs_list):
+        for k, (name, was_changed) in enumerate(pool.imap_unordered(_worker_write, jobs_list)):
+            if PROGRESS:
+                print('@progress write %d %d' % (k + 1, len(jobs_list)), flush=True)
             files.append(name)
             changed += was_changed
     with open(os.path.join(outdir, 'funcs.h'), 'w') as f:

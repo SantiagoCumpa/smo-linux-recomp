@@ -121,6 +121,8 @@ def main():
         for k, r in enumerate(ex.map(compile_file, sorted(todo, key=lambda n: -os.path.getsize(os.path.join(GEN, n))))):
             results.append(r)
             name, code, out, secs, note = r
+            if os.environ.get('SMO_PROGRESS') == '1':      # scripts/install.py draws its progress line from these
+                print('@progress compile %d %d' % (k + 1, len(todo)), flush=True)
             if code or note:
                 print('  %s %s  %.0fs  %s' % ('FAIL' if code else 'note', name, secs, note))
                 if code:

@@ -67,6 +67,7 @@ static volatile int32_t g_in_scene;
 static volatile int64_t g_scene_last = -100000;
 static int scene_recent(void) { return g_in_scene || nvn_front_frame_next() - g_scene_last < 600; }
 static int64_t g_var_known;
+static volatile int64_t g_pc_translated, g_pc_fromrec, g_pc_tr_scene;     /* stages translated now / read from their record (the precompile's summary) */
 static int64_t g_jq_queued, g_jq_done, g_bq_queued, g_bq_done;
 /* SMO_VK_HOLDLOG=1 only: when a stage's code was first handed to the workers (nvnProgramSetShaders), so that a hold
  * can say whether anyone knew the code before its draw. */
@@ -260,7 +261,8 @@ static void vstage_build(VStage *v, const SSrc *src) {
         while (!done && fread(&e, 1, sizeof e, fp) == sizeof e) {
             VkShaderModule mod;
             if (e.magic != STAGEREC_MAGIC || e.fo != v->fo || !key_fits(s, v->key, e.key, e.dep, e.tex)) continue;
-            if (stage_rec_read(s, e.vh, &r) && !r.images && (mod = module_from_spv(r.spv)) != NULL) { vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; plat_inc(&R.modules); done = 1; }      /* not a stage with images (their formats and types are not in the record) */
+            if (stage_rec_read(s, e.vh, &r) && !r.images && (mod = module_from_spv(r.spv)) != NULL) { vstage_from_rec(v, &r, e.vh, mod); v->from_rec = 1; plat_inc(&R.modules); done = 1; }
+            if (done) plat_inc(&g_pc_fromrec);      /* not a stage with images (their formats and types are not in the record) */
         }
         fclose(fp);
     }
@@ -283,6 +285,8 @@ static void vstage_build(VStage *v, const SSrc *src) {
             static long minb = -2; if (minb == -2) minb = getenv("SMO_VK_DUMP_MINBYTES") ? atol(getenv("SMO_VK_DUMP_MINBYTES")) : -1;
             if ((want >= 0 && src->serial == want) || (minb >= 0 && src->code_len >= minb)) { const char *dir = getenv("SMO_SHADERDUMP"); char path[300]; snprintf(path, sizeof path, "%s%svk_prog_%05d_%d.bin", dir ? dir : "", dir ? "/" : "", src->serial, s); FILE *f = fopen(path, "wb"); if (f) { fwrite(src->code, 1, (size_t)src->code_len, f); fclose(f); } }
         }
+        plat_inc(&g_pc_translated);
+        if (scene_recent()) plat_inc(&g_pc_tr_scene);
         if (!mx_translate(&in, &out)) {
             printf("nvn_vk: %s: machine code not translated: %s\n", what, out.why); fflush(stdout);
             {   /* debug aid: SMO_SHADERDUMP=<dir> also writes the machine code of a stage the translator refuses (as the OpenGL path's b*.bin) */
@@ -912,7 +916,7 @@ static int sig_note(const PKey *k, int *idx) {     /* g_sh_lock held: the index 
 }
 static void gpl_shared_vs(VStage *vs);
 /* ---- the job queue of the workers */
-typedef struct Job { struct Job *next; int kind, sshade, has[3], fragonly; /* kind 3: the fragment stage of a program without a vertex stage */ Pipe *pipe; VStage *lvs, *lfs; /* kind 5: the pair library of these two stages */ PKey k; uint32_t key0[4], key1[4]; SSrc src[3]; uint8_t data[1]; } Job;      /* kind: 0 a program handed over, 1 one pipeline, 2 the stages and the pipeline of a draw the look-ahead met, 3 one stage, 5 a pair library, 6 an optimised link, 7 the stage a skipped draw waits for */
+typedef struct Job { struct Job *next; int kind, sshade, has[3], fragonly, pc /* nvn_vk_precompile: also the integer-attribute variant */; /* kind 3: the fragment stage of a program without a vertex stage */ Pipe *pipe; VStage *lvs, *lfs; /* kind 5: the pair library of these two stages */ PKey k; uint32_t key0[4], key1[4]; SSrc src[3]; uint8_t data[1]; } Job;      /* kind: 0 a program handed over, 1 one pipeline, 2 the stages and the pipeline of a draw the look-ahead met, 3 one stage, 5 a pair library, 6 an optimised link, 7 the stage a skipped draw waits for */
 /* debug aid: what each worker is doing now (printed when the loading barrier times out) */
 static struct { volatile int32_t kind; volatile int32_t serial; volatile int64_t t0; volatile uint32_t tid; } g_wk[64];
 static volatile int32_t g_wk_n;
@@ -1263,9 +1267,23 @@ static void job_prog(Job *j) {
         if (how == 1) plat_inc(&g_w_stages);
         if (!vs->ok) return;
     }
-    if (D.has_gpl && gpl_sep() && !(fs && j->sshade) && stage_fits_universal(vs) && (!fs || stage_fits_universal(fs))) { int lh; stagelib_ensure(vs, 0, &lh); if (fs) stagelib_ensure(fs, 0, &lh); else stagelib_ensure(vs, 1, &lh); }      /* SMO_VK_GPL=2: a library per stage (a program without a fragment stage: both forms of its vertex stage) */
-    else
-    if (D.has_gpl) { int lh; pairlib_ensure(vs, fs, 1, fs ? j->sshade : 0, &lh); }      /* the pair's shaders compiled now, without pass formats; a draw links */
+    /* precompiling: a vertex stage that reads vertex attribute 11 as an integer when it is one (the bone indices of a skinned
+     * model: key 0x800, the only integer variant met in play; measured, 162 of 5,129 vertex variants of a played cache) is
+     * also made in that variant, as a draw of such a model would ask for it */
+    VStage *vlist[2] = {vs, NULL};
+    if (j->pc && (vs->dep & 0x800u)) {
+        static const uint32_t int11[4] = {0x800u, 0, 0, 0};
+        VStage *v2 = stage_ensure(&j->src[0], hv, int11, vs->fo, &how);
+        if (how == 1) plat_inc(&g_w_stages);
+        if (v2->ok && v2 != vs) vlist[1] = v2;
+    }
+    for (int vi = 0; vi < 2 && vlist[vi]; vi++) {
+        VStage *lv = vlist[vi];
+        if (D.has_gpl && gpl_sep() && !(fs && j->sshade) && stage_fits_universal(lv) && (!fs || stage_fits_universal(fs))) { int lh; stagelib_ensure(lv, 0, &lh); if (fs) stagelib_ensure(fs, 0, &lh); else stagelib_ensure(lv, 1, &lh); }      /* SMO_VK_GPL=2: a library per stage (a program without a fragment stage: both forms of its vertex stage) */
+        else
+        if (D.has_gpl) { int lh; pairlib_ensure(lv, fs, 1, fs ? j->sshade : 0, &lh); }      /* the pair's shaders compiled now, without pass formats; a draw links */
+        if (vi && D.has_gpl && gpl_sep() && stage_fits_universal(lv)) { int lh; stagelib_ensure(lv, 1, &lh); }      /* precompiling: the skinned variant is drawn in the shadow passes too, without a fragment stage */
+    }
     if (!g_predict) return;
     plat_lock(&g_sh_lock);
     PairRec *pr = pair_get(vs, fs);
@@ -1479,6 +1497,7 @@ void nvn_vk_program_set(void *prog) {
     plat_unlock(&g_sh_lock);
 }
 static int piperec_cmp(const void *a, const void *b) { return memcmp(a, b, sizeof(PipeRec)); }
+static void pc_check(void);
 static void prewarm_start(void) {
     plat_lock_init(&g_sh_lock); plat_lock_init(&g_gpl_lock);
     plat_cond_init(&g_sh_cv); plat_cond_init(&g_jq_cv);
@@ -1538,6 +1557,7 @@ static void prewarm_start(void) {
     g_handover_on = !(getenv("SMO_VK_HANDOVER") && !atoi(getenv("SMO_VK_HANDOVER")));
     printf("nvn_vk: %d pipelines listed in ../cache/vk/pipes.bin; %d worker threads; programs are handed to them when the game sets their shaders: %s; key prediction: %s\n", g_pw_n, g_pw_nthread,
            g_handover_on ? "yes" : "no (SMO_VK_HANDOVER=0)", g_predict ? "blind (SMO_VK_PREDICT=1)" : g_scan_on ? "look-ahead of every batch" : D.has_eds3 ? "none (SMO_VK_LOOKAHEAD=0)" : "none (blend state is part of the key on this GPU)");
+    if (!(getenv("SMO_PRECOMPILE") && atoi(getenv("SMO_PRECOMPILE")))) pc_check();
 }
 /* ---------------------------------------------------------------- look-ahead: what a batch will draw, before it is replayed
  * The lists of a submitted batch are read once for the (stage pair, pass formats, topology class) of every draw. A
@@ -1685,8 +1705,120 @@ void nvn_vk_hold_counts(long long *holds, long long *hold_ms, long long *dummies
     *holds = g_bar_n; *hold_ms = (long long)((double)g_bar_tk * 1000.0 / (double)fq.QuadPart); *dummies = R.dummy_kind;
 }
 
+/* ---------------------------------------------------------------- precompiling (SMO_PRECOMPILE=1: ./smo --compile-shaders)
+ * The game loads most of its programs at start (the .sharcb archives, the effects): those are made then, as always. What it
+ * loads LATER, while you play, are the variations of the material shaders (ShaderData/*.bfsha: alRenderMaterial alone has
+ * 18,046 programs over 10,362 stages), each one the first time an object or kingdom needs it: a stage translated and its
+ * library compiled near a scene is a held frame. This walks those archives and hands every program to the workers exactly as
+ * nvnProgramSetShaders does (a stage is the archive's control and code sections, the very bytes the game copies), so the
+ * same records (../cache/vk/stage, spv) and stage libraries (the pipeline cache) exist before the game asks for them.
+ *
+ * BNSH (inside a .bfsha at "BNSH"; offsets from there): "grsc" block, +0x1c u32 variation count, +0x20 u64 variation table
+ * (0x40 bytes each; +0x10 u64 the binary program). Program: +0x08 .. +0x30 u64 stage records of vertex, hull, domain,
+ * geometry, fragment, compute. Stage record: +0x08 u64 control section, +0x10 u64 code section (magic 0x12345678; the
+ * program header at +0x30). Control: +0x6f8 code length, +0x6fc constants size, +0x700 constants offset (from the section). */
+uint8_t *ui_arc(const char *path, size_t *size);                                      /* smo_ui.c: a romfs file, Yaz0 undone */
+const uint8_t *ui_sarc(const uint8_t *s, size_t n, const char *name, size_t *size);
+static const char *const k_pc_arc[][2] = {
+    {"ShaderData/alRenderMaterial.szs", "alRenderMaterial.bfsha"}, {"ShaderData/alRenderMaterial.szs", "alRenderMaterialUber.bfsha"},
+    {"ShaderData/alRenderCloudLayer.szs", "alRenderCloudLayer.bfsha"}, {"ShaderData/alRenderDepthOnly.szs", "alRenderDepthOnly.bfsha"},
+    {"ShaderData/alRenderSky.szs", "alRenderSky.bfsha"}, {"ShaderData/alRenderProgram.szs", "alRenderProgram.bfsha"},
+    {"ShaderData/alPostEffectMask.szs", "alPostEffectMask.bfsha"}};
+static uint32_t pc_u32(const uint8_t *b, size_t n, uint64_t o) { uint32_t v = 0; if (o + 4 <= n) memcpy(&v, b + o, 4); return v; }
+static uint64_t pc_u64(const uint8_t *b, size_t n, uint64_t o) { uint64_t v = 0; if (o + 8 <= n) memcpy(&v, b + o, 8); return v; }
+/* a stage of the archive as nvn_gl.c's nvnProgramSetShaders makes it (Stage: code = section + 0x30, ctl = control + 0x6f0) */
+static int pc_stage(SSrc *o, const uint8_t *n, size_t len, uint64_t rec, int s) {
+    memset(o, 0, sizeof *o);
+    if (!rec) return 0;
+    uint64_t ctl = pc_u64(n, len, rec + 8), code = pc_u64(n, len, rec + 16);
+    uint32_t clen = pc_u32(n, len, ctl + 0x6f8), csize = pc_u32(n, len, ctl + 0x6fc), coff = pc_u32(n, len, ctl + 0x700);
+    if (pc_u32(n, len, code) != 0x12345678u || !clen || clen > (4u << 20) || code + 0x30 + clen > len) return 0;
+    o->stage = s; o->code = n + code + 0x30; o->code_len = (int)clen; o->serial = -1;
+    if (csize && coff && code + coff + csize <= len) { o->cdata = n + code + coff; o->cdata_size = csize; }
+    return 1;
+}
+/* ../cache/vk/precompiled.txt: what the last precompile was made for. A stage record is another one when the translator
+ * changes (MX_VK_VERSION) or when the internal resolution goes from native to scaled or back (fragment stages: "rs1"); the
+ * stage libraries are another one for another GPU or driver (the pipeline cache's own name). */
+static void pc_marker(char *out, size_t n) {
+    snprintf(out, n, "gpu %04x:%04x driver %08x translator %u scaled %d\n", (unsigned)V.props.vendorID, (unsigned)V.props.deviceID,
+             (unsigned)V.props.driverVersion, MX_VK_VERSION, RS_ON ? 1 : 0);
+}
+static void pc_check(void) {                       /* at start: the log says when ./smo --compile-shaders would help */
+    char want[160], have[160] = "";
+    pc_marker(want, sizeof want);
+    FILE *f = fopen(vkc_file("precompiled.txt"), "r");
+    if (f) { if (!fgets(have, sizeof have, f)) have[0] = 0; fclose(f); }
+    if (!strcmp(want, have)) printf("nvn_vk: the material shaders were precompiled for this GPU, driver and resolution mode (../cache/vk/precompiled.txt)\n");
+    else printf("nvn_vk: the material shaders are NOT precompiled for this GPU, driver and resolution mode (%s): new places may stutter the first time; run ./smo --compile-shaders\n", have[0] ? "made for another one" : "never made");
+}
+void nvn_vk_precompile(void) {
+    plat_counter fq; plat_qpf(&fq);
+    int64_t t0 = tk();
+    int total = 0, queued = 0, dup = 0, bad = 0, last_pct = -1;
+    size_t seen_cap = 1 << 16;
+    uint64_t *seen = calloc(seen_cap, sizeof *seen);       /* the (vertex, fragment) pairs queued: open addressing on the pair's hash */
+    printf("precompile: waiting for the pipelines of earlier runs to be made\n"); fflush(stdout);
+    prewarm_wait();
+    int64_t tr0 = g_pc_translated, rec0 = g_pc_fromrec;
+    for (int pass = 0; pass < 2; pass++) {                 /* pass 0 counts, pass 1 queues (so that progress has a total) */
+        for (size_t a = 0; a < sizeof k_pc_arc / sizeof k_pc_arc[0]; a++) {
+            size_t an = 0, fn = 0;
+            uint8_t *arc = ui_arc(k_pc_arc[a][0], &an);
+            const uint8_t *f = arc ? ui_sarc(arc, an, k_pc_arc[a][1], &fn) : NULL;
+            const uint8_t *bn = NULL;
+            for (size_t k = 0; f && k + 4 <= fn; k += 8) if (!memcmp(f + k, "BNSH", 4)) { bn = f + k; break; }      /* after the shading models: 0x9d7000 in alRenderMaterial */
+            if (!bn) { if (pass) printf("precompile: %s / %s: no shader binary found\n", k_pc_arc[a][0], k_pc_arc[a][1]); free(arc); continue; }
+            size_t len = fn - (size_t)(bn - f), g = 0;
+            for (size_t k = 0; k + 4 <= len && k < 0x1000; k += 4) if (!memcmp(bn + k, "grsc", 4)) { g = k; break; }
+            uint32_t nvar = g ? pc_u32(bn, len, g + 0x1c) : 0;
+            uint64_t tab = g ? pc_u64(bn, len, g + 0x20) : 0;
+            for (uint32_t i = 0; i < nvar; i++) {
+                uint64_t prog = pc_u64(bn, len, tab + (uint64_t)i * 0x40 + 0x10);
+                SSrc sv, sf;
+                if (!prog) continue;
+                int hv = pc_stage(&sv, bn, len, pc_u64(bn, len, prog + 0x08), 0), hf = pc_stage(&sf, bn, len, pc_u64(bn, len, prog + 0x28), 1);
+                if (pc_u64(bn, len, prog + 0x10) || pc_u64(bn, len, prog + 0x18) || pc_u64(bn, len, prog + 0x20) || pc_u64(bn, len, prog + 0x30) || !hv) { if (pass) bad++; continue; }      /* only vertex + fragment programs (all of them, measured) */
+                if (!pass) { total++; continue; }
+                uint64_t key = fnv(fnv(0xcbf29ce484222325ULL, (uint64_t[]){ssrc_hb(&sv)}, 8), (uint64_t[]){hf ? ssrc_hb(&sf) : 0}, 8) | 1;
+                size_t h = (size_t)(key % seen_cap);
+                while (seen[h] && seen[h] != key) h = (h + 1) % seen_cap;
+                if (seen[h]) { dup++; continue; }
+                seen[h] = key;
+                Job *j = calloc(1, sizeof *j + (size_t)sv.code_len + sv.cdata_size + (hf ? (size_t)sf.code_len + sf.cdata_size : 0) + 64);
+                uint8_t *d = j->data;
+                job_copy_src(j, &d, 0, &sv);
+                if (hf) job_copy_src(j, &d, 1, &sf);
+                j->pc = 1;
+                plat_lock(&g_sh_lock);
+                while (g_jq_queued - g_jq_done > 4 * g_pw_nthread) WD_SLEEP(&g_sh_cv, &g_sh_lock, 50);
+                job_push(j);
+                plat_unlock(&g_sh_lock);
+                queued++;
+                int pct = (int)((int64_t)(queued + dup) * 100 / (total ? total : 1));
+                if (pct != last_pct) { last_pct = pct; printf("precompile: %d%% (%d of %d programs)\n", pct, queued + dup, total); fflush(stdout); }
+            }
+            free(arc);
+        }
+        if (!pass) { printf("precompile: %d programs in the material shader archives\n", total); fflush(stdout); }
+    }
+    plat_lock(&g_sh_lock);
+    while (g_jq_queued > g_jq_done || g_bq_queued > g_bq_done) WD_SLEEP(&g_sh_cv, &g_sh_lock, 100);
+    plat_unlock(&g_sh_lock);
+    free(seen);
+    {   char m[160];
+        FILE *f = fopen(vkc_file("precompiled.txt"), "w");
+        pc_marker(m, sizeof m);
+        if (f) { fputs(m, f); fclose(f); }
+    }
+    printf("precompile: done in %.0f s: %d programs (%d the same as another), %lld stages translated now, %lld already in the cache; %d programs of another kind left out\n",
+           (double)(tk() - t0) / (double)fq.QuadPart, queued + dup, dup, (long long)(g_pc_translated - tr0), (long long)(g_pc_fromrec - rec0), bad);
+    fflush(stdout);
+}
 static void pipelines_report(void) {
     plat_counter fq; plat_qpf(&fq);
+    printf("nvn_vk_stages: translated in this run %lld (near a scene: %lld), read from their records %lld (../cache/vk/stage; ./smo --compile-shaders makes the material shaders' records ahead)\n",
+           (long long)g_pc_translated, (long long)g_pc_tr_scene, (long long)g_pc_fromrec);
     if (D.has_gpl) {
         double q = 1000.0 / (double)fq.QuadPart;
         printf("nvn_vk_gpl: pair libraries compiled by the workers: %lld (%.0f ms of worker time; %lld of them asked for as shared vertex stage x fragment stage without a program of its own: %d such fragment stages, %d shared vertex stages); "

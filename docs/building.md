@@ -22,7 +22,13 @@ Decrypting uses `tools/bin/hactool`, a static build of hactool the repository ca
 `tools/hactool/bktr-new-layout.patch` for the 1.4.1 update's RomFS patch). The NSP files may
 be two (base and update) or one that carries both; personalized tickets are refused (dump with a common ticket). The
 decrypted dump goes to `build/install/dump` (`tools/extract/nsp.py`), then `setup.py` and `tools/make_game_folder.py` run
-on it. `./smo-recomp --help` lists the steps; each resumes.
+on it, and the game folder's `./smo --compile-shaders` last. `./smo-recomp --help` lists the steps; each resumes.
+While it runs, each step is one line rewritten in place (`scripts/progress_ui.py`): a bar with the files compiled,
+the C files written, the gigabytes decrypted or the shader programs made, or a spinner where nothing can be counted,
+and the time taken; the build's own steps (import, translation to C, compiling, linking) are lines of their own. The
+tools' whole output goes to `build/install/install.log` (they print `@progress <phase> <done> <total>` lines there
+when `SMO_PROGRESS=1`); when a step fails, its last lines and the log's path are printed. Output that is not a terminal
+gets a plain line every 10 % instead.
 
 ## What you need
 
@@ -117,6 +123,23 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
 - **Caches stay in the repository:** the translated shaders in `build/cache/vk`, and the driver's own caches in
   `build/cache` (`run.py` sets `XDG_CACHE_HOME`, `__GL_SHADER_DISK_CACHE_PATH` and `MESA_SHADER_CACHE_DIR`).
   Temporary files go to `build/tmp`.
+- **Shaders compiled ahead (`./smo --compile-shaders`):** the game hands most of its shader programs over at start
+  (the `.sharcb` archives and the effects), and those are made then. The materials of the objects and kingdoms
+  (`ShaderData/*.bfsha`: 20,816 programs, 18,046 of them in `alRenderMaterial`) are handed over while you play, the
+  first time something needs them; a stage translated and compiled then is a held frame. `SMO_PRECOMPILE=1` (what
+  `./smo --compile-shaders` sets; `scripts/install.py` runs it as its step 6) walks those archives instead of
+  starting the game (`nvn_vk_precompile` in `runtime/gfx/nvn_vk_pipelines.c`: the BNSH inside each `.bfsha`, its
+  variations, each program's vertex and fragment stage: the very control and code sections the game copies) and hands
+  every program to the workers as `nvnProgramSetShaders` does: the stage records (`cache/vk/stage`, `spv`) and the
+  stage libraries (the pipeline cache) then exist before the game asks; a vertex stage that reads attribute 11 as an
+  integer (skinned models: key 0x800, the only integer variant met in play) is also made in that variant. With an
+  empty cache: about 12,000 stages in about 2 minutes on 14 threads, about 1 GB of cache; with everything there it only
+  reads it. Measured over five kingdoms entered for the first time (Sand, Cascade, Wooded, Metro, Snow; the same cache
+  of a run to the title screen before): render-thread holds at a draw 151 / 860 ms without, 70 / 78 ms with (almost all
+  while loading), stages translated near a scene 519 against 10, loading screens held 6.7 s against 4.4 s. `cache/vk/precompiled.txt`
+  says what it was made for (GPU, driver, translator version, native or scaled internal resolution: a fragment stage
+  is translated differently); at start the log says whether it fits (`nvn_vk: the material shaders ...`), and the
+  exit report counts the stages translated in the run and near a scene (`nvn_vk_stages:`).
 - Without `--exe` (the name is then `smo_test`), or with any other name, the run is a test: `scripts/run.py` copies
   `smo_native` to that name, keeps the window hidden (`SMO_SHOW=1` shows it) and silent, and stops the game after
   `--seconds` (default 30). Everything the game prints goes to `build/run/<run name>.log`, and a summary (boot stages
@@ -135,7 +158,8 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   with documented defaults on the first run; `controllers.ini` is read again when you edit it while the game runs).
 - The window: by default the game covers its monitor (`window = borderless_fullscreen`). F11, or a double-click on
   it, switches between that and a window; `window = borderless_window` (no frame, the size in `graphics.ini`; a tiling
-  compositor such as niri tiles it), `windowed` (with a title bar) and `fullscreen` (always on top) start that way.
+  compositor such as niri tiles it), `windowed` (with a title bar) and `fullscreen` (always on top) start that way. The
+  mouse pointer is hidden while the window covers its monitor and shown in a window.
 - Internal resolution: `resolution = 720p | 900p | 1080p | 1440p | 2160p` in `graphics.ini`. 900p (1600x900) is the
   game's own; above it the game's screen-sized targets are drawn larger (more detail, more GPU work: 2160p draws 5.8
   times the pixels), below it smaller. `resolution_scale` (0.25 to 2.4) says the same as a factor and is used when

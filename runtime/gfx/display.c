@@ -261,6 +261,16 @@ static void display_pump(uint32_t wait_ms) {
     }
     if (plat_xchg(&g_req_full_toggle, 0)) window_fullscreen(!g_win_full);
     if (plat_xchg(&g_req_window, 0)) window_apply();
+    {   /* the mouse pointer is hidden while the window covers its monitor (whichever way it got there: graphics.ini, F11, a
+         * double-click, the settings menu), shown again in a window */
+        static int hidden = -1;
+        if (g_win && g_win_full != hidden) {
+            if (g_win_full) SDL_HideCursor(); else SDL_ShowCursor();
+            hidden = g_win_full;
+            printf("display: mouse pointer %s\n", SDL_CursorVisible() ? "shown (a window)" : "hidden (full screen)");
+            fflush(stdout);
+        }
+    }
     if (plat_xchg(&g_req_title, 0)) { char t[192]; plat_lock(&g_title_lock); snprintf(t, sizeof t, "%s", g_title_req); plat_unlock(&g_title_lock); SDL_SetWindowTitle(g_win, t); }
     {   int32_t m = plat_xchg(&g_req_minimise, 0);
         if (m == 1) SDL_MinimizeWindow(g_win); else if (m == 2) SDL_RestoreWindow(g_win); }
@@ -300,7 +310,7 @@ static void window_create(void) {
     /* SMO_SHOW=0 keeps a test copy's window hidden (a hidden Wayland window gets no frame callbacks: presents use the
      * mailbox mode then, see nvn_vk.c); by default every copy shows its window. SMO_TITLE names the window. */
     const char *show = getenv("SMO_SHOW");
-    if (show && atoi(show) == 0) flags |= SDL_WINDOW_HIDDEN;
+    if ((show && atoi(show) == 0) || (getenv("SMO_PRECOMPILE") && atoi(getenv("SMO_PRECOMPILE")))) flags |= SDL_WINDOW_HIDDEN;      /* precompiling: no window to see */
     snprintf(g_title, sizeof g_title, "%s", getenv("SMO_TITLE") ? getenv("SMO_TITLE") : "Super Mario Odyssey (smo-recomp)");
     g_win = SDL_CreateWindow(g_title, cw, ch, flags);
     if (!g_win) { fprintf(stderr, "display: SDL_CreateWindow failed: %s\n", SDL_GetError()); plat_exit(1); }
