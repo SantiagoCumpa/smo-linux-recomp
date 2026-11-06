@@ -170,7 +170,7 @@ internal resolution between native and a scaled one (logs/smo.log says when it w
 
 Mods: with every mod off this is the console's game. The settings menu (F1, Mods) has a switch for each mod (used
 from the next start; config/mods.ini keeps them). The program's own mods are already there: HD resolution,
-Anisotropic filtering, Asynchronous shaders (off) and Fast sampler sort. To add a mod made for emulators, put it in
+Anisotropic filtering, Texture filtering, Asynchronous shaders (off) and Fast sampler sort. To add a mod made for emulators, put it in
 its own folder under mods/ with its romfs/ folder inside (mods/<name>/romfs/...; a folder copied from an emulator's
 load/0100000000010000/ works too). The order of config/mods.ini decides which wins when two replace the same file.
 Only romfs/ is used: exefs/ code patches for emulators are not applied.

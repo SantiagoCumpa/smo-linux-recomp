@@ -133,6 +133,7 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   |---|---|---|
   | `hd-resolution` | on | `feature = hd_resolution`: the internal resolution of `graphics.ini` / the menu (720p to 2160p); off: 900p |
   | `anisotropic-filtering` | on | `feature = anisotropic_filtering`: `anisotropic_filtering` of `graphics.ini` / the menu |
+  | `texture-filtering` | on | `feature = texture_filtering`: `texture_filtering` (game, bilinear, trilinear) of `graphics.ini` / the menu |
   | `async-shaders` | off | `feature = async_shaders`: a draw whose shader is not ready is left out instead of waited for |
   | `fast-sampler-sort` | on | `library = fast_sampler_sort.so`: native code (its `src/`) in place of two hot game functions, the same results |
 

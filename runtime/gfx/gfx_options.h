@@ -12,6 +12,7 @@ typedef struct {
     float scale;             /* internal resolution scale of 1600x900 asked for (Vulkan: nvn_vk_draw.c rs_scale, 0.25 .. 2.4; 'resolution = 1080p'
                               * sets it too and wins; env SMO_VK_SCALE wins over both) */
     int handheld;            /* 1: the game is told it runs handheld = it makes its own 1280x720 render targets instead of 1920x1080 */
+    int tfilter;             /* texture_filtering: 0 = the game's own, 1 = bilinear, 2 = trilinear (samplers that filter linearly with mip maps) */
     int aniso;               /* 0 = the game's own value; 2, 4, 8, 16 = at least that on samplers that filter between mip levels */
     int stretch;             /* aspect: 0 keep (black bars around the 16:9 picture), 1 stretch it over the whole window */
     int perf_overlay;        /* performance_overlay: 0 off, 1 fps (frames per second and ms per frame), 2 detailed (+ internal resolution, CPU,

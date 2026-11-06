@@ -93,6 +93,7 @@ static void opt_load(void) {
             if (found) o->overlay_corner = found; else unknown++;
         }
         else if (!strcasecmp(key, "language")) { if (strcasecmp(val, "system")) snprintf(o->language, sizeof o->language, "%s", val); }
+        else if (!strcasecmp(key, "texture_filtering")) o->tfilter = !strcasecmp(val, "bilinear") ? 1 : !strcasecmp(val, "trilinear") ? 2 : 0;
         else if (!strcasecmp(key, "anisotropic_filtering")) { int v = atoi(val); o->aniso = v == 2 || v == 4 || v == 8 || v == 16 ? v : 0; }
         else if (!strcasecmp(key, "fps_overlay")) {
             static const char *const k_pos[5] = {"off", "top_left", "top_right", "bottom_left", "bottom_right"};

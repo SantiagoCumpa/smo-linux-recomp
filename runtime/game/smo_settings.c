@@ -60,7 +60,7 @@ enum { B_A = 0, B_B = 1, B_L = 6, B_R = 7, B_PLUS = 10, B_ZL = 8, B_ZR = 9, B_LE
 #define BIT(b) (1ull << (b))
 
 /* ---------------------------------------------------------------- the settings */
-enum { K_RES, K_MODE, K_SIZE, K_VSYNC, K_PERF, K_CORNER, K_GPU, K_ANISO, K_LANG,
+enum { K_RES, K_MODE, K_SIZE, K_VSYNC, K_PERF, K_CORNER, K_GPU, K_ANISO, K_TFILTER, K_LANG,
        K_PATH_SAVE, K_PATH_ALBUM, K_PATH_CONFIG, K_PATH_LOGS, K_PATH_MODS, K_MOD0 /* K_MOD0 + i: the i-th mod (nnfs.c fs_mod_*) */ };
 #define MODS_MAX 32
 enum { TAB_DISPLAY, TAB_GRAPHICS, TAB_SYSTEM, TAB_MODS, TABS };
@@ -156,6 +156,9 @@ static void items_load(void) {
     it = item_add(K_ANISO, TAB_GRAPHICS, "Anisotropic filtering", 1);
     choice(it, "game", "The game's own"); choice(it, "2", "2x"); choice(it, "4", "4x"); choice(it, "8", "8x"); choice(it, "16", "16x");
     it->cur = go->aniso == 2 ? 1 : go->aniso == 4 ? 2 : go->aniso == 8 ? 3 : go->aniso == 16 ? 4 : 0;
+    it = item_add(K_TFILTER, TAB_GRAPHICS, "Texture filtering", 1);
+    choice(it, "game", "The game's own"); choice(it, "bilinear", "Bilinear"); choice(it, "trilinear", "Trilinear");
+    it->cur = go->tfilter;
     /* ---- System */
     it = item_add(K_LANG, TAB_SYSTEM, "Game language", 1);
     static const char *const k_lang[][2] = {{"system", "System language"}, {"en-US", "English (US)"}, {"en-GB", "English (UK)"},
@@ -222,6 +225,7 @@ static int item_enabled(const Item *it) {
     {   int smo_mod_feature(const char *);                 /* options of a mod: only while it is on (this run) */
         if (it->key == K_RES) return smo_mod_feature("hd_resolution");
         if (it->key == K_ANISO) return smo_mod_feature("anisotropic_filtering");
+        if (it->key == K_TFILTER) return smo_mod_feature("texture_filtering");
     }
     return !item_is_path(it);
 }
@@ -280,6 +284,7 @@ static void apply(Item *it) {
     case K_CORNER: go->overlay_corner = it->cur + 1; gfx_options_save("overlay_corner", v); display_set_perf_overlay(display_perf_overlay(), it->cur + 1); break;
     case K_GPU: gfx_options_save("gpu", v); break;
     case K_ANISO: gfx_options_save("anisotropic_filtering", v); break;
+    case K_TFILTER: gfx_options_save("texture_filtering", v); break;
     case K_LANG: {
         int sys = !strcmp(v, "system");
         gfx_options_save("language", v);
@@ -406,7 +411,7 @@ static void menu_draw(void) {
         if (path) fit_path(value, sizeof value, it->path, S.msg, vsc, 660.0f);
         else snprintf(value, sizeof value, "%s%s", it->ch[it->cur].label, it->cur != it->saved ? " (not applied)" : it->restart && it->saved != it->start ? " (after restart)" : "");
         if (!enabled && !path) snprintf(value, sizeof value, "%s", it->key == K_SIZE ? "Only in the window modes" : it->key == K_RES ? "Needs the HD resolution mod (Mods tab)" :
-                                                                   it->key == K_ANISO ? "Needs the Anisotropic filtering mod (Mods tab)" : it->ch[it->cur].label);      /* (a mod with code patches only says so) */
+                                                                   it->key == K_ANISO ? "Needs the Anisotropic filtering mod (Mods tab)" : it->key == K_TFILTER ? "Needs the Texture filtering mod (Mods tab)" : it->ch[it->cur].label);      /* (a mod with code patches only says so) */
         float vbase = cy + 4.0f - (float)mi.ascent * 0.33f * vsc;
         uint32_t fg = chosen ? 0x4d4241ff : enabled || path ? 0xffffffff : 0xffffff80;
         if (chosen) {

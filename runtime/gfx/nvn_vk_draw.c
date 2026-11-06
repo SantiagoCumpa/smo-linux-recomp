@@ -1416,6 +1416,7 @@ static unsigned smp_hash(const SamplerParams *p) {
     return (unsigned)(h ^ (h >> 29)) & 4095;
 }
 static VkSampler g_smp_default;
+static int64_t g_smp_minf[6];                      /* samplers made, by their minification filter (after texture_filtering) */
 static VkSampler sampler_get(const SamplerParams *p) {
     static const VkSamplerAddressMode wrap[8] = {VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
                                                  VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
@@ -1429,6 +1430,19 @@ static VkSampler sampler_get(const SamplerParams *p) {
     VkSamplerCustomBorderColorCreateInfoEXT cb = {VK_STRUCTURE_TYPE_SAMPLER_CUSTOM_BORDER_COLOR_CREATE_INFO_EXT};
     VkSamplerReductionModeCreateInfo red = {VK_STRUCTURE_TYPE_SAMPLER_REDUCTION_MODE_CREATE_INFO};
     int minf = p->min < 6 ? p->min : 1;          /* nearest, linear, nearest-mip-nearest, linear-mip-nearest, nearest-mip-linear, linear-mip-linear */
+    {   /* texture_filtering in graphics.ini ("Texture filtering" mod): bilinear = linear-mip-nearest, trilinear = linear-mip-linear,
+         * on samplers the game made linear with mip maps (3 or 5) and a linear magnification; nearest ones (data, lookup
+         * tables) and shadow-compare samplers stay as they are */
+        static int on = -1; static int64_t n_tf[2];
+        int smo_mod_feature(const char *);
+        if (on < 0) on = smo_mod_feature("texture_filtering");
+        int tf = on ? gfx_options()->tfilter : 0;
+        if (tf && (minf == 3 || minf == 5) && p->mag && p->cmode != 1) {
+            int want = tf == 2 ? 5 : 3;
+            if (minf != want) { minf = want; if (n_tf[tf - 1]++ == 0) printf("nvn_vk: texture_filtering=%s: samplers the game made %s are made %s\n", tf == 2 ? "trilinear" : "bilinear", tf == 2 ? "bilinear" : "trilinear", tf == 2 ? "trilinear" : "bilinear"); }
+        }
+        if (minf >= 0 && minf < 6) g_smp_minf[minf]++;
+    }
     ci.minFilter = (minf & 1) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST; ci.magFilter = p->mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     ci.mipmapMode = minf >= 4 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     ci.addressModeU = wrap[p->ws & 7]; ci.addressModeV = wrap[p->wt & 7]; ci.addressModeW = wrap[p->wr & 7];
@@ -4747,6 +4761,8 @@ static void vkd_shutdown(void) {
                    (double)g_late_k_tk[i] * k, (double)g_late_k_max[i] * k, (long long)g_late_k_big[i], (double)g_late_k_bytes[i] / 1048576.0);
     }
     frstat_report();
+    printf("nvn_vk: samplers made by minification filter: nearest %lld, linear %lld, nearest-mip-nearest %lld, bilinear %lld, nearest-mip-linear %lld, trilinear %lld\n",
+           (long long)g_smp_minf[0], (long long)g_smp_minf[1], (long long)g_smp_minf[2], (long long)g_smp_minf[3], (long long)g_smp_minf[4], (long long)g_smp_minf[5]);
     if (getenv("SMO_VK_SLOW") && atoi(getenv("SMO_VK_SLOW")) > 0 && g_ts_on > 0) {      /* the GPU's time of the frames around the slow ones (SMO_VK_GPUTIME=1) */
         int lim = atoi(getenv("SMO_VK_SLOW"));
         for (int f = 1; f < FRSTAT_N - 2 && f < g_cur_frame; f++) if (g_fr_wall[f] > lim || g_fr_gpu[f] > lim)
