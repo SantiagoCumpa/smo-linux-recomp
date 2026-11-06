@@ -98,6 +98,9 @@ static void vkd_device_info(VkDeviceCreateInfo *di, const VkExtensionProperties 
     EXT(has_plr, "VK_EXT_primitive_topology_list_restart", plr, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT)
     EXT(has_vad, "VK_EXT_vertex_attribute_divisor", vad, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT)
     EXT(has_dcc, "VK_EXT_depth_clip_control", dcc, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_CONTROL_FEATURES_EXT)
+    /* the translated stages' ARB ballot and vote (GL_ARB_shader_ballot, GL_ARB_shader_group_vote: SPV_KHR_shader_ballot / _subgroup_vote) */
+    if (has_name(dext, ndext, "VK_EXT_shader_subgroup_ballot")) D.exts[D.next++] = "VK_EXT_shader_subgroup_ballot";
+    if (has_name(dext, ndext, "VK_EXT_shader_subgroup_vote")) D.exts[D.next++] = "VK_EXT_shader_subgroup_vote";
     if (!(getenv("SMO_VK_EDS3") && !atoi(getenv("SMO_VK_EDS3")))) { EXT(has_eds3, "VK_EXT_extended_dynamic_state3", eds3, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT) }
     /* graphics pipeline libraries (nvn_vk_pipelines.c "graphics pipeline libraries"): the stage pair is compiled at loading
      * without the pass formats, a draw only LINKS. SMO_VK_GPL=1 turns it on (needs extended dynamic state 3 as well). */
@@ -567,7 +570,7 @@ static HSpan *hm_make(uint64_t lo, uint64_t hi) {      /* the import thread */
     }
     VkExternalMemoryBufferCreateInfo eb = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO, NULL, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT};
     VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &eb};
-    bi.size = hi - lo; bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    bi.size = hi - lo; bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT; bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;      /* storage: constant and storage buffers in the game's memory are read in place too */
     VkBuffer buf;
     if (vkCreateBuffer(V.device, &bi, NULL, &buf) != VK_SUCCESS) return NULL;
     VkMemoryRequirements rq;
@@ -650,6 +653,20 @@ static void hm_batch_begin(void) {      /* the heap's pieces to import, and thos
     plat_rw_wunlock(&g_hj_lock);
     if (queued) { plat_event_set(g_hj_ev); printf("nvn_vk: vertex and index ranges will be read in place from guest memory: the heap (%llu MB) is imported in %d pieces\n", (unsigned long long)(size >> 20), queued); }
     if (added) g_hs_last = NULL;
+}
+static void hm_stop(void) {                       /* shutdown: no import left half made; the made ones join g_hs to be freed */
+    for (int pass = 0; pass < 2000; pass++) {      /* (at most 2 s for the one being made) */
+        int making = 0;
+        plat_rw_wlock(&g_hj_lock);
+        for (int i = 0; i < g_hj_n; i++) {
+            if (g_hj[i].state == 0) g_hj[i].state = 3;
+            else if (g_hj[i].state == 1) making = 1;
+            else if (g_hj[i].state == 2) { g_hj[i].state = 3; if (g_hj[i].s && g_hs_n < HM_MAX) g_hs[g_hs_n++] = g_hj[i].s; }
+        }
+        plat_rw_wunlock(&g_hj_lock);
+        if (!making) return;
+        { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }
+    }
 }
 static int hm_first_after(uint64_t addr) {        /* index of the first piece that starts after addr */
     int a = 0, b = g_hs_n;
@@ -761,6 +778,7 @@ struct VTex {
     uint32_t lvl_drawn[16];                        /* per mip level, the pass that last drew into it: which way a chain over its levels goes */
     int rs; float sx, sy;                          /* rs = 1 when the image is smaller than the game's texture (w, h are the image's; sx, sy = image / game) */
     int storage;                                   /* made with VK_IMAGE_USAGE_STORAGE_BIT (NVN_TEXTURE_FLAGS_IMAGE): it can be bound as an image */
+    VkImageUsageFlags usage;                       /* the image's usage (its views of a format without storage support leave that bit out) */
     VView *views; VTex *next, *prev;
 };
 /* ---- internal resolution scale (graphics.ini resolution_scale; SMO_VK_SCALE wins).
@@ -1207,6 +1225,7 @@ static VTex *vt_get2(Tex *t, int sync) {
         if (ci.imageType == VK_IMAGE_TYPE_2D && vt->w == vt->h && vt->layers >= 6 && vt->samples == 1) ci.flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
         if (vt->is3d && (ci.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) ci.flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;      /* its slices can be render targets */
         ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        vt->usage = ci.usage;
         VkResult r = vkCreateImage(V.device, &ci, NULL, &vt->img);
         if (r != VK_SUCCESS) vkd_fail("vkCreateImage (NVN format 0x%x -> %d, target %d, %dx%dx%d, %d levels, %d layers, %d samples): %s", b->format, (int)vt->fmt, b->target, vt->w, vt->h, vt->d, vt->levels, vt->layers, vt->samples, vk_result_name(r));
         VkMemoryRequirements rq;
@@ -1373,6 +1392,8 @@ static VView *vt_vview(VTex *vt, const EView *e, int dim, int attach) {
         ci.subresourceRange.baseMipLevel = (uint32_t)e->lvl0; ci.subresourceRange.levelCount = (uint32_t)e->nlvl; ci.subresourceRange.baseArrayLayer = (uint32_t)(vt->is3d ? 0 : e->lay0); ci.subresourceRange.layerCount = (uint32_t)(vt->is3d ? 1 : lay);
         ci.components.r = sw[e->swz[0] < 6 ? e->swz[0] : 0]; ci.components.g = sw[e->swz[1] < 6 ? e->swz[1] : 0]; ci.components.b = sw[e->swz[2] < 6 ? e->swz[2] : 0]; ci.components.a = sw[e->swz[3] < 6 ? e->swz[3] : 0];
     }
+    VkImageViewUsageCreateInfo vu = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+    if (vt->storage && vt->usage && !fmt_supported(ci.format, VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) { vu.usage = vt->usage & ~(VkImageUsageFlags)VK_IMAGE_USAGE_STORAGE_BIT; ci.pNext = &vu; }      /* an sRGB view of a storage image: not a storage view */
     VkResult r = vkCreateImageView(V.device, &ci, NULL, &n->view);
     if (r != VK_SUCCESS) vkd_fail("vkCreateImageView (type %d, format %d of image format %d, levels %d+%d, layers %d+%d of %d, attach %d): %s", (int)ci.viewType, (int)ci.format, (int)vt->fmt, e->lvl0, e->nlvl, e->lay0, e->nlay, vt->layers, attach, vk_result_name(r));
     n->next = vt->views; vt->views = n; R.views++;
@@ -4735,6 +4756,9 @@ static void vkd_shutdown(void) {
     for (int i = 0; i < NSLOT; i++) { for (int k = 0; k < R.slot[i].npool; k++) vkDestroyDescriptorPool(V.device, R.slot[i].pool[k], NULL); vkDestroyFence(V.device, R.slot[i].fence, NULL); }
     tc_shutdown();
     vkDestroyBuffer(V.device, R.ring, NULL); vkDestroyBuffer(V.device, R.zero, NULL);
+    hm_stop();
+    for (int i = 0; i < g_hs_n; i++) { vkDestroyBuffer(V.device, g_hs[i]->buf, NULL); vkFreeMemory(V.device, g_hs[i]->mem, NULL); free(g_hs[i]->pg); free(g_hs[i]); g_hs[i] = NULL; }      /* the imported pieces of the game's memory */
+    g_hs_n = 0; g_hs_last = NULL;
     for (int b = 0; b < g_nblk; b++) if (g_blk[b]) { vkFreeMemory(V.device, g_blk[b]->mem, NULL); free(g_blk[b]); g_blk[b] = NULL; }
     R.ring = NULL;
     printf("nvn_vk: drawing part shut down: %lld images, %lld pipelines, %lld shader modules, %d samplers destroyed; %lld bytes of block space lost to fragmentation records\n", (long long)R.images, (long long)R.pipelines, (long long)R.modules, g_nsmp, (long long)g_mem_leak);

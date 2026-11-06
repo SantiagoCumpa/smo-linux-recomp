@@ -39,7 +39,7 @@ typedef struct {
     uint32_t gubos;                           /* compute: uniform buffers reached through global memory */
     unsigned smem_words;
     int uses_smem;
-    int uses_fcs, uses_tf, uses_shfl;                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
+    int uses_fcs, uses_tf, uses_shfl, uses_sgid;                    /* MxIn.screen_scale: gl_FragCoord.xy was scaled / a texelFetch was mapped */
     uint32_t images, images_read, images_written;
     uint16_t image_fmt[8]; uint8_t image_type[8];
     uint32_t *jt;                             /* static jump target of SYNC / BRK / CONT */
@@ -789,7 +789,7 @@ static void insn(Mx *e, unsigned pc, uint64_t i) {
         unsigned sr = MXB(i, 20, 8);
         const char *v;
         switch (sr) {
-        case 0x00: v = "gl_SubGroupInvocationARB"; break;
+        case 0x00: if (e->in->target == 1) { v = "gl_SubgroupInvocationID"; e->uses_sgid = 1; } else v = "gl_SubGroupInvocationARB"; break;      /* Vulkan: the one lane builtin SHFL uses too (two variables of the same builtin are invalid SPIR-V) */
         case 0x11: v = e->in->stage == MX_GEOMETRY || e->in->stage == MX_TESS_CONTROL ? "uint(gl_InvocationID)" : "0u"; break;
         case 0x12: v = "0x3f800000u"; break;                     /* y direction: +1 (the window origin is applied by glClipControl) */
         case 0x13: v = e->in->stage == MX_FRAGMENT ? "(gl_HelperInvocation ? 0xffffffffu : 0u)" : "0u"; break;
@@ -1844,6 +1844,7 @@ int mx_translate(const MxIn *in, MxOut *out) {
                  "#extension GL_ARB_shader_ballot : enable\n#extension GL_ARB_shader_group_vote : enable\n#extension GL_EXT_texture_shadow_lod : enable\n");
         if (e->uses_layer_out || e->uses_vp_out) emit(&h, "#extension GL_ARB_shader_viewport_layer_array : require\n");
         if (e->uses_shfl) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n#extension GL_KHR_shader_subgroup_shuffle : require\n");      /* SHFL */
+        else if (vk && e->uses_sgid) emit(&h, "#extension GL_KHR_shader_subgroup_basic : require\n");      /* the lane number (S2R 0) */
         emit(&h, "%s", k_prelude);
         if (vk && in->stage == MX_FRAGMENT && in->screen_scale && e->uses_fcs) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* */
         else if (vk && in->stage == MX_VERTEX && e->uses_psize) emit(&h, "layout(push_constant) uniform MXPC { uvec2 mx_alpha; float mx_point_size; float mx_fcs; };\n");      /* mx_fcs: 0 = unscaled pass */

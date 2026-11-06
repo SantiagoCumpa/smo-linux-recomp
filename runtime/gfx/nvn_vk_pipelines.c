@@ -131,6 +131,18 @@ static uint64_t ssrc_hb(const SSrc *o) {
     if (o->stage == 1 && RS_ON) h = fnv(h, "rs1", 3);      /* the fragment stages of a run with an internal resolution scale are another translation (MxIn.screen_scale); at 1.0 the hash is the one it always was */
     return fnv(h, &ver, 4);
 }
+/* SPIR-V made by an older translation that the validation layer rejects: two input variables of the lane builtin
+ * (SubgroupLocalInvocationId: the ARB lane number and the KHR one of a shuffle). Not used: the stage is translated again. */
+static int spv_stale(const uint32_t *w, size_t n) {
+    int lane = 0;
+    for (size_t i = 5; i < n; ) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len) break;
+        if (op == 71 && len >= 4 && i + 3 < n && w[i + 2] == 11 && w[i + 3] == 41) lane++;      /* OpDecorate %x BuiltIn SubgroupLocalInvocationId */
+        i += len;
+    }
+    return lane > 1;
+}
 static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; NULL when the file is not there */
     char path[128];
     VkShaderModule mod = NULL;
@@ -139,7 +151,7 @@ static VkShaderModule module_from_spv(uint64_t h) {              /* any thread; 
     if (!fp) return NULL;
     fseek(fp, 0, SEEK_END); long n = ftell(fp); fseek(fp, 0, SEEK_SET);
     uint32_t *words = n > 20 && n % 4 == 0 ? malloc((size_t)n) : NULL;
-    if (words && fread(words, 1, (size_t)n, fp) == (size_t)n && words[0] == 0x07230203) {
+    if (words && fread(words, 1, (size_t)n, fp) == (size_t)n && words[0] == 0x07230203 && !spv_stale(words, (size_t)n / 4)) {
         VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         ci.codeSize = (size_t)n; ci.pCode = words;
         if (vkCreateShaderModule(V.device, &ci, NULL, &mod) != VK_SUCCESS) mod = NULL;

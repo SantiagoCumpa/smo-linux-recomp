@@ -174,8 +174,12 @@ void nvn_vk_missing(const char *what) {
     fflush(stdout);
 }
 
+static int64_t g_vk_benign;                        /* validation warnings about valid things the game does (vk_debug_cb) */
 static VkBool32 VKAPI_PTR vk_debug_cb(VkFlags severity, VkFlags types, const VkDebugUtilsMessengerCallbackDataEXT *data, void *user) {
     (void)types; (void)user;
+    /* a fragment stage writing a colour in a pass without a colour image (the game's depth-only passes: shadows): valid,
+     * the colour is not kept; counted apart, not shown */
+    if (data && data->pMessageIdName && strstr(data->pMessageIdName, "ShaderOutputNotConsumed")) { plat_inc(&g_vk_benign); return VK_FALSE; }
     if (plat_inc(&g_vk_messages) <= 200)
         printf("vk-validation: %s: %s: %s\n", severity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning", data && data->pMessageIdName ? data->pMessageIdName : "?",
                data && data->pMessage ? data->pMessage : "");
@@ -668,6 +672,7 @@ void nvn_vk_shutdown(void) {
     vkDestroyInstance(V.instance, NULL);
     printf("nvn_vk: shutdown clean: swapchain, sync objects, command pool, device, surface and instance destroyed (%lld frames presented, %lld Vulkan call failures, %lld validation messages%s)\n",
            (long long)g_vk_frames, (long long)g_vk_errors, (long long)g_vk_messages, V.validate ? "" : ": layer not active");
+    if (g_vk_benign) printf("nvn_vk: validation: %lld warnings left out, about colour written by depth-only passes (valid: the colour is not kept)\n", (long long)g_vk_benign);
     fflush(stdout);
 }
 

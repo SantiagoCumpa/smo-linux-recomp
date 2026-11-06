@@ -382,4 +382,8 @@ The end of every log has the counts that tell whether a run was healthy:
   updated, not implemented a warning, except in a clause of counters that says none ("0 refused", "failed Vulkan
   calls 0"); a line on stderr is at least a warning. Builds run from the repository (scripts/run.py, the tests, the
   benchmark) keep untagged lines, which their scripts read as they are.
+- Validation (`SMO_VK_VALIDATE=1`, the vulkan-validation-layers package): a run through two kingdoms gives 0 messages on
+  NVIDIA and Intel. One warning is left out and only counted at shutdown: a fragment stage that writes a colour in a
+  pass without a colour image (the game's depth-only passes, such as shadows), which is valid (the colour is not kept).
+  Any other message is a bug to look at.
 
