@@ -248,6 +248,7 @@ int main(int argc, char **argv) {
     g_argv = argv;
     g_elf = argc > 1 ? argv[1] : GAME_ELF_DEFAULT;   /* the target's main.elf from the exe's folder (image.h) */
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc > 1 && !strcmp(argv[1], "--list-gpus")) { int nvn_vk_list_gpus(void); return nvn_vk_list_gpus(); }   /* nvn_vk.c: the GPUs shaders can be compiled for */
     if (argc > 1 && !strcmp(argv[1], "--shaderc-selftest")) { int smo_shaderc_selftest(void); return smo_shaderc_selftest(); }   /* vk_shaderc_shim.c */
     {   /* pad tools and their self-test (nnpad_sdl.c): no game is started */
         int nnhid_pad_selftest(void), nnpad_tool(int, char **);

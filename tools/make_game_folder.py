@@ -65,6 +65,10 @@ if [ "${SMO_PRIME:-1}" != 0 ]; then
     export __GLX_VENDOR_LIBRARY_NAME="${__GLX_VENDOR_LIBRARY_NAME:-nvidia}"
 fi
 cd "$here/bin"
+if [ "${1:-}" = "--list-gpus" ]; then
+    # the GPUs of this PC as Vulkan sees them, one a line: gpu <n> <nvidia|intel|amd|other> <name> <driver> <ok | why not>
+    SMO_LOG_TAGS=0 exec ./smo_native --list-gpus
+fi
 if [ "${1:-}" = "--compile-shaders" ]; then
     # the material shaders of every kingdom, translated and compiled ahead (the game loads them while you play: without
     # this, the first visit of a place can stutter). No window; the game does not start. Log: logs/compile-shaders.log
@@ -74,9 +78,32 @@ if [ "${1:-}" = "--compile-shaders" ]; then
     while [ $# -gt 0 ] && [[ "$1" =~ ^(all|nvidia|intel|amd)$ ]]; do if [ "$gpus" = all ]; then gpus="$1"; else gpus="$gpus,$1"; fi; shift; done
     export SMO_PRECOMPILE_GPUS="$gpus"
     # every GPU of the PC in turn (SMO_PRECOMPILE_ALL: the program starts again for the next one), so that switching GPU
-    # in the settings menu finds its shaders ready too
-    if [ "$gpus" = all ]; then what="every GPU of this PC"; else what="the GPUs: $gpus"; fi
-    [ "${SMO_PROGRESS:-}" = 1 ] || echo "Compiling shaders for $what (the first time: a few minutes each)"
+    # in the settings menu finds its shaders ready too. Which GPUs there are: Vulkan says (./smo --list-gpus)
+    list="$(SMO_LOG_TAGS=0 ./smo_native --list-gpus 2>/dev/null | grep "^gpu	")"
+    usable="$(printf '%s\n' "$list" | awk -F'\t' '$6 == "ok"')"
+    label() { case "$1" in nvidia) echo NVIDIA ;; intel) echo Intel ;; amd) echo AMD ;; *) echo "$1" ;; esac; }
+    if [ "${SMO_PROGRESS:-}" != 1 ]; then
+        echo "GPUs found on this PC:"
+        [ -n "$list" ] || echo "  none (no Vulkan driver answered)"
+        printf '%s\n' "$list" | while IFS='	' read -r _ _ kind name drv why; do
+            [ -n "$kind" ] || continue
+            if [ "$why" = ok ]; then echo "  $name ($(label "$kind"), driver $drv)"; else echo "  $name: not used ($why)"; fi
+        done
+    fi
+    if [ -z "$usable" ]; then echo "  No GPU the game can use (Vulkan 1.3): nothing compiled"; exit 3; fi
+    kinds="$(printf '%s\n' "$usable" | cut -f3 | awk '!seen[$0]++' | paste -sd, -)"
+    if [ "$gpus" != all ]; then
+        keep=""
+        for g in ${gpus//,/ }; do
+            if [[ ",$kinds," == *",$g,"* ]]; then keep="${keep:+$keep,}$g"; else [ "${SMO_PROGRESS:-}" = 1 ] || echo "  (no $(label "$g") GPU on this PC: left out)"; fi
+        done
+        if [ -z "$keep" ]; then echo "  no GPU of this PC is one of \"$gpus\": nothing compiled"; exit 3; fi
+        gpus="$keep"; export SMO_PRECOMPILE_GPUS="$gpus"
+    fi
+    if [ "$gpus" = all ]; then what="$kinds"; else what="$gpus"; fi
+    what="$(for g in ${what//,/ }; do label "$g"; done | paste -sd, - | sed 's/,/, /g')"
+    [ "${SMO_PROGRESS:-}" = 1 ] && echo "@found $what"
+    [ "${SMO_PROGRESS:-}" = 1 ] || echo "Compiling shaders for: $what (the first time: a few minutes each)"
     SMO_PRECOMPILE=1 SMO_PRECOMPILE_ALL=1 ./smo_native ../game/elf/main.elf 0 "$@" 2>&1 | tee "$here/logs/compile-shaders.log" | while IFS= read -r line; do
         line="${line#\[INFO\] }"; line="${line#\[WARN\] }"; line="${line#\[ERROR\] }"      # (the log's level tags)
         if [ "${SMO_PROGRESS:-}" = 1 ]; then          # the installer (scripts/install.py) draws its own progress line
@@ -129,7 +156,7 @@ the settings menu: resolution (up to 4K), full screen or window, vertical sync, 
 smo.desktop is a menu entry for this folder: copy it to ~/.local/share/applications.
 
 Shaders: ./smo --compile-shaders prepares the shaders of every kingdom ahead, for every GPU of the PC (a few minutes
-the first time; ./smo --compile-shaders nvidia, or intel, amd: only those), so that a new place does not stutter the first time you see it. After a graphics driver update the
+the first time; ./smo --list-gpus shows which GPUs it finds; ./smo --compile-shaders nvidia, or intel, amd: only those), so that a new place does not stutter the first time you see it. After a graphics driver update the
 game does it again by itself when it starts (a small box with a bar in the window). Run it again after switching the
 internal resolution between native and a scaled one (logs/smo.log says when it would help).
 

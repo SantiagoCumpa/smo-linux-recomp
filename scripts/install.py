@@ -19,8 +19,8 @@ Steps, each skipped when its result is already there (a run that stopped resumes
     3. decrypt   the NSP files -> build/install/dump (tools/extract/nsp.py; about 5.5 GB, a minute)
     4. build     lift and compile the game from it (scripts/setup.py; the first time takes long)
     5. folder    the game folder (tools/make_game_folder.py): ./smo starts the game
-    6. shaders   the material shaders of every kingdom, compiled ahead for every GPU of the PC, or those --shader-gpus
-                 names (<out_dir>/smo --compile-shaders; a few minutes a GPU the first time, seconds when they are there)
+    6. shaders   the material shaders of every kingdom, compiled ahead for the GPUs the PC has (found through Vulkan:
+                 <out_dir>/smo --list-gpus), or those of them --shader-gpus names (<out_dir>/smo --compile-shaders; a few minutes a GPU the first time, seconds when they are there)
 
 No firmware is needed: the game's text uses its own fonts, and the system fonts stand in for the console's shared
 fonts. Everything but the game folder stays inside the repository's build/ folder.
@@ -68,6 +68,10 @@ def fail(task, what, tail):
 
 def progress_line(task, line):
     """A tool's '@progress <phase> <done> <total>' line: the bar; '@gpu <i> <n> <name>': which GPU (shaders, one per GPU)."""
+    if line.startswith('@found '):                 # the GPUs ./smo --compile-shaders found (Vulkan) and compiles for
+        task.found = line[7:].strip()
+        task.update(0.0, 'GPUs found: ' + task.found)
+        return True
     if line.startswith('@gpu '):
         p = line.split(' ', 3)
         task.gpu = 'GPU %s of %s (%s): ' % (p[1], p[2], p[3].split(' (')[0] if len(p) > 3 else '?')
@@ -227,10 +231,12 @@ def main():
                 fail(t, 'Compiling shaders', ['--shader-gpus: unknown GPU kind %s (all, nvidia, intel, amd)' % ', '.join(bad)])
             code, tail = run_logged([os.path.join(out, 'smo'), '--compile-shaders'] + gpus, log, lambda l: progress_line(t, l))
             if code == 3:
-                t.finish(note='(no %s GPU on this PC: nothing compiled)' % a.shader_gpus)
+                t.finish(note='(no %s GPU on this PC: nothing compiled)' % ('usable' if a.shader_gpus == 'all' else a.shader_gpus))
                 code = 0
             if code:
                 fail(t, 'Compiling shaders', tail)
+            if getattr(t, 'found', None):
+                t.finish(note='(for: %s)' % t.found)
     log.close()
     print('\nReady. Play with:\n  %s' % os.path.join(out, 'smo'))
 

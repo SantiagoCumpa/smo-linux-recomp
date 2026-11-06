@@ -169,7 +169,10 @@ to `tools/lifter/sdklift_rules.txt` run `--redo sdk`; after a change to the runt
   `Mesa 26.2.6`), the translator version, native or scaled internal resolution (a fragment stage is translated
   differently). `./smo --compile-shaders` goes through every GPU of the PC (`SMO_PRECOMPILE_ALL=1`: the program starts
   again for the next one with `SMO_VK_DEVICE`), so the settings menu can switch GPU without a cold start;
-  `./smo --compile-shaders nvidia intel` (or `amd`, `all`) names the GPUs instead (`SMO_PRECOMPILE_GPUS`), and
+  which GPUs the PC has comes from Vulkan itself (`./smo --list-gpus`: one line a GPU with its kind, name, driver
+  and whether the game can use it; the CPU renderer llvmpipe and GPUs below Vulkan 1.3 are left out), and both
+  `./smo --compile-shaders` and the installer say what they found before compiling for it;
+  `./smo --compile-shaders nvidia intel` (or `amd`, `all`) keeps only those of them (`SMO_PRECOMPILE_GPUS`), and
   `./smo-recomp ... --shader-gpus nvidia,intel` passes that to its step 6; the
   translation (`cache/vk/stage`, `spv`) is shared, each driver keeps its compiled code in its own cache
   (`cache/nvidia`, `cache/mesa`). When the game starts and the GPU's driver has changed since its line was written (the

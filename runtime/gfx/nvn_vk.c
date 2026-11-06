@@ -341,6 +341,48 @@ static void nv_cache_dir(void) {
     printf("nvn_vk: the driver's shader disk cache: %s (the game's own; SMO_VK_NVCACHE=0: the driver's folder)\n", dir);
 }
 
+/* ./smo --list-gpus (the installer and ./smo --compile-shaders: which GPUs the shaders are compiled for). No window: the
+ * GPUs Vulkan knows, one line each, tab-separated:
+ *   gpu <SMO_VK_DEVICE number> <nvidia|intel|amd|other> <name> <driver version> <ok | why the game cannot use it>
+ * A GPU the game can use has a graphics + compute queue and Vulkan 1.3, and is not the CPU (llvmpipe). Returns 0, or 5
+ * without a Vulkan loader or instance. */
+int nvn_vk_list_gpus(void) {
+    V.loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (!V.loader) { printf("nvn_vk: libvulkan.so.1 cannot be loaded (%s): install vulkan-icd-loader and a Vulkan driver\n", dlerror()); return 5; }
+#define X(ret, name, args) name = vk_sym(#name);
+    VKF(X)
+#undef X
+    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "smo-native"; app.pEngineName = "nvn_vk"; app.apiVersion = VK_API_VERSION_1_3;
+    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &app;
+    VkInstance inst;
+    VkResult r = vkCreateInstance(&ici, NULL, &inst);
+    if (r != VK_SUCCESS) { printf("nvn_vk: vkCreateInstance: %s\n", vk_result_name(r)); return 5; }
+    VkPhysicalDevice gpus[16];
+    uint32_t n = 16;
+    r = vkEnumeratePhysicalDevices(inst, &n, gpus);
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE) n = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        VkPhysicalDeviceDriverProperties dp = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &dp};
+        VkQueueFamilyProperties q[32];
+        uint32_t nq = 32;
+        int gc = 0;
+        vkGetPhysicalDeviceProperties2(gpus[i], &p2);
+        vkGetPhysicalDeviceQueueFamilyProperties(gpus[i], &nq, q);
+        for (uint32_t k = 0; k < nq; k++) gc |= (q[k].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
+        const VkPhysicalDeviceProperties *p = &p2.properties;
+        uint32_t v = p->vendorID;
+        const char *kind = v == 0x10de ? "nvidia" : v == 0x8086 ? "intel" : v == 0x1002 ? "amd" : "other";
+        const char *why = p->deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU ? "not a GPU (the CPU draws)" : !gc ? "no graphics + compute queue" :
+                          p->apiVersion < VK_API_VERSION_1_3 ? "below Vulkan 1.3" : "ok";
+        printf("gpu\t%u\t%s\t%s\t%s\t%s\n", (unsigned)i, kind, p->deviceName, dp.driverInfo[0] ? dp.driverInfo : "?", why);
+    }
+    vkDestroyInstance(inst, NULL);
+    return 0;
+}
+
 /* Render thread, once. Returns 1; any failure prints its cause and ends the process with code 5 (as the OpenGL path does). */
 int nvn_vk_init(void *window) {
     static const char *const k_wanted[] = {"VK_KHR_swapchain", "VK_EXT_extended_dynamic_state3", "VK_EXT_vertex_input_dynamic_state", "VK_KHR_push_descriptor", "VK_EXT_custom_border_color",
