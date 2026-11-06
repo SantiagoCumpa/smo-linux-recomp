@@ -4531,6 +4531,26 @@ swap: ;
         t_prev = t_now;
         g_cur_frame = frame + 1;
     }
+    {   /* SMO_VK_SLOW=<ms>: a line for every frame longer than that, with where the render thread's time went in it */
+        static int lim = -1; static int64_t t_prev, tm_prev[12], pt_prev[5], hold_prev, pipes_prev, mods_prev, imgs_prev, late_prev, latek_prev; static int32_t nl;
+        if (lim < 0) lim = getenv("SMO_VK_SLOW") ? atoi(getenv("SMO_VK_SLOW")) : 0;
+        if (lim > 0) {
+            plat_counter fq; plat_qpf(&fq);
+            int64_t now = tk(), hold = g_hold_tk[0] + g_hold_tk[1] + g_hold_tk[2] + g_hold_tk[3];
+            double k = 1000.0 / (double)fq.QuadPart, wall = t_prev ? (double)(now - t_prev) * k : 0.0;
+            if (wall > lim && nl++ < 2000) {
+                double rep = (double)(g_tm[3] - tm_prev[3]) * k, prep = (double)(g_tm[8] - tm_prev[8]) * k, pip = (double)(g_tm[5] - tm_prev[5]) * k, mod = (double)(g_tm[6] - tm_prev[6]) * k,
+                       gw = (double)(g_tm[0] - tm_prev[0]) * k, cb = (double)(g_tm[1] - tm_prev[1]) * k, pres = (double)(g_tm[4] - tm_prev[4]) * k, late = (double)(g_late_tk - latek_prev) * k,
+                       lbar = (double)(g_pt[0] - pt_prev[0]) * k, qp = (double)(g_pt[3] - pt_prev[3]) * k;
+                printf("nvn_vk_slow: frame %lld %.1f ms (%lld draws) | render thread: batch replay %.1f (draw prep %.1f, pipelines %.1f, shader modules %.1f, holds %.1f), textures made at use %.1f (%lld), "
+                       "wait for GPU %.1f, copy-back %.1f, present %.1f (loading barrier %.1f, queue present %.1f), not in these %.1f | made: %lld pipelines, %lld modules, %lld images\n",
+                       (long long)frame, wall, (long long)R.frame_draws, rep, prep, pip, mod, (double)(hold - hold_prev) * k, late, (long long)(g_late_n - late_prev),
+                       gw, cb, pres, lbar, qp, wall - rep - gw - cb - pres - late, (long long)(R.pipelines - pipes_prev), (long long)(R.modules - mods_prev), (long long)(R.images - imgs_prev));
+            }
+            t_prev = now; memcpy(tm_prev, g_tm, sizeof tm_prev); memcpy(pt_prev, g_pt, sizeof pt_prev); hold_prev = hold;
+            pipes_prev = R.pipelines; mods_prev = R.modules; imgs_prev = R.images; late_prev = g_late_n; latek_prev = g_late_tk;
+        }
+    }
     {   /* what this frame paid for textures made or read at their use (hold log), then the textures made ahead */
         plat_counter fq; plat_qpf(&fq);
         if (holdlog_on() && g_up_fr_tk * 1000 > 3 * fq.QuadPart) { static int nl; if (nl++ < 300) printf("nvn_vk_upl: frame %lld (%s): %d textures made or read at their use, %.1f MB, %.1f ms\n", (long long)frame, g_in_scene ? "scene" : "no scene", g_up_fr_n, (double)g_up_fr_bytes / 1048576.0, (double)g_up_fr_tk * 1000.0 / (double)fq.QuadPart); }
@@ -4727,6 +4747,11 @@ static void vkd_shutdown(void) {
                    (double)g_late_k_tk[i] * k, (double)g_late_k_max[i] * k, (long long)g_late_k_big[i], (double)g_late_k_bytes[i] / 1048576.0);
     }
     frstat_report();
+    if (getenv("SMO_VK_SLOW") && atoi(getenv("SMO_VK_SLOW")) > 0 && g_ts_on > 0) {      /* the GPU's time of the frames around the slow ones (SMO_VK_GPUTIME=1) */
+        int lim = atoi(getenv("SMO_VK_SLOW"));
+        for (int f = 1; f < FRSTAT_N - 2 && f < g_cur_frame; f++) if (g_fr_wall[f] > lim || g_fr_gpu[f] > lim)
+            printf("nvn_vk_slow_gpu: frame %d: wall %.1f ms, GPU %.1f ms (frames before / after: GPU %.1f / %.1f)\n", f, g_fr_wall[f], g_fr_gpu[f], g_fr_gpu[f - 1], g_fr_gpu[f + 1]);
+    }
     if (RS_ON && rs_ui_native()) printf("nvn_vk_scale: SMO_VK_UI_NATIVE=1: the window's textures are kept at the game's size; passes with such a colour target and a SCALED depth target (drawn without depth): %lld\n", (long long)g_rs_mixed);
     if (RS_ON) printf("nvn_vk_scale: resolution scale %.3f: %lld images made scaled, %lld fragment stages translated in this run for it (%lld of them read the pixel position, %lld fetch texels by integer position), %lld uploads into and %lld read-backs from a scaled image, %lld copies / blits touching one\n",
                       (double)rs_scale(), (long long)g_rs_images, (long long)g_rs_stages, (long long)g_rs_fcs, (long long)g_rs_tf, (long long)g_rs_up, (long long)g_rs_down, (long long)g_rs_blits);

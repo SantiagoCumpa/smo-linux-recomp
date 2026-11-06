@@ -386,4 +386,10 @@ The end of every log has the counts that tell whether a run was healthy:
   NVIDIA and Intel. One warning is left out and only counted at shutdown: a fragment stage that writes a colour in a
   pass without a colour image (the game's depth-only passes, such as shadows), which is valid (the colour is not kept).
   Any other message is a bug to look at.
+- Slow frames: `SMO_VK_SLOW=<ms>` prints a `nvn_vk_slow:` line for every frame longer than that, with where the render
+  thread's time went in it (batch replay and its draw preparation, pipelines, shader modules, holds, textures made at
+  their use, waits for the GPU, present) and what was made; with `SMO_VK_GPUTIME=1` the exit adds the GPU's time of
+  those frames (`nvn_vk_slow_gpu:`). Measured on arriving at a kingdom (Sand, Cascade, Lake; RTX 4060): the kingdom's
+  first frame draws 3,000-4,700 objects (about 1,000 later) and costs the GPU 36-49 ms, so it and the next take 42-71
+  ms; both are drawn while the screen is still black, before the opening circle, so they are not seen.
 
